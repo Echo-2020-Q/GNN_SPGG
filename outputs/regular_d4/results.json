@@ -1,0 +1,166 @@
+{
+  "experiment": {
+    "experiment_name": "regular_d4",
+    "seed": 42,
+    "run_mode": "uniform",
+    "network": {
+      "type": "regular",
+      "num_nodes": 100,
+      "regular_degree": 4,
+      "er_edge_prob": 0.04,
+      "ws_degree": 4,
+      "ws_rewiring_prob": 0.1,
+      "ba_attachments_per_new_node": 2,
+      "grid_rows": 10,
+      "grid_cols": 10,
+      "grid_periodic": false
+    },
+    "dynamics": {
+      "alpha": 0.5,
+      "r": 0.4,
+      "p_max": 50.0,
+      "beta": 1.0,
+      "episode_length": 150,
+      "initial_resource": 10.0,
+      "initial_cooperation_prob": 0.5
+    },
+    "reward": {
+      "lambda_payoff": 1.0,
+      "lambda_cooperation": 0.0,
+      "lambda_gini": 0.0,
+      "epsilon": 1e-08
+    },
+    "gnn": {
+      "hidden_dim": 64,
+      "num_message_passing_layers": 2,
+      "temperature": 1.0,
+      "dirichlet_concentration_scale": 1.0,
+      "dirichlet_concentration_floor": 0.1
+    },
+    "training": {
+      "total_updates": 50,
+      "steps_per_update": 64,
+      "gamma": 0.99,
+      "gae_lambda": 0.95,
+      "learning_rate": 0.0003,
+      "entropy_coef": 0.001,
+      "value_coef": 0.5,
+      "max_grad_norm": 1.0,
+      "eval_interval": 10,
+      "eval_episodes": 3,
+      "device": "cpu"
+    },
+    "rollout": {
+      "episodes": 5,
+      "post_training_eval_episodes": 2
+    },
+    "visualization": {
+      "enable_micro_snapshots": true,
+      "enable_macro_timeseries": true,
+      "episodes_to_visualize": [
+        1
+      ],
+      "frame_stride": 1,
+      "layout": "spring",
+      "spring_iterations": 80,
+      "node_color_metric": "x_actual",
+      "node_size_metric": "resources",
+      "label_nodes": true,
+      "macro_metrics": [
+        "actual_cooperation_rate",
+        "mean_resource",
+        "mean_pool_grown",
+        "mean_payoff",
+        "gini"
+      ],
+      "save_dpi": 160
+    },
+    "output": {
+      "root_dir": "outputs",
+      "save_results_json": true,
+      "save_micro_snapshots": true,
+      "save_macro_timeseries": true
+    }
+  },
+  "graph_summary": {
+    "num_nodes": 100.0,
+    "num_edges": 200.0,
+    "degree_min": 4.0,
+    "degree_max": 4.0,
+    "degree_mean": 4.0
+  },
+  "env_config": {
+    "alpha": 0.5,
+    "r": 0.4,
+    "p_max": 50.0,
+    "beta": 1.0,
+    "episode_length": 150,
+    "initial_resource": 10.0,
+    "initial_cooperation_prob": 0.5,
+    "num_nodes": null,
+    "reward": {
+      "lambda_payoff": 1.0,
+      "lambda_cooperation": 0.0,
+      "lambda_gini": 0.0,
+      "epsilon": 1e-08
+    }
+  },
+  "results": {
+    "experiment_name": "regular_d4",
+    "run_mode": "uniform",
+    "network_type": "regular",
+    "episode_summaries": [
+      {
+        "final_actual_cooperation": 0.0,
+        "final_mean_resource": 12.473523519999999,
+        "final_mean_pool_grown": 0.0,
+        "final_mean_payoff": 0.0,
+        "final_gini": 0.2383057125824765,
+        "episode_return": 2.473523519999999,
+        "episode_index": 1.0
+      },
+      {
+        "final_actual_cooperation": 0.0,
+        "final_mean_resource": 12.332430789744642,
+        "final_mean_pool_grown": 0.0,
+        "final_mean_payoff": 0.0,
+        "final_gini": 0.2259023315947163,
+        "episode_return": 2.3324307897446386,
+        "episode_index": 2.0
+      },
+      {
+        "final_actual_cooperation": 0.0,
+        "final_mean_resource": 12.735820518883836,
+        "final_mean_pool_grown": 0.0,
+        "final_mean_payoff": 0.0,
+        "final_gini": 0.2411726176103048,
+        "episode_return": 2.7358205188838385,
+        "episode_index": 3.0
+      },
+      {
+        "final_actual_cooperation": 0.0,
+        "final_mean_resource": 12.185738079999998,
+        "final_mean_pool_grown": 0.0,
+        "final_mean_payoff": 0.0,
+        "final_gini": 0.22184854952075986,
+        "episode_return": 2.185738079999999,
+        "episode_index": 4.0
+      },
+      {
+        "final_actual_cooperation": 0.0,
+        "final_mean_resource": 12.89266844077411,
+        "final_mean_pool_grown": 0.0,
+        "final_mean_payoff": 0.0,
+        "final_gini": 0.24570169076489035,
+        "episode_return": 2.8926684407741057,
+        "episode_index": 5.0
+      }
+    ],
+    "summary": {
+      "return_mean": 2.524036269880516,
+      "return_std": 0.2586318266334011,
+      "final_cooperation_mean": 0.0,
+      "final_gini_mean": 0.23458618041462956
+    }
+  }
+}
