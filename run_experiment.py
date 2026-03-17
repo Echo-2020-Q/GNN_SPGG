@@ -122,6 +122,8 @@ BASE_EXPERIMENT = {
         # 个体策略更新规则：
         # - "fermi"        ：同步 Fermi 更新
         # - "q_learning"   ：每个节点使用二动作无状态 Q-learning 更新
+        # - "q_learning_2x2"：每个节点使用 2状态×2动作 Q-learning，
+        #                     状态=自己上一轮动作，动作=本轮选 C/D
         # - "imitate_best" ：最优邻居模仿 / Best-takes-over
         "strategy_update_rule": "fermi",
 
@@ -130,7 +132,8 @@ BASE_EXPERIMENT = {
         # 越大，节点越偏向模仿高收益邻居。
         "beta": 1.0,
 
-        # 以下参数仅当 strategy_update_rule == "q_learning" 时使用。
+        # 以下参数仅当 strategy_update_rule == "q_learning"
+        # 或 "q_learning_2x2" 时使用。
         "q_learning_rate": 0.1,
         "q_learning_discount": 0.1,
         "q_learning_epsilon": 0.05,
@@ -355,52 +358,52 @@ BASE_EXPERIMENT = {
 #
 BATCH_EXPERIMENTS = [
     {
-        "experiment_name": "regular_d4_prop_r15_q_learning",
+        "experiment_name": "regular_d4_prop_r15_q_learning_2x2",
         "network": {"type": "regular", "regular_degree": 4},
         "run_mode": "proportional",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning"},
+        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
     },
         {
-        "experiment_name": "regular_d4_uniform_r15_q_learning",
+        "experiment_name": "regular_d4_uniform_r15_q_learning_2x2",
         "network": {"type": "regular", "regular_degree": 4},
         "run_mode": "uniform",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning"},
+        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
     },
         {
-        "experiment_name": "ba_m2_proportional_r15_q_learning",
+        "experiment_name": "ba_m2_proportional_r15_q_learning_2x2",
         "network": {"type": "scale_free", "ba_attachments_per_new_node": 2},
         "run_mode": "proportional",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning"},
+        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
     },
         {
-        "experiment_name": "ba_m2_uniform_r15_q_learning",
+        "experiment_name": "ba_m2_uniform_r15_q_learning_2x2",
         "network": {"type": "scale_free", "ba_attachments_per_new_node": 2},
         "run_mode": "uniform",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning"},
+        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
     },
         {
-        "experiment_name": "er_p04_proportional_r15_q_learning",
+        "experiment_name": "er_p04_proportional_r15_q_learning_2x2",
         "network": {"type": "erdos_renyi", "er_edge_prob": 0.04},
         "run_mode": "proportional",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning"},
+        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
     },
         {
-        "experiment_name": "er_p04_uniform_r15_q_learning",
+        "experiment_name": "er_p04_uniform_r15_q_learning_2x2",
         "network": {"type": "erdos_renyi", "er_edge_prob": 0.04},
         "run_mode": "uniform",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning"},
+        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
     },
         {
-        "experiment_name": "ws_k4_p01_proportional_r15_q_learning",
+        "experiment_name": "ws_k4_p01_proportional_r15_q_learning_2x2",
         "network": {"type": "small_world", "ws_degree": 4, "ws_rewiring_prob": 0.1},
         "run_mode": "proportional",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning"},
+        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
     },
         {
-        "experiment_name": "ws_k4_p01_uniform_r15_q_learning",
+        "experiment_name": "ws_k4_p01_uniform_r15_q_learning_2x2",
         "network": {"type": "small_world", "ws_degree": 4, "ws_rewiring_prob": 0.1},
         "run_mode": "uniform",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning"},
+        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
     },
 ]
 
@@ -562,7 +565,16 @@ def print_header(spec: Mapping[str, Any], graph: Mapping[int, Sequence[int]], en
         print("Strategy  : rule=fermi, beta={0}".format(env_config.beta))
     elif env_config.strategy_update_rule == "q_learning":
         print(
-            "Strategy  : rule=q_learning, lr={0}, gamma={1}, epsilon={2}, q0={3}".format(
+            "Strategy  : rule=q_learning, state=none, lr={0}, gamma={1}, epsilon={2}, q0={3}".format(
+                env_config.q_learning_rate,
+                env_config.q_learning_discount,
+                env_config.q_learning_epsilon,
+                env_config.q_learning_initial_value,
+            )
+        )
+    elif env_config.strategy_update_rule == "q_learning_2x2":
+        print(
+            "Strategy  : rule=q_learning_2x2, state=last_action, lr={0}, gamma={1}, epsilon={2}, q0={3}".format(
                 env_config.q_learning_rate,
                 env_config.q_learning_discount,
                 env_config.q_learning_epsilon,

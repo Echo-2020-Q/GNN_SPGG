@@ -1,0 +1,178 @@
+{
+  "experiment": {
+    "experiment_name": "ba_m2_proportional_r15_q_learning_2x2",
+    "seed": 42,
+    "run_mode": "proportional",
+    "network": {
+      "type": "scale_free",
+      "num_nodes": 100,
+      "regular_degree": 4,
+      "er_edge_prob": 0.04,
+      "ws_degree": 4,
+      "ws_rewiring_prob": 0.1,
+      "ba_attachments_per_new_node": 2,
+      "grid_rows": 10,
+      "grid_cols": 10,
+      "grid_periodic": false
+    },
+    "dynamics": {
+      "alpha": 0.5,
+      "r": 1.5,
+      "p_max": 40.0,
+      "strategy_update_rule": "q_learning_2x2",
+      "beta": 1.0,
+      "q_learning_rate": 0.1,
+      "q_learning_discount": 0.1,
+      "q_learning_epsilon": 0.05,
+      "q_learning_initial_value": 0.0,
+      "episode_length": 150,
+      "initial_resource": 10.0,
+      "initial_cooperation_prob": 0.5
+    },
+    "reward": {
+      "lambda_payoff": 1.0,
+      "lambda_cooperation": 0.0,
+      "lambda_gini": 0.0,
+      "epsilon": 1e-08
+    },
+    "gnn": {
+      "hidden_dim": 64,
+      "num_message_passing_layers": 2,
+      "temperature": 1.0,
+      "dirichlet_concentration_scale": 1.0,
+      "dirichlet_concentration_floor": 0.1
+    },
+    "training": {
+      "total_updates": 50,
+      "steps_per_update": 64,
+      "gamma": 0.99,
+      "gae_lambda": 0.95,
+      "learning_rate": 0.0003,
+      "entropy_coef": 0.001,
+      "value_coef": 0.5,
+      "max_grad_norm": 1.0,
+      "eval_interval": 10,
+      "eval_episodes": 3,
+      "device": "cpu"
+    },
+    "rollout": {
+      "episodes": 5,
+      "post_training_eval_episodes": 2
+    },
+    "visualization": {
+      "enable_micro_snapshots": true,
+      "enable_macro_timeseries": true,
+      "episodes_to_visualize": [
+        1
+      ],
+      "frame_stride": 1,
+      "layout": "spring",
+      "spring_iterations": 80,
+      "node_color_metric": "x_actual",
+      "node_size_metric": "resources",
+      "node_value_metric": "resources",
+      "node_value_decimals": 1,
+      "label_nodes": true,
+      "macro_metrics": [
+        "actual_cooperation_rate",
+        "mean_resource",
+        "mean_pool_grown",
+        "mean_payoff",
+        "gini"
+      ],
+      "save_dpi": 160
+    },
+    "output": {
+      "root_dir": "outputs",
+      "save_results_json": true,
+      "save_micro_snapshots": true,
+      "save_macro_timeseries": true
+    }
+  },
+  "graph_summary": {
+    "num_nodes": 100.0,
+    "num_edges": 197.0,
+    "degree_min": 2.0,
+    "degree_max": 25.0,
+    "degree_mean": 3.94
+  },
+  "env_config": {
+    "alpha": 0.5,
+    "r": 1.5,
+    "p_max": 40.0,
+    "strategy_update_rule": "q_learning_2x2",
+    "beta": 1.0,
+    "q_learning_rate": 0.1,
+    "q_learning_discount": 0.1,
+    "q_learning_epsilon": 0.05,
+    "q_learning_initial_value": 0.0,
+    "episode_length": 150,
+    "initial_resource": 10.0,
+    "initial_cooperation_prob": 0.5,
+    "num_nodes": null,
+    "reward": {
+      "lambda_payoff": 1.0,
+      "lambda_cooperation": 0.0,
+      "lambda_gini": 0.0,
+      "epsilon": 1e-08
+    }
+  },
+  "results": {
+    "experiment_name": "ba_m2_proportional_r15_q_learning_2x2",
+    "run_mode": "proportional",
+    "network_type": "scale_free",
+    "episode_summaries": [
+      {
+        "final_actual_cooperation": 0.17,
+        "final_mean_resource": 174.25318593139855,
+        "final_mean_pool_grown": 18.05308704481177,
+        "final_mean_payoff": 1.8642265075572897,
+        "final_gini": 0.40276247969012924,
+        "episode_return": 164.25318593139852,
+        "episode_index": 1.0
+      },
+      {
+        "final_actual_cooperation": 0.17,
+        "final_mean_resource": 187.71070073690152,
+        "final_mean_pool_grown": 18.0,
+        "final_mean_payoff": 0.811665634507785,
+        "final_gini": 0.35899952498413323,
+        "episode_return": 177.71070073690157,
+        "episode_index": 2.0
+      },
+      {
+        "final_actual_cooperation": 0.14,
+        "final_mean_resource": 173.3311277778835,
+        "final_mean_pool_grown": 20.0,
+        "final_mean_payoff": -0.9270708940283354,
+        "final_gini": 0.4214326166974597,
+        "episode_return": 163.3311277778834,
+        "episode_index": 3.0
+      },
+      {
+        "final_actual_cooperation": 0.14,
+        "final_mean_resource": 180.7846190792132,
+        "final_mean_pool_grown": 17.637225739301762,
+        "final_mean_payoff": 0.9400920469513143,
+        "final_gini": 0.3629276050777994,
+        "episode_return": 170.78461907921323,
+        "episode_index": 4.0
+      },
+      {
+        "final_actual_cooperation": 0.2,
+        "final_mean_resource": 187.18523552776895,
+        "final_mean_pool_grown": 23.94516293431087,
+        "final_mean_payoff": 1.42993878430455,
+        "final_gini": 0.37635926229622474,
+        "episode_return": 177.18523552776904,
+        "episode_index": 5.0
+      }
+    ],
+    "summary": {
+      "return_mean": 170.65297381063314,
+      "return_std": 6.1166330151508115,
+      "final_cooperation_mean": 0.164,
+      "final_gini_mean": 0.3844962977491493
+    }
+  }
+}

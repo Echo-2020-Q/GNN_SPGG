@@ -42,8 +42,10 @@ class SPGGConfig:
     def __post_init__(self) -> None:
         if self.p_max <= 0.0:
             raise ValueError("p_max must be positive.")
-        if self.strategy_update_rule not in {"fermi", "q_learning", "imitate_best"}:
-            raise ValueError("strategy_update_rule must be one of {'fermi', 'q_learning', 'imitate_best'}.")
+        if self.strategy_update_rule not in {"fermi", "q_learning", "q_learning_2x2", "imitate_best"}:
+            raise ValueError(
+                "strategy_update_rule must be one of {'fermi', 'q_learning', 'q_learning_2x2', 'imitate_best'}."
+            )
         if not 0.0 <= self.q_learning_rate <= 1.0:
             raise ValueError("q_learning_rate must be in [0, 1].")
         if not 0.0 <= self.q_learning_discount <= 1.0:
@@ -281,7 +283,8 @@ class SPGGEnv:
         self._step_count = 0
         self._nominal_strategies = np.zeros(self.num_nodes, dtype=np.int8)
         self._resources = np.zeros(self.num_nodes, dtype=np.float64)
-        self._q_values = np.zeros((self.num_nodes, 2), dtype=np.float64)
+        self._q_values = self._initialize_q_values()
+        self._q_learning_previous_actions = np.zeros(self.num_nodes, dtype=np.int8)
         self._current_observation: Observation | None = None
 
     def reset(
@@ -296,11 +299,8 @@ class SPGGEnv:
         self._step_count = 0
         self._resources = self._coerce_resource_vector(initial_resources)
         self._nominal_strategies = self._coerce_strategy_vector(initial_strategies)
-        self._q_values = np.full(
-            (self.num_nodes, 2),
-            self.config.q_learning_initial_value,
-            dtype=np.float64,
-        )
+        self._q_values = self._initialize_q_values()
+        self._q_learning_previous_actions = self._nominal_strategies.astype(np.int8, copy=True)
         self._current_observation = self._precompute_observation(self._nominal_strategies, self._resources)
         return self._copy_observation(self._current_observation)
 
@@ -449,6 +449,8 @@ class SPGGEnv:
             return self._synchronous_fermi_update(nominal_strategies, payoff)
         if self.config.strategy_update_rule == "q_learning":
             return self._q_learning_update(nominal_strategies, payoff)
+        if self.config.strategy_update_rule == "q_learning_2x2":
+            return self._q_learning_2x2_update(nominal_strategies, payoff)
         if self.config.strategy_update_rule == "imitate_best":
             return self._imitate_best_update(nominal_strategies, payoff)
         raise RuntimeError("Unsupported strategy update rule: {0}".format(self.config.strategy_update_rule))
@@ -471,6 +473,28 @@ class SPGGEnv:
         self._q_values = next_q_values
         return next_nominal
 
+    def _q_learning_2x2_update(self, nominal_strategies: np.ndarray, payoff: np.ndarray) -> np.ndarray:
+        previous_q_values = self._q_values.copy()
+        next_q_values = previous_q_values.copy()
+        state_actions = self._q_learning_previous_actions.astype(np.int8, copy=True)
+        next_nominal = nominal_strategies.astype(np.int8, copy=True)
+
+        for node in range(self.num_nodes):
+            state = int(state_actions[node])
+            action = int(nominal_strategies[node])
+            next_state = action
+            best_future_value = float(previous_q_values[node, next_state].max())
+            td_target = float(payoff[node]) + (self.config.q_learning_discount * best_future_value)
+            next_q_values[node, state, action] = (
+                (1.0 - self.config.q_learning_rate) * previous_q_values[node, state, action]
+                + (self.config.q_learning_rate * td_target)
+            )
+            next_nominal[node] = self._select_q_learning_action(next_q_values[node, next_state])
+
+        self._q_values = next_q_values
+        self._q_learning_previous_actions = nominal_strategies.astype(np.int8, copy=True)
+        return next_nominal
+
     def _imitate_best_update(self, nominal_strategies: np.ndarray, payoff: np.ndarray) -> np.ndarray:
         next_nominal = nominal_strategies.astype(np.int8, copy=True)
         for node, neighbors in enumerate(self.graph.neighbors):
@@ -489,6 +513,14 @@ class SPGGEnv:
         best_value = float(q_values.max())
         best_actions = np.flatnonzero(np.isclose(q_values, best_value))
         return np.int8(self.rng.choice(best_actions))
+
+    def _initialize_q_values(self) -> np.ndarray:
+        q_shape = (self.num_nodes, 2, 2) if self.config.strategy_update_rule == "q_learning_2x2" else (self.num_nodes, 2)
+        return np.full(
+            q_shape,
+            self.config.q_learning_initial_value,
+            dtype=np.float64,
+        )
 
     def _planner_reward(
         self,

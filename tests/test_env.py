@@ -122,6 +122,34 @@ class SPGGEnvTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(next_nominal, np.array([0], dtype=np.int8))
 
+    def test_q_learning_2x2_updates_using_previous_action_state(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.0,
+                p_max=1.0,
+                strategy_update_rule="q_learning_2x2",
+                q_learning_rate=1.0,
+                q_learning_discount=1.0,
+                q_learning_epsilon=0.0,
+                episode_length=1,
+                num_nodes=1,
+            ),
+            [],
+        )
+        env.reset(initial_resources=[5.0], initial_strategies=[1], seed=0)
+        env._q_values = np.array([[[0.0, 0.0], [0.0, 2.0]]], dtype=np.float64)
+        env._q_learning_previous_actions = np.array([0], dtype=np.int8)
+
+        next_nominal = env._q_learning_2x2_update(
+            np.array([1], dtype=np.int8),
+            np.array([5.0], dtype=np.float64),
+        )
+
+        self.assertAlmostEqual(float(env._q_values[0, 0, 1]), 7.0)
+        np.testing.assert_array_equal(next_nominal, np.array([1], dtype=np.int8))
+        np.testing.assert_array_equal(env._q_learning_previous_actions, np.array([1], dtype=np.int8))
+
     def test_isolated_node_keeps_nominal_strategy(self) -> None:
         env = SPGGEnv(
             SPGGConfig(alpha=0.0, r=0.0, p_max=1.0, beta=100.0, episode_length=1, num_nodes=1),
