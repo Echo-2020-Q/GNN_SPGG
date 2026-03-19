@@ -450,11 +450,13 @@ BATCH_EXPERIMENTS = [
 # =============================================================================
 SCAN_EXPERIMENT = {
     "enabled": True,
-    "name": "3_18_r_network_consumption_strategy_scan",
-    "output_root_dir": "outputs/200frame_r_network_consumption_strategy_scan_0.05tau",
+    "name": "3_18_num_nodes_r_network_consumption_strategy_scan_proportional",
+    "output_root_dir": "outputs/200frame_r_network_consumption_strategy_scan_0.01_0.1tau",
     "parallel": True,
-    "max_workers": 8,#自己的电脑为16核
+    "max_workers": 32,#自己的电脑为16核
     "r_values": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5],
+    "resource_consumption_rate": [0.01, 0.05,0.1],
+    "num_nodes": [100,2500],
     "network_types": ["regular", "erdos_renyi", "small_world", "scale_free"],
     "resource_consumption_modes": ["piecewise_linear"],#["fixed", "proportional", "piecewise_linear"],
     "resource_consumption_fixed_modes": ["constant", "degree_scaled"],
@@ -586,14 +588,8 @@ def build_scan_experiment_specs() -> List[Dict[str, Any]]:
                                     "resource_consumption_mode": resource_consumption_mode,
                                     "strategy_update_rule": strategy_update_rule,
                                 },
-                                "visualization": {
-                                    "enable_micro_snapshots": False,
-                                    "enable_macro_timeseries": True,
-                                },
                                 "output": {
                                     "root_dir": scan["output_root_dir"],
-                                    "save_micro_snapshots": False,
-                                    "save_macro_timeseries": True,
                                 },
                             },
                         )
