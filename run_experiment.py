@@ -147,11 +147,11 @@ BASE_EXPERIMENT = {
         # 比例消耗系数。
         # - proportional     ：consumption = rate * resources
         # - piecewise_linear ：consumption = fixed + rate * max(resources - threshold, 0)
-        "resource_consumption_rate": 0.1,
+        "resource_consumption_rate": 0.05, #0.1
 
         # 分段线性消耗阈值。
         # 仅当 resource_consumption_mode == "piecewise_linear" 时使用。
-        "resource_consumption_threshold": 50.0,
+        "resource_consumption_threshold": 4.0, #50
 
         # 个体策略更新规则：
         # - "fermi"        ：同步 Fermi 更新
@@ -175,7 +175,7 @@ BASE_EXPERIMENT = {
 
         # 每个 episode 的时间步上限。
         # 到达这个步数后，本 episode 结束。
-        "episode_length": 10000, #150
+        "episode_length": 200, #150 10000
 
         # 所有节点统一的初始资源。
         "initial_resource": 20.0,#10
@@ -278,7 +278,7 @@ BASE_EXPERIMENT = {
     "visualization": {
         # 是否生成微观网络快照图。
         # 开启后，每个选中的 episode 都会在每个时间步保存一张图。
-        "enable_micro_snapshots": False,
+        "enable_micro_snapshots": True,
 
         # 是否生成宏观时间序列图。
         # 开启后，每个选中的 episode 都会保存一张统计量随时间变化的折线图。
@@ -451,12 +451,12 @@ BATCH_EXPERIMENTS = [
 SCAN_EXPERIMENT = {
     "enabled": True,
     "name": "3_18_r_network_consumption_strategy_scan",
-    "output_root_dir": "outputs/r_network_consumption_strategy_scan",
+    "output_root_dir": "outputs/200frame_r_network_consumption_strategy_scan_0.05tau",
     "parallel": True,
     "max_workers": 8,#自己的电脑为16核
     "r_values": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5],
     "network_types": ["regular", "erdos_renyi", "small_world", "scale_free"],
-    "resource_consumption_modes": ["fixed", "proportional", "piecewise_linear"],
+    "resource_consumption_modes": ["piecewise_linear"],#["fixed", "proportional", "piecewise_linear"],
     "resource_consumption_fixed_modes": ["constant", "degree_scaled"],
     "strategy_update_rules": ["q_learning", "fermi"],
     "run_mode": ["proportional"],
