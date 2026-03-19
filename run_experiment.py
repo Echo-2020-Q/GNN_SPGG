@@ -17,8 +17,11 @@ from __future__ import annotations
 """
 
 from copy import deepcopy
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import csv
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, List, Mapping, Optional, Sequence
@@ -114,10 +117,41 @@ BASE_EXPERIMENT = {
         # r：资源池放大参数。
         # 对应：
         #   G_i,t = min((1 + r) * P_i,t, P_max)
-        "r": 0.4,
+        "r": 2,
 
         # P_max：资源池增长后的饱和上限。
-        "p_max": 40.0,
+        "p_max": 100.0,#40
+
+        # 资源自然消耗模式：
+        # - "fixed"            ：每轮固定消耗
+        # - "proportional"     ：按当前资源按比例消耗
+        # - "piecewise_linear" ：先固定消耗，超过阈值后再按比例增加
+        "resource_consumption_mode": "piecewise_linear",
+
+        # 固定消耗项的计算模式：
+        # - "constant"      ：所有节点用同一个固定常数
+        # - "degree_scaled" ：固定项 = 倍数 × 节点度 d_i
+        "resource_consumption_fixed_mode": "degree_scaled",
+
+        # 固定消耗constant项。
+        # - fixed            ：每轮直接消耗这个值
+        # - piecewise_linear ：作为基础固定消耗
+        # 仅当 resource_consumption_fixed_mode == "constant" 时生效。
+        "resource_consumption_fixed": 4, #暂时设置等于平均度
+
+        # 度比例固定消耗倍数。
+        # 当 resource_consumption_fixed_mode == "degree_scaled" 时：
+        # fixed_term_i = resource_consumption_degree_multiplier * degree_i
+        "resource_consumption_degree_multiplier": 1.0,
+
+        # 比例消耗系数。
+        # - proportional     ：consumption = rate * resources
+        # - piecewise_linear ：consumption = fixed + rate * max(resources - threshold, 0)
+        "resource_consumption_rate": 0.1,
+
+        # 分段线性消耗阈值。
+        # 仅当 resource_consumption_mode == "piecewise_linear" 时使用。
+        "resource_consumption_threshold": 50.0,
 
         # 个体策略更新规则：
         # - "fermi"        ：同步 Fermi 更新
@@ -125,7 +159,7 @@ BASE_EXPERIMENT = {
         # - "q_learning_2x2"：每个节点使用 2状态×2动作 Q-learning，
         #                     状态=自己上一轮动作，动作=本轮选 C/D
         # - "imitate_best" ：最优邻居模仿 / Best-takes-over
-        "strategy_update_rule": "fermi",
+        "strategy_update_rule": "q_learning",
 
         # beta：同步 Fermi 更新的选择强度。
         # 仅当 strategy_update_rule == "fermi" 时使用。
@@ -141,10 +175,10 @@ BASE_EXPERIMENT = {
 
         # 每个 episode 的时间步上限。
         # 到达这个步数后，本 episode 结束。
-        "episode_length": 150,
+        "episode_length": 10000, #150
 
         # 所有节点统一的初始资源。
-        "initial_resource": 10.0,
+        "initial_resource": 20.0,#10
 
         # 初始名义合作概率。
         # 如果不单独指定节点策略向量，reset 时每个节点按这个概率初始化为合作。
@@ -223,7 +257,7 @@ BASE_EXPERIMENT = {
         "eval_episodes": 3,
 
         # 训练设备：cpu 或 cuda。
-        "device": "cpu",
+        "device": "cuda",
     },
 
     # ---------------------------
@@ -244,7 +278,7 @@ BASE_EXPERIMENT = {
     "visualization": {
         # 是否生成微观网络快照图。
         # 开启后，每个选中的 episode 都会在每个时间步保存一张图。
-        "enable_micro_snapshots": True,
+        "enable_micro_snapshots": False,
 
         # 是否生成宏观时间序列图。
         # 开启后，每个选中的 episode 都会保存一张统计量随时间变化的折线图。
@@ -279,6 +313,7 @@ BASE_EXPERIMENT = {
         # - "pool_grown" ：增长后池子资源
         # - "investment" ：个体投入
         # - "income"     ：个体收入
+        # - "consumption": 个体消耗
         # - "payoff"     ：个体净收益
         "node_color_metric": "x_actual",
 
@@ -294,6 +329,7 @@ BASE_EXPERIMENT = {
         # - "resources"  ：显示当前个体资源
         # - "investment" ：显示当前投入
         # - "income"     ：显示当前收入
+        # - "consumption": 显示当前消耗
         "node_value_metric": "resources",
 
         # 节点中心数值保留的小数位数。
@@ -310,6 +346,7 @@ BASE_EXPERIMENT = {
             "actual_cooperation_rate",
             "mean_resource",
             "mean_pool_grown",
+            "mean_consumption",
             "mean_payoff",
             "gini",
         ],
@@ -324,7 +361,7 @@ BASE_EXPERIMENT = {
     "output": {
         # 所有输出结果的根目录。
         # 每个实验会在下面单独建一个子目录。
-        "root_dir": "outputs",
+        "root_dir": "outputs/200frame_piecewise_degree_Pmax100_R020_r2_len200",#"outputs",
 
         # 是否保存结果 JSON。
         "save_results_json": True,
@@ -358,54 +395,72 @@ BASE_EXPERIMENT = {
 #
 BATCH_EXPERIMENTS = [
     {
-        "experiment_name": "regular_d4_prop_r15_q_learning_2x2",
+        "experiment_name": "regular_d4_prop_r15_q_learning",
         "network": {"type": "regular", "regular_degree": 4},
         "run_mode": "proportional",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
+        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
     },
         {
-        "experiment_name": "regular_d4_uniform_r15_q_learning_2x2",
+        "experiment_name": "regular_d4_uniform_r15_q_learning",
         "network": {"type": "regular", "regular_degree": 4},
         "run_mode": "uniform",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
+        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
     },
         {
-        "experiment_name": "ba_m2_proportional_r15_q_learning_2x2",
+        "experiment_name": "ba_m2_proportional_r15_q_learning",
         "network": {"type": "scale_free", "ba_attachments_per_new_node": 2},
         "run_mode": "proportional",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
+        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
     },
         {
-        "experiment_name": "ba_m2_uniform_r15_q_learning_2x2",
+        "experiment_name": "ba_m2_uniform_r15_q_learning",
         "network": {"type": "scale_free", "ba_attachments_per_new_node": 2},
         "run_mode": "uniform",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
+        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
     },
         {
-        "experiment_name": "er_p04_proportional_r15_q_learning_2x2",
+        "experiment_name": "er_p04_proportional_r15_q_learning",
         "network": {"type": "erdos_renyi", "er_edge_prob": 0.04},
         "run_mode": "proportional",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
+        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
     },
         {
-        "experiment_name": "er_p04_uniform_r15_q_learning_2x2",
+        "experiment_name": "er_p04_uniform_r15_q_learning",
         "network": {"type": "erdos_renyi", "er_edge_prob": 0.04},
         "run_mode": "uniform",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
+        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
     },
         {
-        "experiment_name": "ws_k4_p01_proportional_r15_q_learning_2x2",
+        "experiment_name": "ws_k4_p01_proportional_r15_q_learning",
         "network": {"type": "small_world", "ws_degree": 4, "ws_rewiring_prob": 0.1},
         "run_mode": "proportional",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
+        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
     },
         {
-        "experiment_name": "ws_k4_p01_uniform_r15_q_learning_2x2",
+        "experiment_name": "ws_k4_p01_uniform_r15_q_learning",
         "network": {"type": "small_world", "ws_degree": 4, "ws_rewiring_prob": 0.1},
         "run_mode": "uniform",
-        "dynamics": {"r": 1.5,"strategy_update_rule": "q_learning_2x2"},
+        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
     },
 ]
+
+
+# =============================================================================
+# 参数扫描配置：启用后会忽略上面的 BATCH_EXPERIMENTS，自动生成扫描实验
+# =============================================================================
+SCAN_EXPERIMENT = {
+    "enabled": True,
+    "name": "3_18_r_network_consumption_strategy_scan",
+    "output_root_dir": "outputs/r_network_consumption_strategy_scan",
+    "parallel": True,
+    "max_workers": 8,#自己的电脑为16核
+    "r_values": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5],
+    "network_types": ["regular", "erdos_renyi", "small_world", "scale_free"],
+    "resource_consumption_modes": ["fixed", "proportional", "piecewise_linear"],
+    "resource_consumption_fixed_modes": ["constant", "degree_scaled"],
+    "strategy_update_rules": ["q_learning", "fermi"],
+    "run_mode": ["proportional"],
+}
 
 def deep_update(base: Dict[str, Any], overrides: Mapping[str, Any]) -> Dict[str, Any]:
     for key, value in overrides.items():
@@ -416,7 +471,153 @@ def deep_update(base: Dict[str, Any], overrides: Mapping[str, Any]) -> Dict[str,
     return base
 
 
+def _format_float_token(value: float) -> str:
+    token = format(float(value), "g")
+    return token.replace("-", "m").replace(".", "p")
+
+
+def _network_variant_label(network: Mapping[str, Any]) -> str:
+    network_type = network["type"]
+    if network_type == "regular":
+        return "regular_d{0}".format(network["regular_degree"])
+    if network_type == "erdos_renyi":
+        return "er_p{0}".format(_format_float_token(network["er_edge_prob"]))
+    if network_type == "small_world":
+        return "ws_k{0}_p{1}".format(
+            network["ws_degree"],
+            _format_float_token(network["ws_rewiring_prob"]),
+        )
+    if network_type == "scale_free":
+        return "ba_m{0}".format(network["ba_attachments_per_new_node"])
+    if network_type == "grid":
+        return "grid_{0}x{1}".format(network["grid_rows"], network["grid_cols"])
+    raise ValueError("Unsupported network type: {0}".format(network_type))
+
+
+def _network_override_for_type(base_network: Mapping[str, Any], network_type: str) -> Dict[str, Any]:
+    override: Dict[str, Any] = {"type": network_type, "num_nodes": base_network["num_nodes"]}
+    if network_type == "regular":
+        override["regular_degree"] = base_network["regular_degree"]
+    elif network_type == "erdos_renyi":
+        override["er_edge_prob"] = base_network["er_edge_prob"]
+    elif network_type == "small_world":
+        override["ws_degree"] = base_network["ws_degree"]
+        override["ws_rewiring_prob"] = base_network["ws_rewiring_prob"]
+    elif network_type == "scale_free":
+        override["ba_attachments_per_new_node"] = base_network["ba_attachments_per_new_node"]
+    elif network_type == "grid":
+        override["grid_rows"] = base_network["grid_rows"]
+        override["grid_cols"] = base_network["grid_cols"]
+        override["grid_periodic"] = base_network["grid_periodic"]
+    else:
+        raise ValueError("Unsupported network type in scan: {0}".format(network_type))
+    return override
+
+
+def _consumption_variants(scan_config: Mapping[str, Any]) -> List[tuple[str, Optional[str]]]:
+    variants: List[tuple[str, Optional[str]]] = []
+    for mode in scan_config["resource_consumption_modes"]:
+        if mode == "proportional":
+            variants.append((mode, None))
+            continue
+        for fixed_mode in scan_config["resource_consumption_fixed_modes"]:
+            variants.append((mode, fixed_mode))
+    return variants
+
+
+def _consumption_variant_label(mode: str, fixed_mode: Optional[str]) -> str:
+    if mode == "proportional":
+        return "proportional"
+    if fixed_mode is None:
+        raise ValueError("fixed_mode is required for mode {0}".format(mode))
+    return "{0}_{1}".format(mode, fixed_mode)
+
+
+def _scan_run_modes(scan_config: Mapping[str, Any], base_run_mode: str) -> List[str]:
+    configured_run_mode = scan_config.get("run_mode", base_run_mode)
+    if isinstance(configured_run_mode, str):
+        run_modes = [configured_run_mode]
+    else:
+        run_modes = [str(item) for item in configured_run_mode]
+
+    if not run_modes:
+        raise ValueError("SCAN_EXPERIMENT['run_mode'] must contain at least one run mode.")
+    invalid_run_modes = [item for item in run_modes if item not in {"uniform", "proportional"}]
+    if invalid_run_modes:
+        raise ValueError(
+            "Scan mode currently supports only rule-based run_mode values {'uniform', 'proportional'}."
+            " Invalid values: {0}".format(invalid_run_modes)
+        )
+    return run_modes
+
+
+def build_scan_experiment_specs() -> List[Dict[str, Any]]:
+    base = deepcopy(BASE_EXPERIMENT)
+    scan = SCAN_EXPERIMENT
+    run_modes = _scan_run_modes(scan, str(base["run_mode"]))
+    specs: List[Dict[str, Any]] = []
+
+    for run_mode in run_modes:
+        for strategy_update_rule in scan["strategy_update_rules"]:
+            for resource_consumption_mode, resource_consumption_fixed_mode in _consumption_variants(scan):
+                consumption_label = _consumption_variant_label(
+                    resource_consumption_mode,
+                    resource_consumption_fixed_mode,
+                )
+                for network_type in scan["network_types"]:
+                    network_override = _network_override_for_type(base["network"], network_type)
+                    network_label = _network_variant_label(network_override)
+                    for r_value in scan["r_values"]:
+                        experiment_name = "{0}__{1}__{2}__{3}__r{4}".format(
+                            network_label,
+                            run_mode,
+                            consumption_label,
+                            strategy_update_rule,
+                            _format_float_token(r_value),
+                        )
+                        spec = deep_update(
+                            deepcopy(base),
+                            {
+                                "experiment_name": experiment_name,
+                                "run_mode": run_mode,
+                                "network": network_override,
+                                "dynamics": {
+                                    "r": float(r_value),
+                                    "resource_consumption_mode": resource_consumption_mode,
+                                    "strategy_update_rule": strategy_update_rule,
+                                },
+                                "visualization": {
+                                    "enable_micro_snapshots": False,
+                                    "enable_macro_timeseries": True,
+                                },
+                                "output": {
+                                    "root_dir": scan["output_root_dir"],
+                                    "save_micro_snapshots": False,
+                                    "save_macro_timeseries": True,
+                                },
+                            },
+                        )
+                        if resource_consumption_fixed_mode is not None:
+                            spec["dynamics"]["resource_consumption_fixed_mode"] = resource_consumption_fixed_mode
+                        spec["scan_tags"] = {
+                            "scan_name": scan["name"],
+                            "run_mode": run_mode,
+                            "network_label": network_label,
+                            "consumption_label": consumption_label,
+                            "resource_consumption_mode": resource_consumption_mode,
+                            "resource_consumption_fixed_mode": resource_consumption_fixed_mode,
+                            "strategy_update_rule": strategy_update_rule,
+                            "r": float(r_value),
+                        }
+                        specs.append(spec)
+
+    return specs
+
+
 def build_experiment_specs() -> List[Dict[str, Any]]:
+    if SCAN_EXPERIMENT["enabled"]:
+        return build_scan_experiment_specs()
+
     base = deepcopy(BASE_EXPERIMENT)
     if not BATCH_EXPERIMENTS:
         return [base]
@@ -473,6 +674,12 @@ def build_env_config(spec: Mapping[str, Any]) -> SPGGConfig:
         alpha=dynamics["alpha"],
         r=dynamics["r"],
         p_max=dynamics["p_max"],
+        resource_consumption_mode=dynamics.get("resource_consumption_mode", "fixed"),
+        resource_consumption_fixed_mode=dynamics.get("resource_consumption_fixed_mode", "constant"),
+        resource_consumption_fixed=dynamics.get("resource_consumption_fixed", 0.0),
+        resource_consumption_degree_multiplier=dynamics.get("resource_consumption_degree_multiplier", 0.0),
+        resource_consumption_rate=dynamics.get("resource_consumption_rate", 0.0),
+        resource_consumption_threshold=dynamics.get("resource_consumption_threshold", 0.0),
         strategy_update_rule=dynamics.get("strategy_update_rule", "fermi"),
         beta=dynamics["beta"],
         q_learning_rate=dynamics.get("q_learning_rate", 0.1),
@@ -561,6 +768,38 @@ def print_header(spec: Mapping[str, Any], graph: Mapping[int, Sequence[int]], en
             env_config.episode_length,
         )
     )
+    if env_config.resource_consumption_mode == "fixed":
+        if env_config.resource_consumption_fixed_mode == "degree_scaled":
+            print(
+                "Consume   : mode=fixed, fixed_mode=degree_scaled, degree_multiplier={0}".format(
+                    env_config.resource_consumption_degree_multiplier
+                )
+            )
+        else:
+            print(
+                "Consume   : mode=fixed, fixed_mode=constant, fixed={0}".format(
+                    env_config.resource_consumption_fixed
+                )
+            )
+    elif env_config.resource_consumption_mode == "proportional":
+        print("Consume   : mode=proportional, rate={0}".format(env_config.resource_consumption_rate))
+    else:
+        if env_config.resource_consumption_fixed_mode == "degree_scaled":
+            print(
+                "Consume   : mode=piecewise_linear, fixed_mode=degree_scaled, degree_multiplier={0}, rate={1}, threshold={2}".format(
+                    env_config.resource_consumption_degree_multiplier,
+                    env_config.resource_consumption_rate,
+                    env_config.resource_consumption_threshold,
+                )
+            )
+        else:
+            print(
+                "Consume   : mode=piecewise_linear, fixed_mode=constant, fixed={0}, rate={1}, threshold={2}".format(
+                    env_config.resource_consumption_fixed,
+                    env_config.resource_consumption_rate,
+                    env_config.resource_consumption_threshold,
+                )
+            )
     if env_config.strategy_update_rule == "fermi":
         print("Strategy  : rule=fermi, beta={0}".format(env_config.beta))
     elif env_config.strategy_update_rule == "q_learning":
@@ -616,6 +855,7 @@ def capture_record(
     resources = observation["resources"].copy()
     zeros = np.zeros_like(resources, dtype=np.float64)
     income = np.asarray(info["income"], dtype=np.float64).copy() if info is not None else zeros.copy()
+    consumption = np.asarray(info["consumption"], dtype=np.float64).copy() if info is not None else zeros.copy()
     payoff = np.asarray(info["payoff"], dtype=np.float64).copy() if info is not None else zeros.copy()
 
     record = {
@@ -627,6 +867,7 @@ def capture_record(
         "pool_raw": observation["pool_raw"].copy(),
         "pool_grown": observation["pool_grown"].copy(),
         "income": income,
+        "consumption": consumption,
         "payoff": payoff,
         "reward": float(reward),
         "gini": float(info["gini"]) if info is not None else gini_coefficient(resources),
@@ -637,6 +878,7 @@ def capture_record(
         "mean_pool_grown": float(np.mean(observation["pool_grown"])),
         "mean_investment": float(np.mean(observation["investment"])),
         "mean_income": float(np.mean(income)),
+        "mean_consumption": float(np.mean(consumption)),
         "mean_payoff": float(np.mean(payoff)),
     }
     return record
@@ -659,20 +901,19 @@ def save_visualizations_for_history(
 
     from Project1.visualization import build_layout, save_macro_timeseries, save_network_snapshots
 
-    network = spec["network"]
-    grid_shape = None
-    if network["type"] == "grid":
-        grid_shape = (network["grid_rows"], network["grid_cols"])
-
-    layout = build_layout(
-        graph,
-        layout_name=visualization["layout"],
-        seed=spec["seed"],
-        spring_iterations=visualization["spring_iterations"],
-        grid_shape=grid_shape,
-    )
-
     if visualization["enable_micro_snapshots"] and output["save_micro_snapshots"]:
+        network = spec["network"]
+        grid_shape = None
+        if network["type"] == "grid":
+            grid_shape = (network["grid_rows"], network["grid_cols"])
+
+        layout = build_layout(
+            graph,
+            layout_name=visualization["layout"],
+            seed=spec["seed"],
+            spring_iterations=visualization["spring_iterations"],
+            grid_shape=grid_shape,
+        )
         micro_dir = output_dir / "{0}_episode_{1:03d}_micro".format(phase_name, episode_index)
         save_network_snapshots(
             graph=graph,
@@ -706,8 +947,34 @@ def summarize_episode(history: Sequence[Dict[str, Any]]) -> Dict[str, float]:
         "final_actual_cooperation": float(final_record["actual_cooperation_rate"]),
         "final_mean_resource": float(final_record["mean_resource"]),
         "final_mean_pool_grown": float(final_record["mean_pool_grown"]),
+        "final_mean_consumption": float(final_record["mean_consumption"]),
         "final_mean_payoff": float(final_record["mean_payoff"]),
         "final_gini": float(final_record["gini"]),
+    }
+
+
+def summarize_rule_based_episodes(
+    episode_summaries: Sequence[Mapping[str, float]],
+    episode_returns: Sequence[float],
+) -> Dict[str, float]:
+    final_actual_cooperation_mean = float(np.mean([item["final_actual_cooperation"] for item in episode_summaries]))
+    final_mean_resource_mean = float(np.mean([item["final_mean_resource"] for item in episode_summaries]))
+    final_mean_pool_grown_mean = float(np.mean([item["final_mean_pool_grown"] for item in episode_summaries]))
+    final_mean_consumption_mean = float(np.mean([item["final_mean_consumption"] for item in episode_summaries]))
+    final_mean_payoff_mean = float(np.mean([item["final_mean_payoff"] for item in episode_summaries]))
+    final_gini_mean = float(np.mean([item["final_gini"] for item in episode_summaries]))
+
+    return {
+        "return_mean": float(np.mean(episode_returns)),
+        "return_std": float(np.std(episode_returns)),
+        "final_cooperation_mean": final_actual_cooperation_mean,
+        "final_actual_cooperation_mean": final_actual_cooperation_mean,
+        "final_mean_resource_mean": final_mean_resource_mean,
+        "final_mean_pool_grown_mean": final_mean_pool_grown_mean,
+        "final_consumption_mean": final_mean_consumption_mean,
+        "final_mean_consumption_mean": final_mean_consumption_mean,
+        "final_mean_payoff_mean": final_mean_payoff_mean,
+        "final_gini_mean": final_gini_mean,
     }
 
 
@@ -775,12 +1042,7 @@ def run_rule_based_mode(
         "run_mode": run_mode,
         "network_type": spec["network"]["type"],
         "episode_summaries": episode_summaries,
-        "summary": {
-            "return_mean": float(np.mean(episode_returns)),
-            "return_std": float(np.std(episode_returns)),
-            "final_cooperation_mean": float(np.mean([item["final_actual_cooperation"] for item in episode_summaries])),
-            "final_gini_mean": float(np.mean([item["final_gini"] for item in episode_summaries])),
-        },
+        "summary": summarize_rule_based_episodes(episode_summaries, episode_returns),
     }
 
 
@@ -947,7 +1209,185 @@ def run_one_experiment(spec: Mapping[str, Any]) -> Dict[str, Any]:
     return results
 
 
+def _run_scan_experiment_worker(spec: Mapping[str, Any]) -> Dict[str, Any]:
+    results = run_one_experiment(spec)
+    return _scan_record_from_results(spec, results)
+
+
+def _scan_record_from_results(spec: Mapping[str, Any], results: Mapping[str, Any]) -> Dict[str, Any]:
+    summary = results["summary"]
+    scan_tags = spec["scan_tags"]
+    return {
+        "experiment_name": spec["experiment_name"],
+        "run_mode": scan_tags["run_mode"],
+        "network_type": spec["network"]["type"],
+        "network_label": scan_tags["network_label"],
+        "resource_consumption_mode": scan_tags["resource_consumption_mode"],
+        "resource_consumption_fixed_mode": scan_tags["resource_consumption_fixed_mode"],
+        "consumption_label": scan_tags["consumption_label"],
+        "strategy_update_rule": scan_tags["strategy_update_rule"],
+        "r": float(scan_tags["r"]),
+        "final_actual_cooperation_mean": float(summary["final_actual_cooperation_mean"]),
+        "final_mean_resource_mean": float(summary["final_mean_resource_mean"]),
+        "final_mean_pool_grown_mean": float(summary["final_mean_pool_grown_mean"]),
+        "final_mean_consumption_mean": float(summary["final_mean_consumption_mean"]),
+        "final_mean_payoff_mean": float(summary["final_mean_payoff_mean"]),
+        "final_gini_mean": float(summary["final_gini_mean"]),
+        "return_mean": float(summary["return_mean"]),
+        "return_std": float(summary["return_std"]),
+    }
+
+
+def _save_scan_summary_tables(
+    output_root: Path,
+    scan_records: Sequence[Mapping[str, Any]],
+) -> None:
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    json_path = output_root / "scan_summary.json"
+    json_path.write_text(json.dumps(list(scan_records), ensure_ascii=False, indent=2), encoding="utf-8")
+    print("Scan summary saved to: {0}".format(json_path))
+
+    csv_path = output_root / "scan_summary.csv"
+    fieldnames = [
+        "experiment_name",
+        "run_mode",
+        "network_type",
+        "network_label",
+        "resource_consumption_mode",
+        "resource_consumption_fixed_mode",
+        "consumption_label",
+        "strategy_update_rule",
+        "r",
+        "final_actual_cooperation_mean",
+        "final_mean_resource_mean",
+        "final_mean_pool_grown_mean",
+        "final_mean_consumption_mean",
+        "final_mean_payoff_mean",
+        "final_gini_mean",
+        "return_mean",
+        "return_std",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in scan_records:
+            writer.writerow({field: record.get(field) for field in fieldnames})
+    print("Scan CSV saved to: {0}".format(csv_path))
+
+
+def _save_scan_steady_state_plots(
+    output_root: Path,
+    scan_records: Sequence[Mapping[str, Any]],
+) -> None:
+    from Project1.visualization import save_scan_metric_grid
+
+    metrics = [
+        "final_actual_cooperation_mean",
+        "final_mean_resource_mean",
+        "final_mean_pool_grown_mean",
+        "final_mean_consumption_mean",
+        "final_mean_payoff_mean",
+        "final_gini_mean",
+    ]
+
+    grouped_records: Dict[tuple[str, str, str], List[Mapping[str, Any]]] = {}
+    for record in scan_records:
+        group_key = (
+            str(record["run_mode"]),
+            str(record["strategy_update_rule"]),
+            str(record["consumption_label"]),
+        )
+        grouped_records.setdefault(group_key, []).append(record)
+
+    steady_state_dir = output_root / "steady_state_vs_r"
+    steady_state_dir.mkdir(parents=True, exist_ok=True)
+
+    for (run_mode, strategy_update_rule, consumption_label), records in grouped_records.items():
+        output_path = steady_state_dir / "{0}__{1}__{2}__steady_state_vs_r.png".format(
+            run_mode,
+            strategy_update_rule,
+            consumption_label,
+        )
+        title = "Steady-state vs r | run_mode={0} | strategy={1} | consumption={2}".format(
+            run_mode,
+            strategy_update_rule,
+            consumption_label,
+        )
+        save_scan_metric_grid(
+            records=records,
+            output_path=output_path,
+            metrics=metrics,
+            title=title,
+            dpi=int(BASE_EXPERIMENT["visualization"]["save_dpi"]),
+        )
+
+
+def run_scan_experiments() -> None:
+    specs = build_scan_experiment_specs()
+    output_root = Path(SCAN_EXPERIMENT["output_root_dir"])
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "scan_config": deepcopy(SCAN_EXPERIMENT),
+        "base_experiment_name": BASE_EXPERIMENT["experiment_name"],
+        "base_run_mode": BASE_EXPERIMENT["run_mode"],
+        "num_experiments": len(specs),
+    }
+    manifest_path = output_root / "scan_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("Scan manifest saved to: {0}".format(manifest_path))
+
+    scan_records: List[Dict[str, Any]] = []
+    if SCAN_EXPERIMENT["parallel"]:
+        requested_workers = SCAN_EXPERIMENT["max_workers"]
+        cpu_count = os.cpu_count() or 1
+        max_workers = cpu_count if requested_workers in (None, 0) else int(requested_workers)
+        max_workers = max(1, min(max_workers, len(specs)))
+        print("Running scan in parallel with {0} worker processes.".format(max_workers))
+
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_meta = {
+                executor.submit(_run_scan_experiment_worker, spec): (index, spec["experiment_name"])
+                for index, spec in enumerate(specs, start=1)
+            }
+            for completed_count, future in enumerate(as_completed(future_to_meta), start=1):
+                index, experiment_name = future_to_meta[future]
+                print(
+                    "[Scan completed {0}/{1}] #{2} {3}".format(
+                        completed_count,
+                        len(specs),
+                        index,
+                        experiment_name,
+                    )
+                )
+                scan_records.append(future.result())
+    else:
+        for index, spec in enumerate(specs, start=1):
+            print("\n" + "#" * 80)
+            print("Scan experiment {0}/{1}".format(index, len(specs)))
+            print("#" * 80)
+            results = run_one_experiment(spec)
+            scan_records.append(_scan_record_from_results(spec, results))
+
+    scan_records.sort(
+        key=lambda item: (
+            str(item["run_mode"]),
+            str(item["strategy_update_rule"]),
+            str(item["consumption_label"]),
+            str(item["network_label"]),
+            float(item["r"]),
+        )
+    )
+    _save_scan_summary_tables(output_root, scan_records)
+    _save_scan_steady_state_plots(output_root, scan_records)
+
+
 def main() -> None:
+    if SCAN_EXPERIMENT["enabled"]:
+        run_scan_experiments()
+        return
+
     specs = build_experiment_specs()
     for index, spec in enumerate(specs, start=1):
         if len(specs) > 1:

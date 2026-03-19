@@ -27,9 +27,19 @@ SCALAR_LABELS = {
     "mean_pool_grown": "Mean Grown Pool",
     "mean_investment": "Mean Investment",
     "mean_income": "Mean Income",
+    "mean_consumption": "Mean Consumption",
     "mean_payoff": "Mean Payoff",
     "gini": "Gini",
     "reward": "Reward",
+}
+
+STEADY_STATE_LABELS = {
+    "final_actual_cooperation_mean": "Steady-State f_c",
+    "final_mean_resource_mean": "Steady-State Mean Resource",
+    "final_mean_pool_grown_mean": "Steady-State Mean Grown Pool",
+    "final_mean_consumption_mean": "Steady-State Mean Consumption",
+    "final_mean_payoff_mean": "Steady-State Mean Payoff",
+    "final_gini_mean": "Steady-State Gini",
 }
 
 
@@ -138,6 +148,75 @@ def save_macro_timeseries(
     axes[-1].set_xlabel("Time step")
     figure.suptitle(title or "Macro Statistics Over Time", fontsize=14)
     figure.tight_layout()
+    figure.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
+
+
+def save_scan_metric_grid(
+    records: Sequence[Mapping[str, Any]],
+    output_path: Path,
+    metrics: Sequence[str],
+    title: str = "",
+    dpi: int = 160,
+) -> None:
+    if not records or not metrics:
+        return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    network_labels = sorted({str(record["network_label"]) for record in records})
+    num_metrics = len(metrics)
+    num_cols = 2
+    num_rows = int(np.ceil(num_metrics / num_cols))
+    marker_cycle = ["o", "s", "^", "D", "v", "P", "X", "*"]
+    line_style_cycle = ["-", "--", "-.", ":"]
+
+    figure, axes = plt.subplots(num_rows, num_cols, figsize=(14, 3.5 * num_rows), sharex=True)
+    axes_array = np.atleast_1d(axes).reshape(-1)
+
+    for axis, metric in zip(axes_array, metrics):
+        for network_index, network_label in enumerate(network_labels):
+            network_records = [
+                record for record in records
+                if str(record["network_label"]) == network_label
+            ]
+            network_records.sort(key=lambda item: float(item["r"]))
+            r_values = [float(item["r"]) for item in network_records]
+            y_values = [float(item[metric]) for item in network_records]
+            axis.plot(
+                r_values,
+                y_values,
+                marker=marker_cycle[network_index % len(marker_cycle)],
+                linestyle=line_style_cycle[network_index % len(line_style_cycle)],
+                linewidth=2.0,
+                markersize=6.5,
+                alpha=0.85,
+                markeredgecolor="white",
+                markeredgewidth=0.9,
+                label=network_label,
+            )
+
+        axis.set_ylabel(STEADY_STATE_LABELS.get(metric, metric))
+        axis.grid(True, linestyle="--", alpha=0.35)
+
+    for axis in axes_array[num_metrics:]:
+        axis.axis("off")
+
+    for axis in axes_array[-num_cols:]:
+        axis.set_xlabel("r")
+
+    if network_labels:
+        handles, labels = axes_array[0].get_legend_handles_labels()
+        figure.legend(
+            handles,
+            labels,
+            loc="center left",
+            bbox_to_anchor=(1.01, 0.5),
+            frameon=True,
+            title="Network",
+        )
+
+    figure.suptitle(title or "Steady-State Metrics vs r", fontsize=14, y=0.995)
+    figure.tight_layout(rect=(0.0, 0.0, 0.84, 0.96))
     figure.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
 

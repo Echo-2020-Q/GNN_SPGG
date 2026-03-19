@@ -70,6 +70,106 @@ class SPGGEnvTests(unittest.TestCase):
         np.testing.assert_allclose(observation["pool_raw"], np.array([2.0, 2.0]))
         np.testing.assert_allclose(observation["pool_grown"], np.array([3.0, 3.0]))
 
+    def test_fixed_resource_consumption_reduces_resources_but_not_payoff(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.0,
+                p_max=10.0,
+                resource_consumption_mode="fixed",
+                resource_consumption_fixed=1.0,
+                beta=0.0,
+                episode_length=1,
+            ),
+            {0: [1], 1: [0]},
+        )
+
+        observation = env.reset(initial_resources=[3.0, 3.0], initial_strategies=[1, 1], seed=0)
+        next_observation, reward, done, info = env.step(UniformAllocationPolicy().allocate(observation))
+        self.assertTrue(done)
+        self.assertAlmostEqual(reward, 0.0)
+        np.testing.assert_allclose(info["consumption"], np.array([1.0, 1.0]))
+        np.testing.assert_allclose(info["payoff"], np.array([0.0, 0.0]))
+        np.testing.assert_allclose(next_observation["resources"], np.array([2.0, 2.0]))
+
+    def test_proportional_resource_consumption_is_capped_by_available_resources(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.0,
+                p_max=1.0,
+                resource_consumption_mode="proportional",
+                resource_consumption_rate=2.0,
+                beta=0.0,
+                episode_length=1,
+                num_nodes=1,
+            ),
+            [],
+        )
+
+        observation = env.reset(initial_resources=[1.0], initial_strategies=[0], seed=0)
+        next_observation, reward, done, info = env.step(np.array([[1.0]], dtype=np.float64))
+        self.assertTrue(done)
+        self.assertAlmostEqual(reward, 0.0)
+        np.testing.assert_allclose(info["consumption"], np.array([1.0]))
+        np.testing.assert_allclose(info["payoff"], np.array([0.0]))
+        np.testing.assert_allclose(next_observation["resources"], np.array([0.0]))
+
+    def test_degree_scaled_fixed_consumption_uses_node_degree(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.0,
+                p_max=1.0,
+                resource_consumption_mode="fixed",
+                resource_consumption_fixed_mode="degree_scaled",
+                resource_consumption_degree_multiplier=0.5,
+                beta=0.0,
+                episode_length=1,
+            ),
+            {0: [1], 1: [0, 2], 2: [1]},
+        )
+        nominal = env._compute_nominal_consumption(np.array([10.0, 10.0, 10.0], dtype=np.float64))
+        np.testing.assert_allclose(nominal, np.array([0.5, 1.0, 0.5]))
+
+    def test_piecewise_linear_consumption_adds_fixed_and_excess_terms(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.0,
+                p_max=1.0,
+                resource_consumption_mode="piecewise_linear",
+                resource_consumption_fixed=1.0,
+                resource_consumption_rate=0.2,
+                resource_consumption_threshold=5.0,
+                beta=0.0,
+                episode_length=1,
+                num_nodes=2,
+            ),
+            {0: [1], 1: [0]},
+        )
+        nominal = env._compute_nominal_consumption(np.array([2.0, 10.0], dtype=np.float64))
+        np.testing.assert_allclose(nominal, np.array([1.0, 2.0]))
+
+    def test_piecewise_linear_consumption_can_use_degree_scaled_fixed_term(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.0,
+                p_max=1.0,
+                resource_consumption_mode="piecewise_linear",
+                resource_consumption_fixed_mode="degree_scaled",
+                resource_consumption_degree_multiplier=0.5,
+                resource_consumption_rate=0.2,
+                resource_consumption_threshold=5.0,
+                beta=0.0,
+                episode_length=1,
+            ),
+            {0: [1], 1: [0, 2], 2: [1]},
+        )
+        nominal = env._compute_nominal_consumption(np.array([2.0, 10.0, 8.0], dtype=np.float64))
+        np.testing.assert_allclose(nominal, np.array([0.5, 2.0, 1.1]))
+
     def test_synchronous_fermi_update_uses_previous_payoff(self) -> None:
         env = SPGGEnv(
             SPGGConfig(alpha=0.0, r=0.0, p_max=1.0, beta=100.0, episode_length=1),
@@ -122,6 +222,33 @@ class SPGGEnvTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(next_nominal, np.array([0], dtype=np.int8))
 
+    def test_q_learning_uses_actual_action_when_resources_force_defection(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.0,
+                p_max=1.0,
+                strategy_update_rule="q_learning",
+                q_learning_rate=1.0,
+                q_learning_discount=0.0,
+                q_learning_epsilon=0.0,
+                episode_length=1,
+                num_nodes=1,
+            ),
+            [],
+        )
+        env.reset(initial_resources=[0.0], initial_strategies=[1], seed=0)
+        env._q_values = np.array([[0.0, 0.0]], dtype=np.float64)
+
+        next_nominal = env._q_learning_update(
+            np.array([0], dtype=np.int8),
+            np.array([3.0], dtype=np.float64),
+        )
+
+        self.assertAlmostEqual(float(env._q_values[0, 0]), 3.0)
+        self.assertAlmostEqual(float(env._q_values[0, 1]), 0.0)
+        np.testing.assert_array_equal(next_nominal, np.array([0], dtype=np.int8))
+
     def test_q_learning_2x2_updates_using_previous_action_state(self) -> None:
         env = SPGGEnv(
             SPGGConfig(
@@ -149,6 +276,35 @@ class SPGGEnvTests(unittest.TestCase):
         self.assertAlmostEqual(float(env._q_values[0, 0, 1]), 7.0)
         np.testing.assert_array_equal(next_nominal, np.array([1], dtype=np.int8))
         np.testing.assert_array_equal(env._q_learning_previous_actions, np.array([1], dtype=np.int8))
+
+    def test_q_learning_2x2_uses_actual_action_and_previous_actual_state(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.0,
+                p_max=1.0,
+                strategy_update_rule="q_learning_2x2",
+                q_learning_rate=1.0,
+                q_learning_discount=0.0,
+                q_learning_epsilon=0.0,
+                episode_length=1,
+                num_nodes=1,
+            ),
+            [],
+        )
+        env.reset(initial_resources=[0.0], initial_strategies=[1], seed=0)
+        env._q_values = np.zeros((1, 2, 2), dtype=np.float64)
+        env._q_learning_previous_actions = np.array([1], dtype=np.int8)
+
+        next_nominal = env._q_learning_2x2_update(
+            np.array([0], dtype=np.int8),
+            np.array([4.0], dtype=np.float64),
+        )
+
+        self.assertAlmostEqual(float(env._q_values[0, 1, 0]), 4.0)
+        self.assertAlmostEqual(float(env._q_values[0, 1, 1]), 0.0)
+        np.testing.assert_array_equal(next_nominal, np.array([0], dtype=np.int8))
+        np.testing.assert_array_equal(env._q_learning_previous_actions, np.array([0], dtype=np.int8))
 
     def test_isolated_node_keeps_nominal_strategy(self) -> None:
         env = SPGGEnv(

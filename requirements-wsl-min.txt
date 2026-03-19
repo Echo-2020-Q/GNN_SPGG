@@ -1,0 +1,8 @@
+# Minimal dependencies for the WSL/Codex environment.
+# This avoids pulling the default CUDA-enabled torch wheels.
+
+numpy
+matplotlib
+
+# If torch is needed later in WSL, install the CPU-only build explicitly:
+# pip install torch --index-url https://download.pytorch.org/whl/cpu

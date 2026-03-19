@@ -27,6 +27,12 @@ class SPGGConfig:
     alpha: float = 0.0
     r: float = 1.0
     p_max: float = 10.0
+    resource_consumption_mode: str = "fixed"
+    resource_consumption_fixed_mode: str = "constant"
+    resource_consumption_fixed: float = 0.0
+    resource_consumption_degree_multiplier: float = 0.0
+    resource_consumption_rate: float = 0.0
+    resource_consumption_threshold: float = 0.0
     strategy_update_rule: str = "fermi"
     beta: float = 1.0
     q_learning_rate: float = 0.1
@@ -42,6 +48,22 @@ class SPGGConfig:
     def __post_init__(self) -> None:
         if self.p_max <= 0.0:
             raise ValueError("p_max must be positive.")
+        if self.resource_consumption_mode not in {"fixed", "proportional", "piecewise_linear"}:
+            raise ValueError(
+                "resource_consumption_mode must be one of {'fixed', 'proportional', 'piecewise_linear'}."
+            )
+        if self.resource_consumption_fixed_mode not in {"constant", "degree_scaled"}:
+            raise ValueError(
+                "resource_consumption_fixed_mode must be one of {'constant', 'degree_scaled'}."
+            )
+        if self.resource_consumption_fixed < 0.0:
+            raise ValueError("resource_consumption_fixed must be non-negative.")
+        if self.resource_consumption_degree_multiplier < 0.0:
+            raise ValueError("resource_consumption_degree_multiplier must be non-negative.")
+        if self.resource_consumption_rate < 0.0:
+            raise ValueError("resource_consumption_rate must be non-negative.")
+        if self.resource_consumption_threshold < 0.0:
+            raise ValueError("resource_consumption_threshold must be non-negative.")
         if self.strategy_update_rule not in {"fermi", "q_learning", "q_learning_2x2", "imitate_best"}:
             raise ValueError(
                 "strategy_update_rule must be one of {'fermi', 'q_learning', 'q_learning_2x2', 'imitate_best'}."
@@ -300,8 +322,8 @@ class SPGGEnv:
         self._resources = self._coerce_resource_vector(initial_resources)
         self._nominal_strategies = self._coerce_strategy_vector(initial_strategies)
         self._q_values = self._initialize_q_values()
-        self._q_learning_previous_actions = self._nominal_strategies.astype(np.int8, copy=True)
         self._current_observation = self._precompute_observation(self._nominal_strategies, self._resources)
+        self._q_learning_previous_actions = self._current_observation["x_actual"].astype(np.int8, copy=True)
         return self._copy_observation(self._current_observation)
 
     def step(self, allocation_matrix: np.ndarray | Sequence[Sequence[float]]) -> tuple[Observation, float, bool, dict[str, Any]]:
@@ -313,10 +335,16 @@ class SPGGEnv:
 
         transfer_matrix = allocation * observation["pool_grown"][:, None]
         income = transfer_matrix.sum(axis=0)
+        resources_after_exchange = observation["resources"] - observation["investment"] + income
+        consumption = self._compute_effective_consumption(observation["resources"], resources_after_exchange)
         payoff = income - observation["investment"]
-        next_resources = observation["resources"] - observation["investment"] + income
+        next_resources = resources_after_exchange - consumption
 
-        next_nominal = self._update_nominal_strategies(observation["x_nominal"], payoff)
+        next_nominal = self._update_nominal_strategies(
+            observation["x_nominal"],
+            observation["x_actual"].astype(np.int8, copy=False),
+            payoff,
+        )
 
         self._step_count += 1
         done = self._step_count >= self.config.episode_length
@@ -328,6 +356,7 @@ class SPGGEnv:
             "allocation_matrix": allocation.copy(),
             "transfer_matrix": transfer_matrix.copy(),
             "income": income.copy(),
+            "consumption": consumption.copy(),
             "payoff": payoff.copy(),
             "gini": gini_coefficient(next_resources, self.config.reward.epsilon),
             "actual_cooperation_rate": float(next_observation["x_actual"].mean()),
@@ -335,6 +364,7 @@ class SPGGEnv:
             "nominal_strategies_next": next_nominal.copy(),
             "resources_next": next_resources.copy(),
             "reward_components": {
+                "mean_consumption": float(consumption.mean()),
                 "mean_payoff": float(payoff.mean()),
                 "actual_cooperation_rate_next": float(next_observation["x_actual"].mean()),
                 "gini_next_resources": gini_coefficient(next_resources, self.config.reward.epsilon),
@@ -430,6 +460,37 @@ class SPGGEnv:
             raise ValueError("Each pool row must sum to 1 across its local neighborhood.")
         return allocation
 
+    def _compute_effective_consumption(
+        self,
+        resources: np.ndarray,
+        resources_after_exchange: np.ndarray,
+    ) -> np.ndarray:
+        desired_consumption = self._compute_nominal_consumption(resources)
+        return np.minimum(desired_consumption, resources_after_exchange)
+
+    def _compute_nominal_consumption(self, resources: np.ndarray) -> np.ndarray:
+        resources = np.asarray(resources, dtype=np.float64)
+        fixed_component = self._compute_fixed_consumption_component()
+        if self.config.resource_consumption_mode == "fixed":
+            return fixed_component
+        if self.config.resource_consumption_mode == "proportional":
+            return self.config.resource_consumption_rate * resources
+        if self.config.resource_consumption_mode == "piecewise_linear":
+            excess_resources = np.maximum(resources - self.config.resource_consumption_threshold, 0.0)
+            return fixed_component + (self.config.resource_consumption_rate * excess_resources)
+        raise RuntimeError(
+            "Unsupported resource consumption mode: {0}".format(self.config.resource_consumption_mode)
+        )
+
+    def _compute_fixed_consumption_component(self) -> np.ndarray:
+        if self.config.resource_consumption_fixed_mode == "constant":
+            return np.full(self.num_nodes, self.config.resource_consumption_fixed, dtype=np.float64)
+        if self.config.resource_consumption_fixed_mode == "degree_scaled":
+            return self.config.resource_consumption_degree_multiplier * self.graph.degrees.astype(np.float64)
+        raise RuntimeError(
+            "Unsupported resource_consumption_fixed_mode: {0}".format(self.config.resource_consumption_fixed_mode)
+        )
+
     def _synchronous_fermi_update(self, nominal_strategies: np.ndarray, payoff: np.ndarray) -> np.ndarray:
         next_nominal = nominal_strategies.astype(np.int8, copy=True)
         for node, neighbors in enumerate(self.graph.neighbors):
@@ -444,24 +505,29 @@ class SPGGEnv:
                 next_nominal[node] = nominal_strategies[sampled_neighbor]
         return next_nominal
 
-    def _update_nominal_strategies(self, nominal_strategies: np.ndarray, payoff: np.ndarray) -> np.ndarray:
+    def _update_nominal_strategies(
+        self,
+        nominal_strategies: np.ndarray,
+        actual_strategies: np.ndarray,
+        payoff: np.ndarray,
+    ) -> np.ndarray:
         if self.config.strategy_update_rule == "fermi":
             return self._synchronous_fermi_update(nominal_strategies, payoff)
         if self.config.strategy_update_rule == "q_learning":
-            return self._q_learning_update(nominal_strategies, payoff)
+            return self._q_learning_update(actual_strategies, payoff)
         if self.config.strategy_update_rule == "q_learning_2x2":
-            return self._q_learning_2x2_update(nominal_strategies, payoff)
+            return self._q_learning_2x2_update(actual_strategies, payoff)
         if self.config.strategy_update_rule == "imitate_best":
             return self._imitate_best_update(nominal_strategies, payoff)
         raise RuntimeError("Unsupported strategy update rule: {0}".format(self.config.strategy_update_rule))
 
-    def _q_learning_update(self, nominal_strategies: np.ndarray, payoff: np.ndarray) -> np.ndarray:
+    def _q_learning_update(self, actual_strategies: np.ndarray, payoff: np.ndarray) -> np.ndarray:
         previous_q_values = self._q_values.copy()
         next_q_values = previous_q_values.copy()
-        next_nominal = nominal_strategies.astype(np.int8, copy=True)
+        next_nominal = actual_strategies.astype(np.int8, copy=True)
 
         for node in range(self.num_nodes):
-            action = int(nominal_strategies[node])
+            action = int(actual_strategies[node])
             best_future_value = float(previous_q_values[node].max())
             td_target = float(payoff[node]) + (self.config.q_learning_discount * best_future_value)
             next_q_values[node, action] = (
@@ -473,15 +539,15 @@ class SPGGEnv:
         self._q_values = next_q_values
         return next_nominal
 
-    def _q_learning_2x2_update(self, nominal_strategies: np.ndarray, payoff: np.ndarray) -> np.ndarray:
+    def _q_learning_2x2_update(self, actual_strategies: np.ndarray, payoff: np.ndarray) -> np.ndarray:
         previous_q_values = self._q_values.copy()
         next_q_values = previous_q_values.copy()
         state_actions = self._q_learning_previous_actions.astype(np.int8, copy=True)
-        next_nominal = nominal_strategies.astype(np.int8, copy=True)
+        next_nominal = actual_strategies.astype(np.int8, copy=True)
 
         for node in range(self.num_nodes):
             state = int(state_actions[node])
-            action = int(nominal_strategies[node])
+            action = int(actual_strategies[node])
             next_state = action
             best_future_value = float(previous_q_values[node, next_state].max())
             td_target = float(payoff[node]) + (self.config.q_learning_discount * best_future_value)
@@ -492,7 +558,7 @@ class SPGGEnv:
             next_nominal[node] = self._select_q_learning_action(next_q_values[node, next_state])
 
         self._q_values = next_q_values
-        self._q_learning_previous_actions = nominal_strategies.astype(np.int8, copy=True)
+        self._q_learning_previous_actions = actual_strategies.astype(np.int8, copy=True)
         return next_nominal
 
     def _imitate_best_update(self, nominal_strategies: np.ndarray, payoff: np.ndarray) -> np.ndarray:
