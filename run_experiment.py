@@ -83,9 +83,18 @@ BASE_EXPERIMENT = {
         # 例如 degree=4 表示每个节点都恰好连 4 条边。
         "regular_degree": 4,
 
-        # ER 网络参数：任意两点之间连边的概率。
-        # 稀疏图通常用 0.01 ~ 0.10，较稠密图可以更大。 p ≈ 4 / (n - 1) 4/99 ≈ 0.04 是平均度约为 4 的稀疏图。
-        "er_edge_prob": 0.04,
+        # ER 网络参数：目标平均度。
+        # 如果这里不是 None，程序会自动按
+        #   p = er_target_mean_degree / (num_nodes - 1)
+        # 计算 ER 连边概率。
+        # 例如目标平均度为 4：
+        # - n=100  时，p≈4/99   ≈ 0.0404
+        # - n=2500 时，p≈4/2499 ≈ 0.0016
+        "er_target_mean_degree": 4.0,
+
+        # ER 网络参数：手动指定任意两点之间连边的概率。
+        # 仅当 er_target_mean_degree 为 None 时使用。
+        "er_edge_prob": None,
 
         # WS 小世界网络参数：初始规则环网络的度。
         # 当前实现要求是偶数。
@@ -419,14 +428,14 @@ BATCH_EXPERIMENTS = [
         "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
     },
         {
-        "experiment_name": "er_p04_proportional_r15_q_learning",
-        "network": {"type": "erdos_renyi", "er_edge_prob": 0.04},
+        "experiment_name": "er_k4_proportional_r15_q_learning",
+        "network": {"type": "erdos_renyi", "er_target_mean_degree": 4.0},
         "run_mode": "proportional",
         "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
     },
         {
-        "experiment_name": "er_p04_uniform_r15_q_learning",
-        "network": {"type": "erdos_renyi", "er_edge_prob": 0.04},
+        "experiment_name": "er_k4_uniform_r15_q_learning",
+        "network": {"type": "erdos_renyi", "er_target_mean_degree": 4.0},
         "run_mode": "uniform",
         "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
     },
@@ -456,7 +465,7 @@ SCAN_EXPERIMENT = {
     "max_workers": 32,#自己的电脑为16核
     "r_values": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5],
     "resource_consumption_rate": [0.01, 0.05,0.1],
-    "num_nodes": [100,2500],
+    "num_nodes": [100,1000,2500],
     "network_types": ["regular", "erdos_renyi", "small_world", "scale_free"],
     "resource_consumption_modes": ["piecewise_linear"],#["fixed", "proportional", "piecewise_linear"],
     "resource_consumption_fixed_modes": ["constant", "degree_scaled"],
@@ -478,12 +487,54 @@ def _format_float_token(value: float) -> str:
     return token.replace("-", "m").replace(".", "p")
 
 
+def _resolve_er_edge_prob(network: Mapping[str, Any]) -> float:
+    num_nodes = int(network["num_nodes"])
+    target_mean_degree = network.get("er_target_mean_degree")
+    if target_mean_degree is not None:
+        target_mean_degree = float(target_mean_degree)
+        if target_mean_degree < 0.0:
+            raise ValueError("er_target_mean_degree must be non-negative.")
+        max_mean_degree = max(num_nodes - 1, 0)
+        if target_mean_degree > max_mean_degree:
+            raise ValueError(
+                "er_target_mean_degree must be <= num_nodes - 1."
+            )
+        if num_nodes <= 1:
+            return 0.0
+        return target_mean_degree / float(num_nodes - 1)
+
+    edge_prob = network.get("er_edge_prob")
+    if edge_prob is None:
+        raise ValueError("ER network requires er_target_mean_degree or er_edge_prob.")
+    edge_prob = float(edge_prob)
+    if not 0.0 <= edge_prob <= 1.0:
+        raise ValueError("er_edge_prob must be in [0, 1].")
+    return edge_prob
+
+
+def _er_parameter_summary(network: Mapping[str, Any]) -> str:
+    edge_prob = _resolve_er_edge_prob(network)
+    target_mean_degree = network.get("er_target_mean_degree")
+    if target_mean_degree is not None:
+        return "target_mean_degree={0}, edge_prob={1:.6g}".format(
+            float(target_mean_degree),
+            edge_prob,
+        )
+    expected_mean_degree = edge_prob * max(int(network["num_nodes"]) - 1, 0)
+    return "edge_prob={0:.6g}, expected_mean_degree={1:.6g}".format(
+        edge_prob,
+        expected_mean_degree,
+    )
+
+
 def _network_variant_label(network: Mapping[str, Any]) -> str:
     network_type = network["type"]
     if network_type == "regular":
         return "regular_d{0}".format(network["regular_degree"])
     if network_type == "erdos_renyi":
-        return "er_p{0}".format(_format_float_token(network["er_edge_prob"]))
+        if network.get("er_target_mean_degree") is not None:
+            return "er_k{0}".format(_format_float_token(network["er_target_mean_degree"]))
+        return "er_p{0}".format(_format_float_token(_resolve_er_edge_prob(network)))
     if network_type == "small_world":
         return "ws_k{0}_p{1}".format(
             network["ws_degree"],
@@ -501,7 +552,10 @@ def _network_override_for_type(base_network: Mapping[str, Any], network_type: st
     if network_type == "regular":
         override["regular_degree"] = base_network["regular_degree"]
     elif network_type == "erdos_renyi":
-        override["er_edge_prob"] = base_network["er_edge_prob"]
+        if "er_target_mean_degree" in base_network:
+            override["er_target_mean_degree"] = base_network["er_target_mean_degree"]
+        if "er_edge_prob" in base_network:
+            override["er_edge_prob"] = base_network["er_edge_prob"]
     elif network_type == "small_world":
         override["ws_degree"] = base_network["ws_degree"]
         override["ws_rewiring_prob"] = base_network["ws_rewiring_prob"]
@@ -553,10 +607,25 @@ def _scan_run_modes(scan_config: Mapping[str, Any], base_run_mode: str) -> List[
     return run_modes
 
 
+def _scan_num_nodes(scan_config: Mapping[str, Any], base_num_nodes: int) -> List[int]:
+    configured_num_nodes = scan_config.get("num_nodes", base_num_nodes)
+    if isinstance(configured_num_nodes, int):
+        num_nodes_values = [configured_num_nodes]
+    else:
+        num_nodes_values = [int(item) for item in configured_num_nodes]
+
+    if not num_nodes_values:
+        raise ValueError("SCAN_EXPERIMENT['num_nodes'] must contain at least one value.")
+    if any(item <= 0 for item in num_nodes_values):
+        raise ValueError("SCAN_EXPERIMENT['num_nodes'] values must be positive.")
+    return num_nodes_values
+
+
 def build_scan_experiment_specs() -> List[Dict[str, Any]]:
     base = deepcopy(BASE_EXPERIMENT)
     scan = SCAN_EXPERIMENT
     run_modes = _scan_run_modes(scan, str(base["run_mode"]))
+    num_nodes_values = _scan_num_nodes(scan, int(base["network"]["num_nodes"]))
     specs: List[Dict[str, Any]] = []
 
     for run_mode in run_modes:
@@ -566,46 +635,50 @@ def build_scan_experiment_specs() -> List[Dict[str, Any]]:
                     resource_consumption_mode,
                     resource_consumption_fixed_mode,
                 )
-                for network_type in scan["network_types"]:
-                    network_override = _network_override_for_type(base["network"], network_type)
-                    network_label = _network_variant_label(network_override)
-                    for r_value in scan["r_values"]:
-                        experiment_name = "{0}__{1}__{2}__{3}__r{4}".format(
-                            network_label,
-                            run_mode,
-                            consumption_label,
-                            strategy_update_rule,
-                            _format_float_token(r_value),
-                        )
-                        spec = deep_update(
-                            deepcopy(base),
-                            {
-                                "experiment_name": experiment_name,
+                for num_nodes in num_nodes_values:
+                    base_network = deepcopy(base["network"])
+                    base_network["num_nodes"] = int(num_nodes)
+                    for network_type in scan["network_types"]:
+                        network_override = _network_override_for_type(base_network, network_type)
+                        network_label = "n{0}_{1}".format(num_nodes, _network_variant_label(network_override))
+                        for r_value in scan["r_values"]:
+                            experiment_name = "{0}__{1}__{2}__{3}__r{4}".format(
+                                network_label,
+                                run_mode,
+                                consumption_label,
+                                strategy_update_rule,
+                                _format_float_token(r_value),
+                            )
+                            spec = deep_update(
+                                deepcopy(base),
+                                {
+                                    "experiment_name": experiment_name,
+                                    "run_mode": run_mode,
+                                    "network": network_override,
+                                    "dynamics": {
+                                        "r": float(r_value),
+                                        "resource_consumption_mode": resource_consumption_mode,
+                                        "strategy_update_rule": strategy_update_rule,
+                                    },
+                                    "output": {
+                                        "root_dir": scan["output_root_dir"],
+                                    },
+                                },
+                            )
+                            if resource_consumption_fixed_mode is not None:
+                                spec["dynamics"]["resource_consumption_fixed_mode"] = resource_consumption_fixed_mode
+                            spec["scan_tags"] = {
+                                "scan_name": scan["name"],
                                 "run_mode": run_mode,
-                                "network": network_override,
-                                "dynamics": {
-                                    "r": float(r_value),
-                                    "resource_consumption_mode": resource_consumption_mode,
-                                    "strategy_update_rule": strategy_update_rule,
-                                },
-                                "output": {
-                                    "root_dir": scan["output_root_dir"],
-                                },
-                            },
-                        )
-                        if resource_consumption_fixed_mode is not None:
-                            spec["dynamics"]["resource_consumption_fixed_mode"] = resource_consumption_fixed_mode
-                        spec["scan_tags"] = {
-                            "scan_name": scan["name"],
-                            "run_mode": run_mode,
-                            "network_label": network_label,
-                            "consumption_label": consumption_label,
-                            "resource_consumption_mode": resource_consumption_mode,
-                            "resource_consumption_fixed_mode": resource_consumption_fixed_mode,
-                            "strategy_update_rule": strategy_update_rule,
-                            "r": float(r_value),
-                        }
-                        specs.append(spec)
+                                "num_nodes": int(num_nodes),
+                                "network_label": network_label,
+                                "consumption_label": consumption_label,
+                                "resource_consumption_mode": resource_consumption_mode,
+                                "resource_consumption_fixed_mode": resource_consumption_fixed_mode,
+                                "strategy_update_rule": strategy_update_rule,
+                                "r": float(r_value),
+                            }
+                            specs.append(spec)
 
     return specs
 
@@ -638,7 +711,7 @@ def build_graph(spec: Mapping[str, Any]) -> Dict[int, List[int]]:
     if network_type == "erdos_renyi":
         return make_erdos_renyi_graph(
             num_nodes=network["num_nodes"],
-            edge_prob=network["er_edge_prob"],
+            edge_prob=_resolve_er_edge_prob(network),
             seed=seed,
         )
     if network_type == "small_world":
@@ -747,6 +820,8 @@ def print_header(spec: Mapping[str, Any], graph: Mapping[int, Sequence[int]], en
     print("Experiment: {0}".format(spec["experiment_name"]))
     print("Run mode  : {0}".format(spec["run_mode"]))
     print("Network   : {0}".format(spec["network"]["type"]))
+    if spec["network"]["type"] == "erdos_renyi":
+        print("ER Params : {0}".format(_er_parameter_summary(spec["network"])))
     print(
         "Graph     : nodes={0}, edges={1}, degree_min={2:.0f}, degree_max={3:.0f}, degree_mean={4:.3f}".format(
             int(summary["num_nodes"]),
@@ -1216,6 +1291,7 @@ def _scan_record_from_results(spec: Mapping[str, Any], results: Mapping[str, Any
     return {
         "experiment_name": spec["experiment_name"],
         "run_mode": scan_tags["run_mode"],
+        "num_nodes": int(scan_tags["num_nodes"]),
         "network_type": spec["network"]["type"],
         "network_label": scan_tags["network_label"],
         "resource_consumption_mode": scan_tags["resource_consumption_mode"],
@@ -1248,6 +1324,7 @@ def _save_scan_summary_tables(
     fieldnames = [
         "experiment_name",
         "run_mode",
+        "num_nodes",
         "network_type",
         "network_label",
         "resource_consumption_mode",
