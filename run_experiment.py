@@ -184,7 +184,7 @@ BASE_EXPERIMENT = {
 
         # 每个 episode 的时间步上限。
         # 到达这个步数后，本 episode 结束。
-        "episode_length": 200, #150 10000
+        "episode_length": 20000, #150 10000
 
         # 所有节点统一的初始资源。
         "initial_resource": 20.0,#10
@@ -287,7 +287,7 @@ BASE_EXPERIMENT = {
     "visualization": {
         # 是否生成微观网络快照图。
         # 开启后，每个选中的 episode 都会在每个时间步保存一张图。
-        "enable_micro_snapshots": True,
+        "enable_micro_snapshots": False,
 
         # 是否生成宏观时间序列图。
         # 开启后，每个选中的 episode 都会保存一张统计量随时间变化的折线图。
@@ -460,9 +460,9 @@ BATCH_EXPERIMENTS = [
 SCAN_EXPERIMENT = {
     "enabled": True,
     "name": "3_18_num_nodes_r_network_consumption_strategy_scan_proportional",
-    "output_root_dir": "outputs/200frame_r_network_consumption_strategy_scan_0.01_0.1tau",
+    "output_root_dir": "outputs/20000frame_r_network_consumption_strategy_scan_0.01_0.1tau",
     "parallel": True,
-    "max_workers": 32,#自己的电脑为16核
+    "max_workers": 48,#自己的电脑为16核
     "r_values": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5],
     "resource_consumption_rate": [0.01, 0.05,0.1],
     "num_nodes": [100,1000,2500],
