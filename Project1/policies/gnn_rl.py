@@ -160,22 +160,16 @@ class ObservationGraphBuilder:
     """Builds the dense GraphNet tensors (u, V, E) from the environment observation."""
 
     node_feature_names = (
-        "x_nominal",
-        "x_actual",
-        "resources",
-        "investment",
-        "unit_investment",
-        "pool_raw",
-        "pool_grown",
-        "degrees",
+        "pool_raw_norm",
+        "resource_norm",
+        "degree_norm",
+        "strategy_norm",
     )
     global_feature_names = (
-        "x_nominal",
         "x_actual",
-        "resources",
-        "investment",
-        "pool_raw",
-        "pool_grown",
+        "resource_norm",
+        "pool_raw_norm",
+        "gini",
     )
 
     @property
@@ -195,9 +189,7 @@ class ObservationGraphBuilder:
         if ego_mask.ndim != 2 or ego_mask.size(0) != ego_mask.size(1):
             raise ValueError("observation['local_mask'] must be a square matrix.")
 
-        num_nodes = ego_mask.size(0)
-        diagonal = torch.eye(num_nodes, dtype=torch.bool, device=device)
-        edge_mask = ego_mask & ~diagonal
+        edge_mask = ego_mask
 
         node_features = torch.stack(
             [
@@ -226,16 +218,14 @@ class ObservationGraphBuilder:
         )
 
 
-def _masked_edge_mean_by_receiver(edge_features: Tensor, edge_mask: Tensor) -> Tensor:
+def _masked_edge_sum_by_receiver(edge_features: Tensor, edge_mask: Tensor) -> Tensor:
     mask = edge_mask.unsqueeze(-1).to(dtype=edge_features.dtype)
-    counts = edge_mask.sum(dim=0).clamp_min(1).to(dtype=edge_features.dtype).unsqueeze(-1)
-    return (edge_features * mask).sum(dim=0) / counts
+    return (edge_features * mask).sum(dim=0)
 
 
-def _masked_global_edge_mean(edge_features: Tensor, edge_mask: Tensor) -> Tensor:
+def _masked_global_edge_sum(edge_features: Tensor, edge_mask: Tensor) -> Tensor:
     mask = edge_mask.unsqueeze(-1).to(dtype=edge_features.dtype)
-    count = edge_mask.sum().clamp_min(1).to(dtype=edge_features.dtype)
-    return (edge_features * mask).sum(dim=(0, 1)) / count
+    return (edge_features * mask).sum(dim=(0, 1))
 
 
 class GraphNetBlock(nn.Module):
@@ -298,7 +288,7 @@ class GraphNetBlock(nn.Module):
         updated_edges = self.edge_model(edge_inputs)
         updated_edges = updated_edges * state.edge_mask.unsqueeze(-1).to(dtype=updated_edges.dtype)
 
-        aggregated_edge_messages = _masked_edge_mean_by_receiver(updated_edges, state.edge_mask)
+        aggregated_edge_messages = _masked_edge_sum_by_receiver(updated_edges, state.edge_mask)
         global_context_for_nodes = state.global_features.view(1, -1).expand(num_nodes, -1)
         node_inputs = torch.cat(
             [
@@ -310,8 +300,8 @@ class GraphNetBlock(nn.Module):
         )
         updated_nodes = self.node_model(node_inputs)
 
-        aggregated_nodes = updated_nodes.mean(dim=0)
-        aggregated_edges = _masked_global_edge_mean(updated_edges, state.edge_mask)
+        aggregated_nodes = updated_nodes.sum(dim=0)
+        aggregated_edges = _masked_global_edge_sum(updated_edges, state.edge_mask)
         global_inputs = torch.cat(
             [
                 state.global_features,

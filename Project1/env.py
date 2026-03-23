@@ -43,6 +43,7 @@ class SPGGConfig:
     initial_resource: float = 10.0
     initial_cooperation_prob: float = 0.5
     num_nodes: int | None = None
+    target_mean_degree: float | None = None
     reward: RewardConfig = field(default_factory=RewardConfig)
 
     def __post_init__(self) -> None:
@@ -80,6 +81,8 @@ class SPGGConfig:
             raise ValueError("initial_cooperation_prob must be in [0, 1].")
         if self.num_nodes is not None and self.num_nodes <= 0:
             raise ValueError("num_nodes must be positive when provided.")
+        if self.target_mean_degree is not None and self.target_mean_degree < 0.0:
+            raise ValueError("target_mean_degree must be non-negative when provided.")
 
 
 @dataclass(frozen=True)
@@ -300,6 +303,13 @@ class SPGGEnv:
         self.config = config
         self.graph = self._normalize_graph(graph, config.num_nodes)
         self.num_nodes = self.graph.num_nodes
+        self.graph_mean_degree = float(self.graph.degrees.mean()) if self.num_nodes > 0 else 0.0
+        self.target_mean_degree = (
+            float(config.target_mean_degree)
+            if config.target_mean_degree is not None
+            else self.graph_mean_degree
+        )
+        self.resource_norm_reference = self._compute_resource_norm_reference()
         self.rng = np.random.default_rng()
 
         self._step_count = 0
@@ -428,6 +438,17 @@ class SPGGEnv:
 
         pool_raw = self.graph.local_mask.astype(np.float64) @ unit_investment
         pool_grown = np.minimum((1.0 + self.config.r) * pool_raw, self.config.p_max)
+        pool_raw_norm = np.minimum(pool_raw, self.config.p_max) / self.config.p_max
+        resource_norm = resources / self.resource_norm_reference
+        degree_reference = max(self.target_mean_degree, 1e-8)
+        degree_norm = (self.graph.degrees.astype(np.float64) - degree_reference) / degree_reference
+        strategy_norm = np.divide(
+            investment,
+            resources,
+            out=np.zeros_like(resources, dtype=np.float64),
+            where=resources > 0.0,
+        )
+        resource_gini = gini_coefficient(resources, self.config.reward.epsilon)
 
         return {
             "x_nominal": nominal_strategies.astype(np.int8, copy=True),
@@ -438,6 +459,11 @@ class SPGGEnv:
             "pool_raw": pool_raw.astype(np.float64, copy=True),
             "pool_grown": pool_grown.astype(np.float64, copy=True),
             "degrees": self.graph.degrees.astype(np.int64, copy=True),
+            "pool_raw_norm": pool_raw_norm.astype(np.float64, copy=True),
+            "resource_norm": resource_norm.astype(np.float64, copy=True),
+            "degree_norm": degree_norm.astype(np.float64, copy=True),
+            "strategy_norm": strategy_norm.astype(np.float64, copy=True),
+            "gini": np.asarray(resource_gini, dtype=np.float64),
             "local_mask": self.graph.local_mask.copy(),
         }
 
@@ -490,6 +516,18 @@ class SPGGEnv:
         raise RuntimeError(
             "Unsupported resource_consumption_fixed_mode: {0}".format(self.config.resource_consumption_fixed_mode)
         )
+
+    def _compute_resource_norm_reference(self) -> float:
+        denominator = self.config.alpha + self.config.resource_consumption_rate
+        if denominator <= 1e-8:
+            return max(self.config.p_max, 1e-8)
+
+        theoretical_max = (
+            self.config.p_max - ((1.0 - self.config.alpha) * (self.graph_mean_degree + 1.0))
+        ) / denominator
+        if theoretical_max <= 1e-8:
+            return max(self.config.p_max, 1e-8)
+        return float(theoretical_max)
 
     def _synchronous_fermi_update(self, nominal_strategies: np.ndarray, payoff: np.ndarray) -> np.ndarray:
         next_nominal = nominal_strategies.astype(np.int8, copy=True)

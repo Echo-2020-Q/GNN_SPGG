@@ -776,7 +776,34 @@ def build_graph(spec: Mapping[str, Any]) -> Dict[int, List[int]]:
     raise ValueError("Unsupported network type: {0}".format(network_type))
 
 
-def build_env_config(spec: Mapping[str, Any]) -> SPGGConfig:
+def _resolve_target_mean_degree_for_env(
+    spec: Mapping[str, Any],
+    graph: Mapping[int, Sequence[int]],
+) -> float:
+    network = spec["network"]
+    network_type = network["type"]
+
+    if network_type == "regular":
+        return float(network["regular_degree"])
+    if network_type == "erdos_renyi":
+        target_mean_degree = network.get("er_target_mean_degree")
+        if target_mean_degree is not None:
+            return float(target_mean_degree)
+        num_nodes = int(network["num_nodes"])
+        return float(_resolve_er_edge_prob(network) * max(num_nodes - 1, 0))
+    if network_type == "small_world":
+        return float(network["ws_degree"])
+    if network_type == "scale_free":
+        num_nodes = int(network["num_nodes"])
+        attachments = float(network["ba_attachments_per_new_node"])
+        return float((2.0 * attachments) - ((attachments * (attachments + 1.0)) / max(num_nodes, 1)))
+    if network_type == "grid":
+        degrees = [len(neighbors) for neighbors in graph.values()]
+        return float(mean(degrees) if degrees else 0.0)
+    raise ValueError("Unsupported network type: {0}".format(network_type))
+
+
+def build_env_config(spec: Mapping[str, Any], graph: Mapping[int, Sequence[int]]) -> SPGGConfig:
     dynamics = spec["dynamics"]
     reward = spec["reward"]
     return SPGGConfig(
@@ -798,6 +825,7 @@ def build_env_config(spec: Mapping[str, Any]) -> SPGGConfig:
         episode_length=dynamics["episode_length"],
         initial_resource=dynamics["initial_resource"],
         initial_cooperation_prob=dynamics["initial_cooperation_prob"],
+        target_mean_degree=_resolve_target_mean_degree_for_env(spec, graph),
         reward=RewardConfig(
             lambda_payoff=reward["lambda_payoff"],
             lambda_cooperation=reward["lambda_cooperation"],
@@ -1317,7 +1345,7 @@ def run_one_experiment(spec: Mapping[str, Any]) -> Dict[str, Any]:
     np.random.seed(spec["seed"])
 
     graph = build_graph(spec)
-    env_config = build_env_config(spec)
+    env_config = build_env_config(spec, graph)
     output_dir = build_output_dir(spec)
     print_header(spec, graph, env_config)
 
