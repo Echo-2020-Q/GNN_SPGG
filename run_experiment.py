@@ -235,29 +235,69 @@ BASE_EXPERIMENT = {
     # 训练参数
     # ---------------------------
     "training": {
-        # 总 update 次数。
+        # 外层训练迭代次数。
         "total_updates": 50,
 
-        # 每次 update 收集多少个环境步。
+        # 每个 worker 在每次训练迭代中收集多少个环境步。
         "steps_per_update": 64,
 
         # 折扣因子 gamma。
         "gamma": 0.99,
 
-        # GAE 的 lambda。
-        "gae_lambda": 0.95,
-
-        # Adam 学习率。
+        # 共享学习率。
+        # 如果 actor_lr / critic_lr 为 None，就回退到这里。
         "learning_rate": 3e-4,
 
-        # 熵正则系数。
-        "entropy_coef": 1e-3,
+        # Actor 学习率。
+        "actor_lr": None,
 
-        # 价值函数损失权重。
-        "value_coef": 0.5,
+        # Critic 学习率。
+        "critic_lr": None,
 
-        # 梯度裁剪阈值。
-        "max_grad_norm": 1.0,
+        # replay buffer 容量。
+        "replay_capacity": 200_000,
+
+        # learner 每次更新采样的 batch 大小。
+        "batch_size": 32,
+
+        # warm-up 步数。前期用随机 logits + softmax 动作填充 buffer。
+        "warmup_steps": 1_000,
+
+        # 每隔多少个外层训练迭代做一次 learner 更新。
+        "train_every": 1,
+
+        # 每个外层训练迭代做多少次梯度更新。
+        "gradient_steps_per_update": 1,
+
+        # TD3 delayed policy update 频率。
+        "policy_delay": 2,
+
+        # target network soft update 系数 tau。
+        "tau": 0.005,
+
+        # rollout 时在 logits 空间加噪声的标准差。
+        "rollout_logit_noise_std": 0.30,
+
+        # rollout 时 logits 噪声的截断范围。
+        "rollout_logit_noise_clip": 0.50,
+
+        # rollout 噪声衰减系数。
+        "rollout_noise_decay": 0.9995,
+
+        # target policy smoothing 使用的 logits 噪声标准差。
+        "target_logit_noise_std": 0.10,
+
+        # target policy smoothing 的 logits 噪声截断范围。
+        "target_logit_noise_clip": 0.25,
+
+        # worker 数量。
+        "num_workers": 8,
+
+        # learner 参数同步到 worker 的间隔。
+        "worker_sync_interval": 1,
+
+        # 评估时资源低于该阈值视为 collapse。
+        "collapse_resource_threshold": 1e-6,
 
         # 每隔多少个 update 做一次评估。
         "eval_interval": 10,
@@ -790,11 +830,24 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         total_updates=training["total_updates"],
         steps_per_update=training["steps_per_update"],
         gamma=training["gamma"],
-        gae_lambda=training["gae_lambda"],
         learning_rate=training["learning_rate"],
-        entropy_coef=training["entropy_coef"],
-        value_coef=training["value_coef"],
-        max_grad_norm=training["max_grad_norm"],
+        actor_lr=training.get("actor_lr"),
+        critic_lr=training.get("critic_lr"),
+        replay_capacity=training["replay_capacity"],
+        batch_size=training["batch_size"],
+        warmup_steps=training["warmup_steps"],
+        train_every=training["train_every"],
+        gradient_steps_per_update=training["gradient_steps_per_update"],
+        policy_delay=training["policy_delay"],
+        tau=training["tau"],
+        rollout_logit_noise_std=training["rollout_logit_noise_std"],
+        rollout_logit_noise_clip=training["rollout_logit_noise_clip"],
+        rollout_noise_decay=training["rollout_noise_decay"],
+        target_logit_noise_std=training["target_logit_noise_std"],
+        target_logit_noise_clip=training["target_logit_noise_clip"],
+        num_workers=training["num_workers"],
+        worker_sync_interval=training["worker_sync_interval"],
+        collapse_resource_threshold=training["collapse_resource_threshold"],
         eval_interval=training["eval_interval"],
         eval_episodes=training["eval_episodes"],
         device=training["device"],
