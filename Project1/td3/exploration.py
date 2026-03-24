@@ -13,10 +13,10 @@ def masked_row_softmax(logits: Tensor, mask: Tensor) -> Tensor:
     mask = mask.to(dtype=torch.bool)
     masked_logits = torch.full_like(logits, torch.finfo(logits.dtype).min)
     masked_logits = torch.where(mask, logits, masked_logits)
-    row_max = masked_logits.max(dim=1, keepdim=True).values
+    row_max = masked_logits.max(dim=-1, keepdim=True).values
     stable_logits = masked_logits - row_max
     exp_logits = torch.exp(stable_logits) * mask.to(dtype=logits.dtype)
-    normalizer = exp_logits.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    normalizer = exp_logits.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     return exp_logits / normalizer
 
 
@@ -51,6 +51,7 @@ class LogitSpaceExplorer:
         noise_clip: float,
     ) -> TensorActionRecord:
         mask = ego_mask.to(dtype=torch.bool, device=logits.device)
+        pool_tensor = pool_values.to(dtype=torch.float32, device=logits.device)
         noise = torch.randn_like(logits) * float(noise_std)
         if noise_clip > 0.0:
             noise = noise.clamp(-float(noise_clip), float(noise_clip))
@@ -59,15 +60,15 @@ class LogitSpaceExplorer:
         masked_fill_value = torch.finfo(logits.dtype).min
         noisy_logits = torch.where(mask, logits + noise, torch.full_like(logits, masked_fill_value))
         allocation = masked_row_softmax(noisy_logits, mask)
-        transfers = allocation * pool_values.view(-1, 1)
-        incoming = transfers.sum(dim=0)
+        transfers = allocation * pool_tensor.unsqueeze(-1)
+        incoming = transfers.sum(dim=-2)
         return TensorActionRecord(
             logits=noisy_logits,
             allocation=allocation,
             transfers=transfers,
             incoming=incoming,
             ego_mask=mask,
-            pool_values=pool_values,
+            pool_values=pool_tensor,
         )
 
     def logits_from_allocation(
@@ -88,14 +89,14 @@ class LogitSpaceExplorer:
             logits,
         )
 
-        rows_without_positive = positive_mask.sum(dim=1) == 0
+        rows_without_positive = positive_mask.sum(dim=-1, keepdim=True) == 0
         if torch.any(rows_without_positive):
             fallback_logits = torch.where(
-                mask[rows_without_positive],
-                torch.zeros_like(allocation_tensor[rows_without_positive]),
-                torch.full_like(allocation_tensor[rows_without_positive], masked_fill_value),
+                mask,
+                torch.zeros_like(allocation_tensor),
+                torch.full_like(allocation_tensor, masked_fill_value),
             )
-            logits[rows_without_positive] = fallback_logits
+            logits = torch.where(rows_without_positive, fallback_logits, logits)
         return logits
 
     def action_from_allocation(

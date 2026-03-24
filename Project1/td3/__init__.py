@@ -1,6 +1,15 @@
 from .config import DomainRandomizationConfig, EvalConfig, GraphTD3Config, WorkerConfig
 from .critic import GraphActionCritic, GraphActionCriticConfig, TwinCritic
-from .data import ActionRecord, TensorActionRecord, Transition, clone_observation
+from .data import (
+    ActionRecord,
+    TensorActionRecord,
+    TensorReplayBatch,
+    TensorTransition,
+    Transition,
+    clone_observation,
+    clone_tensor_observation,
+    observation_to_replay_tensors,
+)
 from .evaluator import GraphTD3Evaluator
 from .exploration import LogitSpaceExplorer, masked_row_softmax
 from .learner import GraphTD3Learner
@@ -23,9 +32,13 @@ __all__ = [
     "ReplayBuffer",
     "RolloutWorker",
     "TensorActionRecord",
+    "TensorReplayBatch",
+    "TensorTransition",
     "Transition",
     "TwinCritic",
     "WorkerConfig",
     "clone_observation",
+    "clone_tensor_observation",
     "masked_row_softmax",
+    "observation_to_replay_tensors",
 ]

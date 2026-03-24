@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from Project1.policies.gnn_rl import GNNAllocationPolicy
+from Project1.policies.gnn_rl import BatchedPolicyOutput, GNNAllocationPolicy
 
 from .config import GraphTD3Config
-from .critic import TwinCritic
+from .critic import GraphActionCritic, TwinCritic
+from .data import TensorReplayBatch
 from .exploration import LogitSpaceExplorer
 from .replay import ReplayBuffer
 
@@ -40,7 +41,7 @@ def soft_update_module(target: torch.nn.Module, source: torch.nn.Module, tau: fl
 
 def _mean_allocation_entropy(allocation_matrix: Tensor) -> Tensor:
     safe_allocation = allocation_matrix.clamp_min(1e-12)
-    row_entropies = -(allocation_matrix * safe_allocation.log()).sum(dim=1)
+    row_entropies = -(allocation_matrix * safe_allocation.log()).sum(dim=-1)
     return row_entropies.mean()
 
 
@@ -49,6 +50,35 @@ def _masked_mean_square(values: Tensor, mask: Tensor) -> Tensor:
     if valid_values.numel() == 0:
         return values.new_zeros(())
     return valid_values.pow(2).mean()
+
+
+def _batch_size_from_observations(observations: Mapping[str, Tensor]) -> int:
+    if not observations:
+        return 0
+    first_value = next(iter(observations.values()))
+    if first_value.ndim == 0:
+        raise ValueError("Batched observations must include a leading batch dimension.")
+    return int(first_value.shape[0])
+
+
+def _slice_observation_batch(observations: Mapping[str, Tensor], start: int, end: int) -> dict[str, Tensor]:
+    return {key: value[start:end] for key, value in observations.items()}
+
+
+def _concat_batched_policy_outputs(outputs: list[BatchedPolicyOutput]) -> BatchedPolicyOutput:
+    if not outputs:
+        raise ValueError("outputs must contain at least one item.")
+    return BatchedPolicyOutput(
+        allocation_matrix=torch.cat([output.allocation_matrix for output in outputs], dim=0),
+        transferred_resources=torch.cat([output.transferred_resources for output in outputs], dim=0),
+        incoming_resources=torch.cat([output.incoming_resources for output in outputs], dim=0),
+        value=torch.cat([output.value for output in outputs], dim=0),
+        logits=(
+            torch.cat([output.logits for output in outputs], dim=0)
+            if outputs[0].logits is not None
+            else None
+        ),
+    )
 
 
 class GraphTD3Learner:
@@ -97,6 +127,68 @@ class GraphTD3Learner:
         self.target_actor.load_state_dict(self.actor.state_dict())
         self.target_critics.load_state_dict(self.critics.state_dict())
         self._apply_lr_schedule(step=0)
+
+    def _batched_actor_outputs(
+        self,
+        actor: GNNAllocationPolicy,
+        observations: Mapping[str, Tensor],
+    ) -> BatchedPolicyOutput:
+        batch_size = _batch_size_from_observations(observations)
+        if batch_size == 0:
+            raise ValueError("observations must contain at least one item.")
+
+        chunk_size = max(1, int(self.config.graph_batch_chunk_size))
+        chunk_outputs: list[BatchedPolicyOutput] = []
+        for start in range(0, batch_size, chunk_size):
+            end = min(start + chunk_size, batch_size)
+            chunk_outputs.append(actor.deterministic_action_tensor_batch(_slice_observation_batch(observations, start, end)))
+        return _concat_batched_policy_outputs(chunk_outputs)
+
+    def _critic_forward_batch(
+        self,
+        critic: GraphActionCritic,
+        observations: Mapping[str, Tensor],
+        actions: Tensor,
+    ) -> Tensor:
+        batch_size = _batch_size_from_observations(observations)
+        if batch_size == 0:
+            return torch.empty(0, dtype=torch.float32, device=self.device)
+
+        chunk_size = max(1, int(self.config.graph_batch_chunk_size))
+        chunk_outputs: list[Tensor] = []
+        for start in range(0, batch_size, chunk_size):
+            end = min(start + chunk_size, batch_size)
+            chunk_outputs.append(
+                critic.forward_tensor_batch(
+                    _slice_observation_batch(observations, start, end),
+                    actions[start:end],
+                )
+            )
+        return torch.cat(chunk_outputs, dim=0)
+
+    def _twin_critic_forward_batch(
+        self,
+        critics: TwinCritic,
+        observations: Mapping[str, Tensor],
+        actions: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        batch_size = _batch_size_from_observations(observations)
+        if batch_size == 0:
+            empty = torch.empty(0, dtype=torch.float32, device=self.device)
+            return empty, empty
+
+        chunk_size = max(1, int(self.config.graph_batch_chunk_size))
+        chunk_outputs_1: list[Tensor] = []
+        chunk_outputs_2: list[Tensor] = []
+        for start in range(0, batch_size, chunk_size):
+            end = min(start + chunk_size, batch_size)
+            q1, q2 = critics.forward_tensor_batch(
+                _slice_observation_batch(observations, start, end),
+                actions[start:end],
+            )
+            chunk_outputs_1.append(q1)
+            chunk_outputs_2.append(q2)
+        return torch.cat(chunk_outputs_1, dim=0), torch.cat(chunk_outputs_2, dim=0)
 
     def _scheduled_lr(self, initial_lr: float, step: int) -> float:
         if self.config.lr_schedule_type == "constant":
@@ -177,7 +269,7 @@ class GraphTD3Learner:
 
         actor_lr = self._current_actor_lr()
         critic_lr = self._current_critic_lr()
-        batch = self.replay_buffer.sample(self.config.batch_size)
+        batch = self.replay_buffer.sample(self.config.batch_size, device=self.device)
         critic_metrics = self.update_critics(batch)
 
         actor_metrics: dict[str, float] = {
@@ -203,29 +295,36 @@ class GraphTD3Learner:
             "critic_lr": critic_lr,
         }
 
-    def update_critics(self, batch: list[Any]) -> dict[str, float]:
-        observations = [transition.obs for transition in batch]
-        next_observations = [transition.next_obs for transition in batch]
-        actions = [transition.action.to_tensors(self.device).allocation for transition in batch]
-        rewards = torch.tensor([transition.reward for transition in batch], dtype=torch.float32, device=self.device)
-        dones = torch.tensor([float(transition.done) for transition in batch], dtype=torch.float32, device=self.device)
+    def update_critics(self, batch: TensorReplayBatch) -> dict[str, float]:
+        observations = batch.obs
+        next_observations = batch.next_obs
+        actions = batch.action.allocation
+        rewards = batch.reward
+        dones = batch.done
 
         with torch.no_grad():
-            target_outputs = [self.target_actor.deterministic_action(obs) for obs in next_observations]
-            target_actions = [
-                self.target_explorer.apply_to_policy_output(
-                    policy_output=output,
-                    ego_mask=torch.as_tensor(obs["local_mask"], dtype=torch.bool, device=self.device),
-                    pool_values=torch.as_tensor(obs["pool_grown"], dtype=torch.float32, device=self.device),
-                    noise_std=self.config.target_logit_noise_std,
-                    noise_clip=self.config.target_logit_noise_clip,
-                ).allocation
-                for output, obs in zip(target_outputs, next_observations)
-            ]
-            target_q1, target_q2 = self.target_critics.forward_batch(next_observations, target_actions)
+            target_outputs = self._batched_actor_outputs(self.target_actor, next_observations)
+            if target_outputs.logits is None:
+                raise ValueError("Target actor must provide logits for TD3 target smoothing.")
+            target_actions = self.target_explorer.apply_to_logits(
+                logits=target_outputs.logits,
+                ego_mask=next_observations["local_mask"],
+                pool_values=next_observations["pool_grown"],
+                noise_std=self.config.target_logit_noise_std,
+                noise_clip=self.config.target_logit_noise_clip,
+            ).allocation
+            target_q1, target_q2 = self._twin_critic_forward_batch(
+                self.target_critics,
+                next_observations,
+                target_actions,
+            )
             target_q = rewards + (self.config.gamma * (1.0 - dones) * torch.minimum(target_q1, target_q2))
 
-        current_q1, current_q2 = self.critics.forward_batch(observations, actions)
+        current_q1, current_q2 = self._twin_critic_forward_batch(
+            self.critics,
+            observations,
+            actions,
+        )
         critic1_loss = F.mse_loss(current_q1, target_q)
         critic2_loss = F.mse_loss(current_q2, target_q)
         critic_loss = critic1_loss + critic2_loss
@@ -240,27 +339,17 @@ class GraphTD3Learner:
             "critic_loss": float(critic_loss.item()),
         }
 
-    def update_actor(self, batch: list[Any]) -> dict[str, float]:
-        observations = [transition.obs for transition in batch]
-        current_outputs = [self.actor.deterministic_action(obs) for obs in observations]
-        current_actions = [output.allocation_matrix for output in current_outputs]
-        actor_q = self.critics.critic1.forward_batch(observations, current_actions)
+    def update_actor(self, batch: TensorReplayBatch) -> dict[str, float]:
+        observations = batch.obs
+        current_outputs = self._batched_actor_outputs(self.actor, observations)
+        actor_q = self._critic_forward_batch(self.critics.critic1, observations, current_outputs.allocation_matrix)
         actor_q_loss = -actor_q.mean()
 
         mean_entropy = actor_q_loss.new_zeros(())
         mean_logit_l2 = actor_q_loss.new_zeros(())
-        if current_outputs:
-            entropy_terms = [_mean_allocation_entropy(output.allocation_matrix) for output in current_outputs]
-            mean_entropy = torch.stack(entropy_terms).mean()
-
-            logit_l2_terms: list[Tensor] = []
-            for output, obs in zip(current_outputs, observations):
-                if output.logits is None:
-                    continue
-                mask = torch.as_tensor(obs["local_mask"], dtype=torch.bool, device=self.device)
-                logit_l2_terms.append(_masked_mean_square(output.logits, mask))
-            if logit_l2_terms:
-                mean_logit_l2 = torch.stack(logit_l2_terms).mean()
+        mean_entropy = _mean_allocation_entropy(current_outputs.allocation_matrix)
+        if current_outputs.logits is not None:
+            mean_logit_l2 = _masked_mean_square(current_outputs.logits, observations["local_mask"])
 
         actor_reg_loss = (
             (-float(self.config.actor_entropy_coef) * mean_entropy)

@@ -30,6 +30,7 @@ class GraphTD3Config:
     critic_pool_hidden_dim: int | None = None
     critic_q_hidden_dim: int | None = None
     batch_size: int = 32
+    graph_batch_chunk_size: int = 16
     replay_capacity: int = 200_000
     warmup_steps: int = 1_000
     warmup_behavior_mode: str = "random_only"
@@ -55,6 +56,7 @@ class GraphTD3Config:
 
     num_workers: int = 1
     worker_sync_interval: int = 1
+    worker_rpc_timeout_seconds: float = 300.0
     collapse_resource_threshold: float = 1e-6
 
     def __post_init__(self) -> None:
@@ -108,6 +110,8 @@ class GraphTD3Config:
             raise ValueError("critic_q_hidden_dim must be positive when provided.")
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive.")
+        if self.graph_batch_chunk_size <= 0:
+            raise ValueError("graph_batch_chunk_size must be positive.")
         if self.replay_capacity <= 0:
             raise ValueError("replay_capacity must be positive.")
         if self.warmup_steps < 0:
@@ -164,6 +168,8 @@ class GraphTD3Config:
             raise ValueError("num_workers must be positive.")
         if self.worker_sync_interval <= 0:
             raise ValueError("worker_sync_interval must be positive.")
+        if self.worker_rpc_timeout_seconds <= 0.0:
+            raise ValueError("worker_rpc_timeout_seconds must be positive.")
 
 
 @dataclass

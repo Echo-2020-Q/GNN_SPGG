@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Any
+from dataclasses import dataclass, replace
+import multiprocessing as mp
+from multiprocessing import shared_memory
+import traceback
+from typing import Any, Mapping
 
 import numpy as np
 import torch
@@ -15,7 +18,7 @@ from Project1.env import (
     make_random_regular_graph,
     make_watts_strogatz_graph,
 )
-from Project1.policies.gnn_rl import GNNAllocationPolicy
+from Project1.policies.gnn_rl import GNNAllocationPolicy, GNNPolicyConfig
 from Project1.policies.rule_based import (
     ConstantMixAllocationPolicy,
     PoolPowerMixAllocationPolicy,
@@ -24,9 +27,8 @@ from Project1.policies.rule_based import (
 )
 
 from .config import DomainRandomizationConfig, GraphTD3Config, WorkerConfig
-from .data import Transition
+from .data import TensorActionRecord, TensorReplayBatch, TensorTransition, stack_tensor_transitions
 from .exploration import LogitSpaceExplorer
-from .replay import ReplayBuffer
 
 
 def _clone_graph_from_env(env: SPGGEnv) -> dict[int, list[int]]:
@@ -35,6 +37,147 @@ def _clone_graph_from_env(env: SPGGEnv) -> dict[int, list[int]]:
 
 def _copy_module_state_to_cpu(module: nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
+
+
+def _serialize_module_state(state_dict: dict[str, torch.Tensor]) -> dict[str, np.ndarray]:
+    return {key: value.detach().cpu().numpy().copy() for key, value in state_dict.items()}
+
+
+def _deserialize_module_state(state_dict: dict[str, Any]) -> dict[str, torch.Tensor]:
+    return {key: torch.as_tensor(value, device="cpu") for key, value in state_dict.items()}
+
+
+def _serialize_remote_exception(exc: Exception) -> dict[str, str]:
+    return {
+        "type": exc.__class__.__name__,
+        "message": str(exc),
+        "traceback": traceback.format_exc(),
+    }
+
+
+def _close_shared_memory_handles(handles: list[shared_memory.SharedMemory], unlink: bool) -> None:
+    for handle in handles:
+        try:
+            handle.close()
+        except FileNotFoundError:
+            pass
+        except BufferError:
+            pass
+        if unlink:
+            try:
+                handle.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _tensor_to_shared_memory_payload(tensor: torch.Tensor) -> tuple[dict[str, Any], shared_memory.SharedMemory]:
+    cpu_tensor = tensor.detach().to(device="cpu").contiguous()
+    array = cpu_tensor.numpy()
+    shm = shared_memory.SharedMemory(create=True, size=max(int(array.nbytes), 1))
+    shared_array = np.ndarray(array.shape, dtype=array.dtype, buffer=shm.buf)
+    shared_array[...] = array
+    return (
+        {
+            "name": shm.name,
+            "shape": list(array.shape),
+            "dtype": array.dtype.str,
+        },
+        shm,
+    )
+
+
+def _shared_memory_payload_to_tensor(payload: Mapping[str, Any]) -> tuple[torch.Tensor, shared_memory.SharedMemory]:
+    shm = shared_memory.SharedMemory(name=str(payload["name"]))
+    array = np.ndarray(
+        tuple(int(item) for item in payload["shape"]),
+        dtype=np.dtype(str(payload["dtype"])),
+        buffer=shm.buf,
+    )
+    return torch.from_numpy(array), shm
+
+
+def _serialize_replay_batch_to_shared_memory(batch: TensorReplayBatch) -> tuple[dict[str, Any], list[shared_memory.SharedMemory]]:
+    handles: list[shared_memory.SharedMemory] = []
+
+    def _store_tensor(tensor: torch.Tensor) -> dict[str, Any]:
+        payload, handle = _tensor_to_shared_memory_payload(tensor)
+        handles.append(handle)
+        return payload
+
+    return (
+        {
+            "obs": {key: _store_tensor(value) for key, value in batch.obs.items()},
+            "action": {
+                "logits": _store_tensor(batch.action.logits),
+                "allocation": _store_tensor(batch.action.allocation),
+                "transfers": _store_tensor(batch.action.transfers),
+                "incoming": _store_tensor(batch.action.incoming),
+                "ego_mask": _store_tensor(batch.action.ego_mask),
+                "pool_values": _store_tensor(batch.action.pool_values),
+            },
+            "reward": _store_tensor(batch.reward),
+            "next_obs": {key: _store_tensor(value) for key, value in batch.next_obs.items()},
+            "done": _store_tensor(batch.done),
+        },
+        handles,
+    )
+
+
+def _deserialize_replay_batch_from_shared_memory(
+    payload: dict[str, Any],
+) -> tuple[TensorReplayBatch, tuple[shared_memory.SharedMemory, ...]]:
+    handles: list[shared_memory.SharedMemory] = []
+
+    def _load_tensor(item: Mapping[str, Any]) -> torch.Tensor:
+        tensor, handle = _shared_memory_payload_to_tensor(item)
+        handles.append(handle)
+        return tensor
+
+    try:
+        batch = TensorReplayBatch(
+            obs={key: _load_tensor(value) for key, value in dict(payload["obs"]).items()},
+            action=TensorActionRecord(
+                logits=_load_tensor(payload["action"]["logits"]),
+                allocation=_load_tensor(payload["action"]["allocation"]),
+                transfers=_load_tensor(payload["action"]["transfers"]),
+                incoming=_load_tensor(payload["action"]["incoming"]),
+                ego_mask=_load_tensor(payload["action"]["ego_mask"]),
+                pool_values=_load_tensor(payload["action"]["pool_values"]),
+            ),
+            reward=_load_tensor(payload["reward"]),
+            next_obs={key: _load_tensor(value) for key, value in dict(payload["next_obs"]).items()},
+            done=_load_tensor(payload["done"]),
+        )
+    except Exception:
+        _close_shared_memory_handles(handles, unlink=False)
+        raise
+    return batch, tuple(handles)
+
+
+def _serialize_rollout_result(result: RolloutResult) -> tuple[dict[str, Any], list[shared_memory.SharedMemory]]:
+    replay_payload, handles = _serialize_replay_batch_to_shared_memory(result.replay_batch)
+    return {
+        "replay_batch": replay_payload,
+        "metrics": dict(result.metrics),
+    }, handles
+
+
+def _deserialize_rollout_result(payload: dict[str, Any]) -> RolloutResult:
+    replay_batch, handles = _deserialize_replay_batch_from_shared_memory(dict(payload["replay_batch"]))
+    return RolloutResult(
+        replay_batch=replay_batch,
+        metrics=dict(payload["metrics"]),
+        shared_memory_handles=handles,
+    )
+
+@dataclass(frozen=True)
+class RolloutResult:
+    replay_batch: TensorReplayBatch
+    metrics: dict[str, Any]
+    shared_memory_handles: tuple[shared_memory.SharedMemory, ...] = ()
+
+    def release_shared_memory(self) -> None:
+        _close_shared_memory_handles(list(self.shared_memory_handles), unlink=True)
 
 
 class RandomizedEnvFactory:
@@ -123,7 +266,6 @@ class RolloutWorker:
     def __init__(
         self,
         actor: GNNAllocationPolicy,
-        replay_buffer: ReplayBuffer,
         explorer: LogitSpaceExplorer,
         env_factory: RandomizedEnvFactory,
         config: WorkerConfig,
@@ -132,7 +274,6 @@ class RolloutWorker:
     ):
         self.actor = actor.to(device)
         self.actor.eval()
-        self.replay_buffer = replay_buffer
         self.explorer = explorer
         self.env_factory = env_factory
         self.config = config
@@ -151,7 +292,7 @@ class RolloutWorker:
         self.current_warmup_behavior_source: str | None = None
 
     def sync_actor(self, actor_state_dict: dict[str, torch.Tensor], version: int) -> None:
-        self.actor.load_state_dict(actor_state_dict)
+        self.actor.load_state_dict(_deserialize_module_state(actor_state_dict))
         self.actor.eval()
         self.actor_version = version
 
@@ -174,7 +315,7 @@ class RolloutWorker:
             "rng_state": self.rng.bit_generator.state,
             "total_env_steps": int(self.total_env_steps),
             "actor_version": int(self.actor_version),
-            "actor_state_dict": _copy_module_state_to_cpu(self.actor),
+            "actor_state_dict": _serialize_module_state(_copy_module_state_to_cpu(self.actor)),
             "env_metadata": dict(self.env_metadata),
             "observation": (
                 {key: np.asarray(value).copy() for key, value in self.observation.items()}
@@ -190,7 +331,7 @@ class RolloutWorker:
         self.rng.bit_generator.state = state_dict["rng_state"]
         self.total_env_steps = int(state_dict["total_env_steps"])
         self.actor_version = int(state_dict["actor_version"])
-        self.actor.load_state_dict(state_dict["actor_state_dict"])
+        self.actor.load_state_dict(_deserialize_module_state(dict(state_dict["actor_state_dict"])))
         self.actor.eval()
         self.env_metadata = dict(state_dict.get("env_metadata", {}))
         observation = state_dict.get("observation")
@@ -207,16 +348,24 @@ class RolloutWorker:
             self.env.load_state_dict(env_state)
         self.current_warmup_behavior_source = state_dict.get("current_warmup_behavior_source")
 
-    def collect(self, num_steps: int) -> dict[str, Any]:
+    def collect(self, num_steps: int, global_warmup_steps: int = 0) -> RolloutResult:
         rewards: list[float] = []
         completed_episodes = 0
         behavior_source_counts: dict[str, int] = {}
+        cooperation_rates: list[float] = []
+        mean_resources: list[float] = []
+        gini_values: list[float] = []
+        mean_payoffs: list[float] = []
+        mean_pool_growns: list[float] = []
+        mean_pool_raws: list[float] = []
+        transitions: list[TensorTransition] = []
+        warmup_budget = max(0, int(global_warmup_steps))
 
-        for _ in range(num_steps):
+        for step_index in range(num_steps):
             self._ensure_environment()
             assert self.observation is not None
 
-            is_warmup = self.total_env_steps < self.train_config.warmup_steps
+            is_warmup = step_index < warmup_budget
             behavior_source = "actor_logits"
 
             if is_warmup:
@@ -241,36 +390,43 @@ class RolloutWorker:
 
             behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
             next_observation, reward, done, info = self.env.step(action.allocation.detach().cpu().numpy())
-            transition = Transition(
+            transition = TensorTransition.from_step(
                 obs=self.observation,
-                action=action.to_numpy(),
+                action=action,
                 reward=float(reward),
                 next_obs=next_observation,
                 done=bool(done),
-                info=info,
-                metadata={
-                    "worker_id": self.config.worker_id,
-                    "actor_version": self.actor_version,
-                    "is_warmup": bool(is_warmup),
-                    "behavior_source": behavior_source,
-                    **self.env_metadata,
-                },
             )
-            self.replay_buffer.add(transition)
+            transitions.append(transition)
 
             rewards.append(float(reward))
+            cooperation_rates.append(float(info.get("actual_cooperation_rate", np.asarray(next_observation["x_actual"]).mean())))
+            mean_resources.append(float(np.asarray(next_observation["resources"]).mean()))
+            gini_values.append(float(info.get("gini", np.asarray(next_observation["gini"]).item())))
+            mean_payoffs.append(float(np.asarray(info.get("payoff", np.zeros_like(next_observation["resources"]))).mean()))
+            mean_pool_growns.append(float(np.asarray(next_observation["pool_grown"]).mean()))
+            mean_pool_raws.append(float(np.asarray(next_observation["pool_raw"]).mean()))
             self.total_env_steps += 1
             self.observation = next_observation
             if done:
                 completed_episodes += 1
                 self._reset_environment()
 
-        return {
+        metrics = {
             "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
             "episodes_completed": float(completed_episodes),
             "env_steps": float(self.total_env_steps),
+            "steps_collected": float(len(transitions)),
+            "mean_actual_cooperation_rate": float(np.mean(cooperation_rates)) if cooperation_rates else 0.0,
+            "mean_resource": float(np.mean(mean_resources)) if mean_resources else 0.0,
+            "mean_gini": float(np.mean(gini_values)) if gini_values else 0.0,
+            "mean_payoff": float(np.mean(mean_payoffs)) if mean_payoffs else 0.0,
+            "mean_pool_grown": float(np.mean(mean_pool_growns)) if mean_pool_growns else 0.0,
+            "mean_pool_raw": float(np.mean(mean_pool_raws)) if mean_pool_raws else 0.0,
             "behavior_source_counts": behavior_source_counts,
         }
+        replay_batch = stack_tensor_transitions(transitions)
+        return RolloutResult(replay_batch=replay_batch, metrics=metrics)
 
     def _ensure_environment(self) -> None:
         if self.env is None or self.observation is None:
@@ -343,3 +499,246 @@ class RolloutWorker:
             noise_clip=self.train_config.warmup_logit_noise_clip,
             device=self.device,
         )
+
+
+def _parallel_rollout_worker_main(
+    connection,
+    actor_config: GNNPolicyConfig,
+    actor_state_dict: dict[str, Any],
+    env_factory: RandomizedEnvFactory,
+    config: WorkerConfig,
+    train_config: GraphTD3Config,
+    device: str,
+) -> None:
+    actor = GNNAllocationPolicy(actor_config)
+    actor.load_state_dict(_deserialize_module_state(actor_state_dict))
+    worker = RolloutWorker(
+        actor=actor,
+        explorer=LogitSpaceExplorer(),
+        env_factory=env_factory,
+        config=config,
+        train_config=train_config,
+        device=device,
+    )
+
+    try:
+        while True:
+            message = connection.recv()
+            command = str(message["command"])
+            if command == "close":
+                break
+            try:
+                if command == "sync_actor":
+                    worker.sync_actor(
+                        actor_state_dict=dict(message["actor_state_dict"]),
+                        version=int(message["version"]),
+                    )
+                    connection.send({"status": "ok", "payload": None})
+                    continue
+                if command == "set_env_factory":
+                    worker.set_env_factory(
+                        env_factory=message["env_factory"],
+                        reset_environment=bool(message.get("reset_environment", True)),
+                    )
+                    connection.send({"status": "ok", "payload": None})
+                    continue
+                if command == "collect":
+                    serialized_result, shared_memory_handles = _serialize_rollout_result(
+                        worker.collect(
+                            num_steps=int(message["num_steps"]),
+                            global_warmup_steps=int(message.get("global_warmup_steps", 0)),
+                        )
+                    )
+                    try:
+                        connection.send({"status": "ok", "payload": serialized_result})
+                    except Exception:
+                        _close_shared_memory_handles(shared_memory_handles, unlink=True)
+                        raise
+                    finally:
+                        _close_shared_memory_handles(shared_memory_handles, unlink=False)
+                    continue
+                if command == "state_dict":
+                    connection.send({"status": "ok", "payload": worker.state_dict()})
+                    continue
+                if command == "load_state_dict":
+                    worker.load_state_dict(dict(message["state_dict"]))
+                    connection.send({"status": "ok", "payload": None})
+                    continue
+                raise ValueError("Unsupported worker command: {0}".format(command))
+            except Exception as exc:
+                connection.send(
+                    {
+                        "status": "error",
+                        "error": _serialize_remote_exception(exc),
+                    }
+                )
+    finally:
+        connection.close()
+
+
+class ParallelRolloutWorker:
+    def __init__(
+        self,
+        actor: GNNAllocationPolicy,
+        env_factory: RandomizedEnvFactory,
+        config: WorkerConfig,
+        train_config: GraphTD3Config,
+        device: str = "cpu",
+    ):
+        self.config = config
+        self._device = str(device)
+        self._rpc_timeout_seconds = float(train_config.worker_rpc_timeout_seconds)
+        self._ctx = mp.get_context("spawn")
+        parent_connection, child_connection = self._ctx.Pipe()
+        self._connection = parent_connection
+        actor_state = _serialize_module_state(_copy_module_state_to_cpu(actor))
+        self._process = self._ctx.Process(
+            target=_parallel_rollout_worker_main,
+            args=(
+                child_connection,
+                actor.config,
+                actor_state,
+                env_factory,
+                config,
+                train_config,
+                self._device,
+            ),
+        )
+        self._process.start()
+        child_connection.close()
+        self._collect_inflight = False
+
+    @property
+    def connection(self):
+        return self._connection
+
+    def _raise_remote_error(self, error_payload: Mapping[str, Any]) -> None:
+        raise RuntimeError(
+            "Remote worker {0} failed with {1}: {2}\n{3}".format(
+                self.config.worker_id,
+                str(error_payload.get("type", "Exception")),
+                str(error_payload.get("message", "")),
+                str(error_payload.get("traceback", "")),
+            )
+        )
+
+    def _recv_response(self, timeout_seconds: float | None = None, ready: bool = False) -> Any:
+        if not ready:
+            timeout = self._rpc_timeout_seconds if timeout_seconds is None else float(timeout_seconds)
+            if not self._connection.poll(timeout):
+                raise TimeoutError(
+                    "Timed out waiting {0:.1f}s for worker {1} RPC response.".format(
+                        timeout,
+                        self.config.worker_id,
+                    )
+                )
+        response = self._connection.recv()
+        status = str(response.get("status", "ok"))
+        if status != "ok":
+            self._raise_remote_error(dict(response.get("error", {})))
+        return response.get("payload")
+
+    def _request_response(self, payload: dict[str, Any]) -> Any:
+        self._connection.send(payload)
+        return self._recv_response()
+
+    def sync_actor(self, actor_state_dict: dict[str, torch.Tensor], version: int) -> None:
+        self._request_response(
+            {
+                "command": "sync_actor",
+                "actor_state_dict": _serialize_module_state(actor_state_dict),
+                "version": int(version),
+            }
+        )
+
+    def set_env_factory(self, env_factory: RandomizedEnvFactory, reset_environment: bool = True) -> None:
+        self._request_response(
+            {
+                "command": "set_env_factory",
+                "env_factory": env_factory,
+                "reset_environment": bool(reset_environment),
+            }
+        )
+
+    def start_collect(self, num_steps: int, global_warmup_steps: int = 0) -> None:
+        if self._collect_inflight:
+            raise RuntimeError("Collect request already in flight for worker {0}.".format(self.config.worker_id))
+        self._connection.send(
+            {
+                "command": "collect",
+                "num_steps": int(num_steps),
+                "global_warmup_steps": int(global_warmup_steps),
+            }
+        )
+        self._collect_inflight = True
+
+    def finish_collect(self) -> RolloutResult:
+        if not self._collect_inflight:
+            raise RuntimeError("No in-flight collect request for worker {0}.".format(self.config.worker_id))
+        try:
+            payload = self._recv_response()
+            return _deserialize_rollout_result(payload)
+        finally:
+            self._collect_inflight = False
+
+    def finish_collect_ready(self) -> RolloutResult:
+        if not self._collect_inflight:
+            raise RuntimeError("No in-flight collect request for worker {0}.".format(self.config.worker_id))
+        try:
+            payload = self._recv_response(ready=True)
+            return _deserialize_rollout_result(payload)
+        finally:
+            self._collect_inflight = False
+
+    def collect(self, num_steps: int, global_warmup_steps: int = 0) -> RolloutResult:
+        self.start_collect(num_steps=num_steps, global_warmup_steps=global_warmup_steps)
+        return self.finish_collect()
+
+    def state_dict(self) -> dict[str, Any]:
+        if self._collect_inflight:
+            raise RuntimeError("Cannot fetch worker state while collect is in flight.")
+        return self._request_response({"command": "state_dict"})
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if self._collect_inflight:
+            raise RuntimeError("Cannot load worker state while collect is in flight.")
+        self._request_response(
+            {
+                "command": "load_state_dict",
+                "state_dict": state_dict,
+            }
+        )
+
+    def close(self) -> None:
+        if getattr(self, "_connection", None) is None:
+            return
+        try:
+            if self._collect_inflight:
+                try:
+                    payload = self._recv_response(timeout_seconds=1.0)
+                    if isinstance(payload, dict) and "replay_batch" in payload:
+                        result = _deserialize_rollout_result(payload)
+                        result.release_shared_memory()
+                except Exception:
+                    pass
+                finally:
+                    self._collect_inflight = False
+            self._connection.send({"command": "close"})
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        except Exception:
+            pass
+        try:
+            self._connection.close()
+        except OSError:
+            pass
+        self._process.join(timeout=5.0)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=5.0)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass

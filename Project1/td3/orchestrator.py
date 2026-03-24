@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import asdict
 from collections import Counter
+from multiprocessing.connection import wait
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -16,15 +17,15 @@ from .evaluator import GraphTD3Evaluator
 from .exploration import LogitSpaceExplorer
 from .learner import GraphTD3Learner
 from .replay import ReplayBuffer
-from .worker import RandomizedEnvFactory, RolloutWorker
+from .worker import ParallelRolloutWorker, RandomizedEnvFactory, RolloutResult, RolloutWorker
 
 
 class GraphTD3Trainer:
-    """Single-process orchestrator for the approved Graph-TD3 training skeleton.
+    """Central learner with real parallel rollout workers.
 
-    The design intentionally mirrors the future multi-worker setup, but keeps execution
-    local and sequential for now. Workers maintain actor snapshots, write into a shared
-    replay buffer, and the centralized learner performs TD3 updates.
+    The learner and replay buffer stay in the main process. Rollout workers hold actor
+    snapshots in separate processes, collect transitions in parallel, and return tensor
+    batches that are appended into the central replay buffer before TD3 updates.
     """
 
     def __init__(
@@ -73,22 +74,31 @@ class GraphTD3Trainer:
         train_factory = RandomizedEnvFactory.from_env(env, randomization=randomization)
         self.train_factory = train_factory
         self.rollout_explorer = LogitSpaceExplorer()
-        self.workers = [
-            RolloutWorker(
-                actor=copy.deepcopy(policy),
-                replay_buffer=self.replay_buffer,
-                explorer=self.rollout_explorer,
-                env_factory=train_factory,
-                config=WorkerConfig(
-                    worker_id=worker_id,
-                    seed=(config.seed or 0) + worker_id,
-                    rollout_steps_per_sync=config.steps_per_update,
-                ),
-                train_config=config,
-                device="cpu",
+        self.workers = []
+        for worker_id in range(config.num_workers):
+            worker_config = WorkerConfig(
+                worker_id=worker_id,
+                seed=(config.seed or 0) + worker_id,
+                rollout_steps_per_sync=config.steps_per_update,
             )
-            for worker_id in range(config.num_workers)
-        ]
+            if config.num_workers > 1:
+                worker = ParallelRolloutWorker(
+                    actor=copy.deepcopy(policy),
+                    env_factory=train_factory,
+                    config=worker_config,
+                    train_config=config,
+                    device="cpu",
+                )
+            else:
+                worker = RolloutWorker(
+                    actor=copy.deepcopy(policy),
+                    explorer=self.rollout_explorer,
+                    env_factory=train_factory,
+                    config=worker_config,
+                    train_config=config,
+                    device="cpu",
+                )
+            self.workers.append(worker)
 
         evaluator_factories = list(eval_env_factories) if eval_env_factories is not None else [
             RandomizedEnvFactory.from_env(eval_env or env)
@@ -105,7 +115,20 @@ class GraphTD3Trainer:
         self.curriculum_stages = [dict(stage) for stage in curriculum_stages] if curriculum_stages is not None else []
         self.active_curriculum_stage_index: int | None = None
         self.completed_updates = 0
+        self.global_env_steps = 0
         self.history: list[dict[str, float]] = []
+
+    def close(self) -> None:
+        for worker in self.workers:
+            close_method = getattr(worker, "close", None)
+            if callable(close_method):
+                close_method()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _resolve_curriculum_stage(self, update: int) -> tuple[int, Mapping[str, Any]] | None:
         if not self.curriculum_stages:
@@ -176,6 +199,7 @@ class GraphTD3Trainer:
             "policy_config": asdict(self.policy.config),
             "learner_state": self.learner.checkpoint_state(),
             "completed_updates": int(self.completed_updates),
+            "global_env_steps": int(self.global_env_steps),
             "active_curriculum_stage_index": self.active_curriculum_stage_index,
             "history": [dict(item) for item in self.history],
         }
@@ -187,6 +211,7 @@ class GraphTD3Trainer:
     def load_checkpoint(self, checkpoint: Mapping[str, Any]) -> str:
         self.learner.load_checkpoint_state(dict(checkpoint["learner_state"]))
         self.completed_updates = int(checkpoint.get("completed_updates", checkpoint.get("update", 0)))
+        self.global_env_steps = int(checkpoint.get("global_env_steps", 0))
         self.history = [dict(item) for item in checkpoint.get("history", [])]
         self.active_curriculum_stage_index = checkpoint.get("active_curriculum_stage_index")
         checkpoint_mode = str(
@@ -221,6 +246,67 @@ class GraphTD3Trainer:
 
         return checkpoint_mode
 
+    def _global_warmup_allocations(self) -> list[int]:
+        remaining_global_warmup = max(0, int(self.config.warmup_steps) - int(self.global_env_steps))
+        if remaining_global_warmup <= 0:
+            return [0 for _ in self.workers]
+
+        allocations: list[int] = []
+        remaining_workers = len(self.workers)
+        for worker in self.workers:
+            per_worker_steps = int(worker.config.rollout_steps_per_sync)
+            if remaining_workers <= 1:
+                allocation = min(per_worker_steps, remaining_global_warmup)
+            else:
+                fair_share = int(np.ceil(float(remaining_global_warmup) / float(remaining_workers)))
+                allocation = min(per_worker_steps, fair_share, remaining_global_warmup)
+            allocations.append(allocation)
+            remaining_global_warmup -= allocation
+            remaining_workers -= 1
+        return allocations
+
+    def _collect_rollouts(self) -> list[RolloutResult]:
+        warmup_allocations = self._global_warmup_allocations()
+        rollout_results: list[RolloutResult] = []
+
+        try:
+            if self.config.num_workers > 1:
+                for worker, warmup_steps in zip(self.workers, warmup_allocations):
+                    worker.start_collect(
+                        num_steps=int(worker.config.rollout_steps_per_sync),
+                        global_warmup_steps=int(warmup_steps),
+                    )
+                pending_workers = {worker.connection: worker for worker in self.workers}
+                while pending_workers:
+                    ready_connections = wait(
+                        list(pending_workers.keys()),
+                        timeout=float(self.config.worker_rpc_timeout_seconds),
+                    )
+                    if not ready_connections:
+                        raise TimeoutError(
+                            "Timed out waiting for rollout workers: {0}".format(
+                                [worker.config.worker_id for worker in pending_workers.values()]
+                            )
+                        )
+                    for ready_connection in ready_connections:
+                        worker = pending_workers.pop(ready_connection)
+                        rollout_results.append(worker.finish_collect_ready())
+            else:
+                rollout_results = [
+                    self.workers[0].collect(
+                        num_steps=int(self.workers[0].config.rollout_steps_per_sync),
+                        global_warmup_steps=int(warmup_allocations[0]) if warmup_allocations else 0,
+                    )
+                ]
+
+            for result in rollout_results:
+                self.replay_buffer.extend(result.replay_batch)
+                self.global_env_steps += len(result.replay_batch)
+            return rollout_results
+        finally:
+            for result in rollout_results:
+                result.release_shared_memory()
+
     def train(
         self,
         num_updates: int | None = None,
@@ -237,8 +323,15 @@ class GraphTD3Trainer:
                 for worker in self.workers:
                     worker.sync_actor(actor_state_dict, version=actor_version)
 
-            rollout_metrics = [worker.collect(worker.config.rollout_steps_per_sync) for worker in self.workers]
+            rollout_results = self._collect_rollouts()
+            rollout_metrics = [result.metrics for result in rollout_results]
             mean_rollout_reward = float(np.mean([item["mean_reward"] for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_cooperation = float(np.mean([item["mean_actual_cooperation_rate"] for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_resource = float(np.mean([item["mean_resource"] for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_gini = float(np.mean([item["mean_gini"] for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_payoff = float(np.mean([item["mean_payoff"] for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_pool_grown = float(np.mean([item["mean_pool_grown"] for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_pool_raw = float(np.mean([item["mean_pool_raw"] for item in rollout_metrics])) if rollout_metrics else 0.0
             behavior_counts: Counter[str] = Counter()
             for item in rollout_metrics:
                 behavior_counts.update(item.get("behavior_source_counts", {}))
@@ -280,6 +373,13 @@ class GraphTD3Trainer:
                 "actor_lr": float(learner_metrics["actor_lr"]),
                 "critic_lr": float(learner_metrics["critic_lr"]),
                 "curriculum_stage": float(self.active_curriculum_stage_index or 0),
+                "rollout_f_c": mean_rollout_cooperation,
+                "rollout_R_mean": mean_rollout_resource,
+                "rollout_gini": mean_rollout_gini,
+                "rollout_payoff_mean": mean_rollout_payoff,
+                "rollout_pool_grown_mean": mean_rollout_pool_grown,
+                "rollout_pool_mean": mean_rollout_pool_raw,
+                "global_env_steps": float(self.global_env_steps),
             }
             total_behavior_samples = float(sum(behavior_counts.values()))
             for source in (

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 import torch
@@ -12,18 +12,25 @@ from Project1.policies.gnn_rl import (
     MLP,
     ObservationGraphBuilder,
     TwoLayerGraphNetBackbone,
+    extract_batched_ego_subgraph,
     extract_ego_subgraph,
 )
 
 
 def _masked_edge_mean_by_receiver(edge_features: Tensor, edge_mask: Tensor) -> Tensor:
     mask = edge_mask.unsqueeze(-1).to(dtype=edge_features.dtype)
+    if edge_features.ndim == 4:
+        counts = edge_mask.sum(dim=1).clamp_min(1).to(dtype=edge_features.dtype).unsqueeze(-1)
+        return (edge_features * mask).sum(dim=1) / counts
     counts = edge_mask.sum(dim=0).clamp_min(1).to(dtype=edge_features.dtype).unsqueeze(-1)
     return (edge_features * mask).sum(dim=0) / counts
 
 
 def _masked_global_edge_mean(edge_features: Tensor, edge_mask: Tensor) -> Tensor:
     mask = edge_mask.unsqueeze(-1).to(dtype=edge_features.dtype)
+    if edge_features.ndim == 4:
+        count = edge_mask.sum(dim=(1, 2)).clamp_min(1).to(dtype=edge_features.dtype).unsqueeze(-1)
+        return (edge_features * mask).sum(dim=(1, 2)) / count
     count = edge_mask.sum().clamp_min(1).to(dtype=edge_features.dtype)
     return (edge_features * mask).sum(dim=(0, 1)) / count
 
@@ -125,13 +132,119 @@ class GraphActionCritic(nn.Module):
         q_input = torch.cat([backbone_output.global_embedding, graph_pool], dim=0)
         return self.q_head(q_input).squeeze(-1)
 
+    def _forward_batch_same_size(
+        self,
+        observations: Sequence[Observation],
+        actions: Sequence[Tensor | np.ndarray],
+    ) -> Tensor:
+        if not observations:
+            raise ValueError("observations must contain at least one item.")
+        if len(observations) != len(actions):
+            raise ValueError("observations and actions must have the same length.")
+
+        device = next(self.parameters()).device
+        graph_input = self.graph_builder.build_batch(list(observations), device=device)
+        allocation = torch.stack([torch.as_tensor(action, dtype=torch.float32, device=device) for action in actions], dim=0)
+        return self._forward_tensor_batch_from_graph_input(graph_input, allocation)
+
+    def _forward_tensor_batch_from_graph_input(
+        self,
+        graph_input,
+        allocation: Tensor,
+    ) -> Tensor:
+        backbone_output = self.state_encoder(graph_input)
+
+        batch_size, num_nodes = backbone_output.node_embeddings.shape[:2]
+        device = backbone_output.node_embeddings.device
+        batch_indices = torch.arange(batch_size, device=device)
+        pool_tokens: list[Tensor] = []
+
+        for center_index in range(num_nodes):
+            ego_subgraph = extract_batched_ego_subgraph(backbone_output, center_index=center_index)
+            member_indices = ego_subgraph.member_indices
+            local_node_mask = ego_subgraph.local_node_mask
+
+            local_alloc = allocation[batch_indices[:, None], center_index, member_indices].unsqueeze(-1)
+            local_alloc = local_alloc * local_node_mask.unsqueeze(-1).to(dtype=allocation.dtype)
+            local_transfers = local_alloc * ego_subgraph.pool_value.view(batch_size, 1, 1)
+            local_nodes = ego_subgraph.local_node_features[:, :, :-1]
+            center_indicator = ego_subgraph.local_node_features[:, :, -1:]
+            local_edge_context = _masked_edge_mean_by_receiver(
+                ego_subgraph.local_edge_features,
+                ego_subgraph.local_edge_mask,
+            )
+
+            action_inputs = torch.cat(
+                [
+                    local_nodes,
+                    local_edge_context,
+                    local_alloc,
+                    local_transfers,
+                    center_indicator,
+                ],
+                dim=-1,
+            )
+            encoded_actions = self.action_encoder(action_inputs)
+            weighted_action_summary = (local_alloc * encoded_actions).sum(dim=1)
+            ego_edge_summary = _masked_global_edge_mean(
+                ego_subgraph.local_edge_features,
+                ego_subgraph.local_edge_mask,
+            )
+            center_node = local_nodes[batch_indices, ego_subgraph.center_local_indices]
+            pool_size = local_node_mask.sum(dim=1).to(dtype=local_nodes.dtype).unsqueeze(-1)
+            pool_value = ego_subgraph.pool_value.view(batch_size, 1)
+
+            pool_input = torch.cat(
+                [
+                    backbone_output.global_embedding,
+                    center_node,
+                    weighted_action_summary,
+                    ego_edge_summary,
+                    pool_value,
+                    pool_size,
+                ],
+                dim=-1,
+            )
+            pool_tokens.append(self.pool_encoder(pool_input))
+
+        graph_pool = torch.stack(pool_tokens, dim=1).mean(dim=1)
+        q_input = torch.cat([backbone_output.global_embedding, graph_pool], dim=-1)
+        return self.q_head(q_input).squeeze(-1)
+
+    def forward_tensor_batch(
+        self,
+        observations: Mapping[str, Tensor],
+        allocation_matrix: Tensor | np.ndarray,
+    ) -> Tensor:
+        device = next(self.parameters()).device
+        graph_input = self.graph_builder.build_tensor_batch(observations, device=device)
+        allocation = torch.as_tensor(allocation_matrix, dtype=torch.float32, device=device)
+        return self._forward_tensor_batch_from_graph_input(graph_input, allocation)
+
     def forward_batch(
         self,
         observations: Sequence[Observation],
         actions: Sequence[Tensor | np.ndarray],
     ) -> Tensor:
-        values = [self.forward(obs, action) for obs, action in zip(observations, actions)]
-        return torch.stack(values, dim=0)
+        if len(observations) != len(actions):
+            raise ValueError("observations and actions must have the same length.")
+        if not observations:
+            return torch.empty(0, dtype=torch.float32, device=next(self.parameters()).device)
+
+        grouped_indices: dict[int, list[int]] = {}
+        for index, observation in enumerate(observations):
+            num_nodes = int(np.asarray(observation["local_mask"]).shape[0])
+            grouped_indices.setdefault(num_nodes, []).append(index)
+
+        outputs: list[Tensor | None] = [None] * len(observations)
+        for indices in grouped_indices.values():
+            group_observations = [observations[index] for index in indices]
+            group_actions = [actions[index] for index in indices]
+            group_values = self._forward_batch_same_size(group_observations, group_actions)
+            for local_index, original_index in enumerate(indices):
+                outputs[original_index] = group_values[local_index]
+
+        return torch.stack([value for value in outputs if value is not None], dim=0)
 
 
 class TwinCritic(nn.Module):
@@ -148,4 +261,14 @@ class TwinCritic(nn.Module):
         return (
             self.critic1.forward_batch(observations, actions),
             self.critic2.forward_batch(observations, actions),
+        )
+
+    def forward_tensor_batch(
+        self,
+        observations: Mapping[str, Tensor],
+        actions: Tensor | np.ndarray,
+    ) -> tuple[Tensor, Tensor]:
+        return (
+            self.critic1.forward_tensor_batch(observations, actions),
+            self.critic2.forward_tensor_batch(observations, actions),
         )

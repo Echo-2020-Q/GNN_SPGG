@@ -257,10 +257,10 @@ BASE_EXPERIMENT = {
     # ---------------------------
     "training": {
         # 外层训练迭代次数。
-        "total_updates": 5_000,#100_000 5_000*150=750_000步=0.75M 步
+        "total_updates": 5_000,  # 5_000 * 150 = 750_000 步 = 0.75M 步
 
         # 每个 worker 在每次训练迭代中收集多少个环境步。
-        "steps_per_update": 150,#episode=150
+        "steps_per_update": 150,  # episode=150
 
         # 是否强制把每次训练迭代的采样长度设为一个完整 episode。
         # 为 True 时，会忽略上面的 steps_per_update，改为使用 dynamics.episode_length。
@@ -271,7 +271,7 @@ BASE_EXPERIMENT = {
         # per_worker_total_env_steps = total_updates * effective_steps_per_update
         # all_workers_total_env_steps = num_workers * per_worker_total_env_steps
         # 当前配置：effective_steps_per_update = 150，
-        # 所以每个 worker 共 100_000 * 150 = 15_000_000 步=15M 步，1 个 workers 合计 100_000 * 150 = 15_000_000 步=15M 步。
+        # 所以每个 worker 共 5_000 * 150 = 750_000 步 = 0.75M 步，1 个 worker 合计也是 750_000 步 = 0.75M 步。
         "use_episode_length_as_steps_per_update": True,
 
         # 折扣因子 gamma。
@@ -301,7 +301,7 @@ BASE_EXPERIMENT = {
 
         # 指数退火的 decay_steps。
         # 当 learner 的训练步数增加到这个量级时，学习率会衰减一个 decay_rate 的量级。
-        "lr_decay_steps": 5_000,
+        "lr_decay_steps": 10_000,
 
         # 是否在训练过程中保存 checkpoint。
         "save_checkpoints": True,
@@ -367,14 +367,21 @@ BASE_EXPERIMENT = {
         "critic_q_hidden_dim": 64,
 
         # replay buffer 容量。
-        "replay_capacity": 200_000,#200k 步=0.2M 步
+        "replay_capacity": 300_000, # 300k 步=0.3M 步
 
         # learner 每次更新采样的 batch 大小。
         "batch_size": 256,
 
-        # warm-up 步数。
-        # 注意这是每个 worker 自己的 warm-up 步数，不是全局总和。
-        "warmup_steps": 6_000,
+        # learner 内部做图张量化时的微批大小。
+        # 这是为了避免把整个 replay batch 一次性展开成 dense [B, N, N, H] 图张量后显存占用过高。
+        # 它不改变 replay sample 的 batch_size，只影响 actor / critic 在 GPU 上分几小块做前向与反向。
+        "graph_batch_chunk_size": 16,
+
+        # warm-up 环境步数。
+        # 注意这是所有 worker 共享的“全局 warm-up 总步数”，不是每个 worker 单独的步数。
+        # 例如 num_workers=4、steps_per_update=150、warmup_steps=150_000 时，
+        # 程序会在所有 worker 的采样结果之间按全局预算分配 warm-up，而不是变成 4 倍。
+        "warmup_steps": 150_000,    #   warm-up/episode= 1000个update 步= x 个 episode 
 
         # warm-up 行为模式：
         # - "random_only"   ：只用随机 logits + softmax
@@ -444,11 +451,17 @@ BASE_EXPERIMENT = {
         # target policy smoothing 的 logits 噪声截断范围。
         "target_logit_noise_clip": 0.25,
 
-        # worker 数量。
-        "num_workers": 1,
+        # 真实并行的 rollout worker 进程数。
+        # num_workers=1 表示单进程采样；num_workers>1 会启动多进程并行采样。
+        # learner 仍然在主进程单点更新。
+        "num_workers": 4,
 
         # learner 参数同步到 worker 的间隔。
         "worker_sync_interval": 1,
+
+        # 并行 worker RPC 的超时时间（秒）。
+        # 包括 actor 参数同步、collect 回传、state_dict/load_state_dict 等控制消息。
+        "worker_rpc_timeout_seconds": 300.0,
 
         # 评估时资源低于该阈值视为 collapse。
         "collapse_resource_threshold": 1e-6,
@@ -698,6 +711,7 @@ BASE_EXPERIMENT = {
         "enabled": True,
 
         # TensorBoard 事件文件相对于实验输出目录的子目录名。
+        # 实际运行时会在该目录下自动再加一层 MMDD_HHMMSS 时间戳子目录。
         "subdir": "tensorboard",
 
         # SummaryWriter 的 flush_secs。
@@ -714,17 +728,17 @@ BASE_EXPERIMENT = {
         "console_progress_logs": True,
 
         # 控制台进度日志的 update 间隔。
-        "console_progress_interval": 50,
+        "console_progress_interval": 5,
 
         # 是否在控制台输出低频的最近训练统计块。
         # 开启后，会按最近若干个 update 的窗口均值打印 loss / reward / lr / 行为占比等。
         "console_training_logs": True,
 
         # 控制台最近训练统计块的 update 间隔。
-        "console_log_interval": 100,
+        "console_log_interval": 10,
 
         # 控制台最近训练统计块使用的滑动窗口大小。
-        "console_recent_window_updates": 50,
+        "console_recent_window_updates": 10,
     },
 
     # ---------------------------
@@ -1204,6 +1218,7 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         critic_q_hidden_dim=training.get("critic_q_hidden_dim"),
         replay_capacity=training["replay_capacity"],
         batch_size=training["batch_size"],
+        graph_batch_chunk_size=training.get("graph_batch_chunk_size", 16),
         warmup_steps=training["warmup_steps"],
         warmup_behavior_mode=training["warmup_behavior_mode"],
         warmup_selection_granularity=training["warmup_selection_granularity"],
@@ -1227,6 +1242,7 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         target_logit_noise_clip=training["target_logit_noise_clip"],
         num_workers=training["num_workers"],
         worker_sync_interval=training["worker_sync_interval"],
+        worker_rpc_timeout_seconds=training.get("worker_rpc_timeout_seconds", 300.0),
         collapse_resource_threshold=training["collapse_resource_threshold"],
         eval_interval=training["eval_interval"],
         eval_episodes=training["eval_episodes"],
@@ -1912,10 +1928,20 @@ def _format_console_recent_stats_lines(
         header += " | stage: {0}".format(stage_label)
 
     ordered_keys = [
+        ("rollout_f_c", "train_f_c"),
+        ("rollout_gini", "train_gini"),
+        ("rollout_R_mean", "train_R_mean"),
+        ("rollout_payoff_mean", "train_payoff_mean"),
+        ("rollout_pool_grown_mean", "train_pool_grown"),
+        ("rollout_pool_mean", "train_pool"),
         ("eval_cooperation_mean", "f_c"),
         ("eval_gini_mean", "gini"),
         ("eval_return_mean", "return_mean"),
-        ("eval_mean_total_resource", "mean_total_resource"),
+        ("eval_mean_resource", "R_mean"),
+        ("eval_mean_payoff", "payoff_mean"),
+        ("eval_mean_pool_grown", "pool_grown_mean"),
+        ("eval_mean_pool_raw", "pool_mean"),
+        ("eval_mean_total_resource", "R_total_mean"),
         ("eval_collapse_rate", "collapse_rate"),
         ("loss", "loss"),
         ("policy_loss", "policy_loss"),
@@ -1951,11 +1977,14 @@ def _format_console_recent_stats_lines(
     if "eval_return_mean" in latest_metrics:
         lines.append(
             _console_info(
-                "Latest eval | f_c={0:.4f}, gini={1:.4f}, return={2:.4f}, resource={3:.4f}, collapse_rate={4:.4f}".format(
+                "Latest eval | f_c={0:.4f}, gini={1:.4f}, return={2:.4f}, R={3:.4f}, payoff={4:.4f}, pool_grown={5:.4f}, pool={6:.4f}, collapse_rate={7:.4f}".format(
                     float(latest_metrics["eval_cooperation_mean"]),
                     float(latest_metrics["eval_gini_mean"]),
                     float(latest_metrics["eval_return_mean"]),
-                    float(latest_metrics.get("eval_mean_total_resource", 0.0)),
+                    float(latest_metrics.get("eval_mean_resource", 0.0)),
+                    float(latest_metrics.get("eval_mean_payoff", 0.0)),
+                    float(latest_metrics.get("eval_mean_pool_grown", 0.0)),
+                    float(latest_metrics.get("eval_mean_pool_raw", 0.0)),
                     float(latest_metrics.get("eval_collapse_rate", 0.0)),
                 )
             )
@@ -1968,8 +1997,30 @@ def _tensorboard_tag_for_metric(metric_name: str) -> Optional[str]:
         return None
     if metric_name.startswith("behavior_frac_"):
         return "behavior/{0}".format(metric_name[len("behavior_frac_"):])
+    if metric_name.startswith("rollout_"):
+        return "train_global/{0}".format(metric_name[len("rollout_"):])
     if metric_name.startswith("eval_"):
-        return "eval/{0}".format(metric_name[len("eval_"):])
+        eval_key = metric_name[len("eval_"):]
+        if "/" in eval_key:
+            base_key, suffix = eval_key.split("/", 1)
+        else:
+            base_key, suffix = eval_key, None
+        eval_name_mapping = {
+            "cooperation_mean": "f_c",
+            "gini_mean": "gini",
+            "mean_resource": "R_mean",
+            "mean_total_resource": "R_total_mean",
+            "mean_payoff": "payoff_mean",
+            "mean_pool_grown": "pool_grown_mean",
+            "mean_pool_raw": "pool_mean",
+            "return_mean": "return_mean",
+            "collapse_rate": "collapse_rate",
+            "sustainability_rate": "sustainability_rate",
+        }
+        mapped_key = eval_name_mapping.get(base_key, base_key)
+        if suffix is not None:
+            return "eval/{0}/{1}".format(mapped_key, suffix)
+        return "eval/{0}".format(mapped_key)
     if metric_name in {"actor_lr", "critic_lr"}:
         return "optim/{0}".format(metric_name)
     if metric_name == "replay_size":
@@ -2026,10 +2077,26 @@ def _log_tensorboard_static_metadata(
         ),
         "static/training/num_workers": float(spec["training"]["num_workers"]),
         "static/training/batch_size": float(spec["training"]["batch_size"]),
+        "static/training/graph_batch_chunk_size": float(spec["training"].get("graph_batch_chunk_size", 16)),
         "static/training/replay_capacity": float(spec["training"]["replay_capacity"]),
     }
     for tag, value in static_scalars.items():
         writer.add_scalar(tag, value, 0)
+
+
+def _log_tensorboard_custom_layout(writer: Any) -> None:
+    writer.add_custom_scalars(
+        {
+            "Train vs Eval": {
+                "f_c": ["Multiline", ["train_global/f_c", "eval/f_c"]],
+                "R_mean": ["Multiline", ["train_global/R_mean", "eval/R_mean"]],
+                "gini": ["Multiline", ["train_global/gini", "eval/gini"]],
+                "payoff_mean": ["Multiline", ["train_global/payoff_mean", "eval/payoff_mean"]],
+                "pool_grown_mean": ["Multiline", ["train_global/pool_grown_mean", "eval/pool_grown_mean"]],
+                "pool_mean": ["Multiline", ["train_global/pool_mean", "eval/pool_mean"]],
+            }
+        }
+    )
 
 
 def _log_tensorboard_update_metrics(
@@ -2273,219 +2340,226 @@ def run_gnn_training_mode(
         eval_env_factories=eval_env_factories,
         curriculum_stages=curriculum_stages,
     )
-    print(
-        "Train CFG : steps_per_update={0}, source={1}".format(
-            trainer_config.steps_per_update,
-            steps_source,
-        )
-    )
-    print(
-        "Eval CFG  : mode={0}, periodic_eval_episodes={1}".format(
-            "custom_env_families({0})".format(len(eval_env_factories))
-            if eval_env_factories is not None
-            else "fixed_base_env",
-            trainer_config.eval_episodes,
-        )
-    )
-    if curriculum_stages:
-        stage_parts = [
-            "{0}@{1}[{2}]".format(
-                stage["label"],
-                stage["activate_at_update"],
-                ",".join(
-                    "{0}:{1:.2f}".format(network_type, float(weight))
-                    for network_type, weight in zip(
-                        stage["train_network_types"],
-                        stage["train_network_type_weights"],
-                    )
-                ),
-            )
-            for stage in curriculum_stages
-        ]
-        print("Curriculum: {0}".format(" | ".join(stage_parts)))
-
-    checkpoint_dir = output_dir / "checkpoints"
-    should_save_checkpoints = bool(training.get("save_checkpoints", False))
-    save_final_checkpoint = bool(training.get("save_final_checkpoint", True))
-    save_best_checkpoint = bool(training.get("save_best_checkpoint", True))
-    checkpoint_interval = int(training.get("checkpoint_interval", 0))
-    checkpoint_mode = str(training.get("checkpoint_mode", "lightweight"))
-    if checkpoint_mode not in {"lightweight", "full_resume"}:
-        raise ValueError("training.checkpoint_mode must be one of {'lightweight', 'full_resume'}.")
-    best_eval_return = float("-inf")
-    resumed_update = 0
-    tensorboard_enabled = bool(tensorboard.get("enabled", False))
-    console_progress_logs = bool(tensorboard.get("console_progress_logs", True))
-    console_progress_interval = int(tensorboard.get("console_progress_interval", 50))
-    console_training_logs = bool(tensorboard.get("console_training_logs", False))
-    console_log_interval = int(tensorboard.get("console_log_interval", 50))
-    console_recent_window_updates = int(tensorboard.get("console_recent_window_updates", 50))
     writer: Any = None
-    tensorboard_stage_log_state: Dict[str, Any] = {"last_stage_index": None}
-    training_start_time = time.time()
-    effective_steps_per_update = int(trainer_config.steps_per_update) * int(trainer_config.num_workers)
-    total_env_steps = int(trainer_config.total_updates) * effective_steps_per_update
-    recent_metrics: deque[dict[str, float]] = deque(maxlen=max(console_recent_window_updates, 1))
-
-    def _current_stage_label(metrics: Mapping[str, float]) -> Optional[str]:
-        if "curriculum_stage" not in metrics:
-            return None
-        stage_index = int(metrics["curriculum_stage"])
-        if curriculum_stages and 0 <= stage_index < len(curriculum_stages):
-            return str(curriculum_stages[stage_index].get("label", stage_index))
-        return str(stage_index)
-
-    def _load_checkpoint_payload(checkpoint_path: Path) -> Dict[str, Any]:
-        try:
-            return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        except TypeError:
-            return torch.load(checkpoint_path, map_location="cpu")
-
-    if should_save_checkpoints or save_final_checkpoint or save_best_checkpoint:
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    if resume_from_checkpoint:
-        checkpoint_path = Path(str(resume_from_checkpoint)).expanduser()
-        if not checkpoint_path.exists():
-            raise FileNotFoundError("Checkpoint path does not exist: {0}".format(checkpoint_path))
-        checkpoint_payload = _load_checkpoint_payload(checkpoint_path)
-        resumed_checkpoint_mode = trainer.load_checkpoint(checkpoint_payload)
-        resumed_update = int(trainer.completed_updates)
-        best_eval_return = float(checkpoint_payload.get("best_eval_return_so_far", float("-inf")))
+    try:
         print(
-            "Resume    : checkpoint={0}, resume_update={1}, checkpoint_mode={2}".format(
-                checkpoint_path,
-                resumed_update,
-                resumed_checkpoint_mode,
+            "Train CFG : steps_per_update={0}, source={1}".format(
+                trainer_config.steps_per_update,
+                steps_source,
             )
         )
-
-    if tensorboard_enabled:
-        try:
-            from torch.utils.tensorboard import SummaryWriter
-        except ImportError as exc:
-            raise ImportError(
-                "TensorBoard logging is enabled, but torch.utils.tensorboard is unavailable. "
-                "Install the 'tensorboard' package or disable spec['tensorboard']['enabled']."
-            ) from exc
-
-        tensorboard_dir = output_dir / str(tensorboard.get("subdir", "tensorboard"))
-        tensorboard_dir.mkdir(parents=True, exist_ok=True)
-        writer = SummaryWriter(
-            log_dir=str(tensorboard_dir),
-            flush_secs=int(tensorboard.get("flush_secs", 30)),
-        )
-        print("TensorBoard: log_dir={0}".format(tensorboard_dir))
-        if bool(tensorboard.get("write_static_scalars", True)):
-            _log_tensorboard_static_metadata(writer, spec, graph, env_config)
-        if bool(tensorboard.get("write_config_text", True)):
-            writer.add_text(
-                "config/spec_json",
-                "```json\n{0}\n```".format(json.dumps(spec, ensure_ascii=False, indent=2)),
-                0,
+        print(
+            "Eval CFG  : mode={0}, periodic_eval_episodes={1}".format(
+                "custom_env_families({0})".format(len(eval_env_factories))
+                if eval_env_factories is not None
+                else "fixed_base_env",
+                trainer_config.eval_episodes,
             )
-        writer.flush()
-
-    def _save_checkpoint(filename: str, update: int, metrics: Mapping[str, float]) -> None:
-        checkpoint_path = checkpoint_dir / filename
-        payload = trainer.build_checkpoint(
-            update=update,
-            metrics=metrics,
-            checkpoint_mode=checkpoint_mode,
         )
-        payload["best_eval_return_so_far"] = float(best_eval_return)
-        torch.save(payload, checkpoint_path)
-        print("Checkpoint saved: {0}".format(checkpoint_path))
+        if curriculum_stages:
+            stage_parts = [
+                "{0}@{1}[{2}]".format(
+                    stage["label"],
+                    stage["activate_at_update"],
+                    ",".join(
+                        "{0}:{1:.2f}".format(network_type, float(weight))
+                        for network_type, weight in zip(
+                            stage["train_network_types"],
+                            stage["train_network_type_weights"],
+                        )
+                    ),
+                )
+                for stage in curriculum_stages
+            ]
+            print("Curriculum: {0}".format(" | ".join(stage_parts)))
 
-    def _on_update(metrics: dict[str, float]) -> None:
-        nonlocal best_eval_return
-        update = int(metrics["update"])
-        recent_metrics.append(dict(metrics))
-        if should_save_checkpoints and checkpoint_interval > 0 and update % checkpoint_interval == 0:
-            _save_checkpoint("update_{0:06d}.pt".format(update), update=update, metrics=metrics)
-            _save_checkpoint("latest.pt", update=update, metrics=metrics)
-        if save_best_checkpoint and "eval_return_mean" in metrics:
-            eval_return = float(metrics["eval_return_mean"])
-            if eval_return > best_eval_return:
-                best_eval_return = eval_return
-                _save_checkpoint("best_eval.pt", update=update, metrics=metrics)
+        checkpoint_dir = output_dir / "checkpoints"
+        should_save_checkpoints = bool(training.get("save_checkpoints", False))
+        save_final_checkpoint = bool(training.get("save_final_checkpoint", True))
+        save_best_checkpoint = bool(training.get("save_best_checkpoint", True))
+        checkpoint_interval = int(training.get("checkpoint_interval", 0))
+        checkpoint_mode = str(training.get("checkpoint_mode", "lightweight"))
+        if checkpoint_mode not in {"lightweight", "full_resume"}:
+            raise ValueError("training.checkpoint_mode must be one of {'lightweight', 'full_resume'}.")
+        best_eval_return = float("-inf")
+        resumed_update = 0
+        tensorboard_enabled = bool(tensorboard.get("enabled", False))
+        console_progress_logs = bool(tensorboard.get("console_progress_logs", True))
+        console_progress_interval = int(tensorboard.get("console_progress_interval", 50))
+        console_training_logs = bool(tensorboard.get("console_training_logs", False))
+        console_log_interval = int(tensorboard.get("console_log_interval", 50))
+        console_recent_window_updates = int(tensorboard.get("console_recent_window_updates", 50))
+        tensorboard_stage_log_state: Dict[str, Any] = {"last_stage_index": None}
+        training_start_time = time.time()
+        effective_steps_per_update = int(trainer_config.steps_per_update) * int(trainer_config.num_workers)
+        total_env_steps = int(trainer_config.total_updates) * effective_steps_per_update
+        recent_metrics: deque[dict[str, float]] = deque(maxlen=max(console_recent_window_updates, 1))
+
+        def _current_stage_label(metrics: Mapping[str, float]) -> Optional[str]:
+            if "curriculum_stage" not in metrics:
+                return None
+            stage_index = int(metrics["curriculum_stage"])
+            if curriculum_stages and 0 <= stage_index < len(curriculum_stages):
+                return str(curriculum_stages[stage_index].get("label", stage_index))
+            return str(stage_index)
+
+        def _load_checkpoint_payload(checkpoint_path: Path) -> Dict[str, Any]:
+            try:
+                return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            except TypeError:
+                return torch.load(checkpoint_path, map_location="cpu")
+
+        if should_save_checkpoints or save_final_checkpoint or save_best_checkpoint:
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        if resume_from_checkpoint:
+            checkpoint_path = Path(str(resume_from_checkpoint)).expanduser()
+            if not checkpoint_path.exists():
+                raise FileNotFoundError("Checkpoint path does not exist: {0}".format(checkpoint_path))
+            checkpoint_payload = _load_checkpoint_payload(checkpoint_path)
+            resumed_checkpoint_mode = trainer.load_checkpoint(checkpoint_payload)
+            resumed_update = int(trainer.completed_updates)
+            best_eval_return = float(checkpoint_payload.get("best_eval_return_so_far", float("-inf")))
+            print(
+                "Resume    : checkpoint={0}, resume_update={1}, checkpoint_mode={2}".format(
+                    checkpoint_path,
+                    resumed_update,
+                    resumed_checkpoint_mode,
+                )
+            )
+
+        if tensorboard_enabled:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+            except ImportError as exc:
+                raise ImportError(
+                    "TensorBoard logging is enabled, but torch.utils.tensorboard is unavailable. "
+                    "Install the 'tensorboard' package or disable spec['tensorboard']['enabled']."
+                ) from exc
+
+            tensorboard_root = output_dir / str(tensorboard.get("subdir", "tensorboard"))
+            run_timestamp = datetime.now().strftime("%m%d_%H%M%S")
+            tensorboard_dir = tensorboard_root / run_timestamp
+            tensorboard_dir.mkdir(parents=True, exist_ok=True)
+            writer = SummaryWriter(
+                log_dir=str(tensorboard_dir),
+                flush_secs=int(tensorboard.get("flush_secs", 30)),
+            )
+            print("TensorBoard: log_dir={0}".format(tensorboard_dir))
+            if bool(tensorboard.get("write_static_scalars", True)):
+                _log_tensorboard_static_metadata(writer, spec, graph, env_config)
+            _log_tensorboard_custom_layout(writer)
+            if bool(tensorboard.get("write_config_text", True)):
+                writer.add_text(
+                    "config/spec_json",
+                    "```json\n{0}\n```".format(json.dumps(spec, ensure_ascii=False, indent=2)),
+                    0,
+                )
+            writer.flush()
+
+        def _save_checkpoint(filename: str, update: int, metrics: Mapping[str, float]) -> None:
+            checkpoint_path = checkpoint_dir / filename
+            payload = trainer.build_checkpoint(
+                update=update,
+                metrics=metrics,
+                checkpoint_mode=checkpoint_mode,
+            )
+            payload["best_eval_return_so_far"] = float(best_eval_return)
+            torch.save(payload, checkpoint_path)
+            print("Checkpoint saved: {0}".format(checkpoint_path))
+
+        def _on_update(metrics: dict[str, float]) -> None:
+            nonlocal best_eval_return
+            update = int(metrics["update"])
+            recent_metrics.append(dict(metrics))
+            if should_save_checkpoints and checkpoint_interval > 0 and update % checkpoint_interval == 0:
+                _save_checkpoint("update_{0:06d}.pt".format(update), update=update, metrics=metrics)
+                _save_checkpoint("latest.pt", update=update, metrics=metrics)
+            if save_best_checkpoint and "eval_return_mean" in metrics:
+                eval_return = float(metrics["eval_return_mean"])
+                if eval_return > best_eval_return:
+                    best_eval_return = eval_return
+                    _save_checkpoint("best_eval.pt", update=update, metrics=metrics)
+            if writer is not None:
+                _log_tensorboard_update_metrics(
+                    writer,
+                    metrics,
+                    curriculum_stages=curriculum_stages,
+                    stage_log_state=tensorboard_stage_log_state,
+                )
+            env_steps = update * effective_steps_per_update
+            should_log_progress = console_progress_logs and (
+                update == resumed_update + 1
+                or update == int(trainer_config.total_updates)
+                or update % max(console_progress_interval, 1) == 0
+            )
+            should_log_recent_stats = console_training_logs and (
+                update == resumed_update + 1
+                or update == int(trainer_config.total_updates)
+                or update % max(console_log_interval, 1) == 0
+            )
+            if should_log_progress:
+                session_env_steps = max(update - resumed_update, 0) * effective_steps_per_update
+                session_total_env_steps = max(int(trainer_config.total_updates) - resumed_update, 0) * effective_steps_per_update
+                for line in _format_console_progress_lines(
+                    update=update,
+                    total_updates=int(trainer_config.total_updates),
+                    env_steps=env_steps,
+                    total_env_steps=total_env_steps,
+                    start_time=training_start_time,
+                    eta_env_steps=session_env_steps,
+                    eta_total_env_steps=session_total_env_steps,
+                ):
+                    print(line)
+            if should_log_recent_stats:
+                for line in _format_console_recent_stats_lines(
+                    recent_metrics=list(recent_metrics),
+                    latest_metrics=metrics,
+                    update=update,
+                    total_updates=int(trainer_config.total_updates),
+                    env_steps=env_steps,
+                    total_env_steps=total_env_steps,
+                    stage_label=_current_stage_label(metrics),
+                ):
+                    print(line)
+
+        history = trainer.train(
+            num_updates=spec["training"]["total_updates"],
+            on_update=_on_update,
+        )
+        if history and save_final_checkpoint:
+            final_metrics = history[-1]
+            _save_checkpoint(
+                "final.pt",
+                update=int(final_metrics["update"]),
+                metrics=final_metrics,
+            )
+
+        evaluation_summaries = run_trained_policy_evaluation(
+            spec=spec,
+            graph=graph,
+            env_config=env_config,
+            policy=policy,
+            output_dir=output_dir,
+        )
         if writer is not None:
-            _log_tensorboard_update_metrics(
-                writer,
-                metrics,
-                curriculum_stages=curriculum_stages,
-                stage_log_state=tensorboard_stage_log_state,
-            )
-        env_steps = update * effective_steps_per_update
-        should_log_progress = console_progress_logs and (
-            update == resumed_update + 1
-            or update == int(trainer_config.total_updates)
-            or update % max(console_progress_interval, 1) == 0
-        )
-        should_log_recent_stats = console_training_logs and (
-            update == resumed_update + 1
-            or update == int(trainer_config.total_updates)
-            or update % max(console_log_interval, 1) == 0
-        )
-        if should_log_progress:
-            session_env_steps = max(update - resumed_update, 0) * effective_steps_per_update
-            session_total_env_steps = max(int(trainer_config.total_updates) - resumed_update, 0) * effective_steps_per_update
-            for line in _format_console_progress_lines(
-                update=update,
-                total_updates=int(trainer_config.total_updates),
-                env_steps=env_steps,
-                total_env_steps=total_env_steps,
-                start_time=training_start_time,
-                eta_env_steps=session_env_steps,
-                eta_total_env_steps=session_total_env_steps,
-            ):
-                print(line)
-        if should_log_recent_stats:
-            for line in _format_console_recent_stats_lines(
-                recent_metrics=list(recent_metrics),
-                latest_metrics=metrics,
-                update=update,
-                total_updates=int(trainer_config.total_updates),
-                env_steps=env_steps,
-                total_env_steps=total_env_steps,
-                stage_label=_current_stage_label(metrics),
-            ):
-                print(line)
+            final_update = int(history[-1]["update"]) if history else resumed_update
+            _log_tensorboard_post_training_evaluation(writer, evaluation_summaries, final_update=final_update)
+            writer.flush()
 
-    history = trainer.train(
-        num_updates=spec["training"]["total_updates"],
-        on_update=_on_update,
-    )
-    if history and save_final_checkpoint:
-        final_metrics = history[-1]
-        _save_checkpoint(
-            "final.pt",
-            update=int(final_metrics["update"]),
-            metrics=final_metrics,
-        )
-
-    evaluation_summaries = run_trained_policy_evaluation(
-        spec=spec,
-        graph=graph,
-        env_config=env_config,
-        policy=policy,
-        output_dir=output_dir,
-    )
-    if writer is not None:
-        final_update = int(history[-1]["update"]) if history else resumed_update
-        _log_tensorboard_post_training_evaluation(writer, evaluation_summaries, final_update=final_update)
-        writer.flush()
-        writer.close()
-
-    return {
-        "experiment_name": spec["experiment_name"],
-        "run_mode": spec["run_mode"],
-        "network_type": spec["network"]["type"],
-        "trainer_config": asdict(trainer_config),
-        "history": history,
-        "post_training_evaluation": evaluation_summaries,
-        "final_metrics": history[-1] if history else {},
-    }
+        return {
+            "experiment_name": spec["experiment_name"],
+            "run_mode": spec["run_mode"],
+            "network_type": spec["network"]["type"],
+            "trainer_config": asdict(trainer_config),
+            "history": history,
+            "post_training_evaluation": evaluation_summaries,
+            "final_metrics": history[-1] if history else {},
+        }
+    finally:
+        if writer is not None:
+            writer.close()
+        trainer.close()
 
 
 def save_results_json(
