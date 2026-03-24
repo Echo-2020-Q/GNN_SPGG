@@ -55,7 +55,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "spgg_CNN_demo",
+    "experiment_name": "spgg_CNN_demo1_8workers",
 
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -260,7 +260,7 @@ BASE_EXPERIMENT = {
     # ---------------------------
     "training": {
         # 外层训练迭代次数。
-        "total_updates": 5_000,  # 5_000 * 150 = 750_000 步 = 0.75M 步
+        "total_updates": 2_500,  # 2_500 * 150 = 375_000 步 = 0.375M 步
 
         # 每个 worker 在每次训练迭代中收集多少个环境步。
         "steps_per_update": 150,  # episode=150
@@ -274,7 +274,7 @@ BASE_EXPERIMENT = {
         # per_worker_total_env_steps = total_updates * effective_steps_per_update
         # all_workers_total_env_steps = num_workers * per_worker_total_env_steps
         # 当前配置：effective_steps_per_update = 150，
-        # 所以每个 worker 共 5_000 * 150 = 750_000 步 = 0.75M 步，1 个 worker 合计也是 750_000 步 = 0.75M 步。
+        # 所以每个 worker 共 2_500 * 150 = 375_000 步 = 0.375M 步，1 个 worker 合计也是 375_000 步 = 0.375M 步。
         "use_episode_length_as_steps_per_update": True,
 
         # 折扣因子 gamma。
@@ -457,7 +457,7 @@ BASE_EXPERIMENT = {
         # 真实并行的 rollout worker 进程数。
         # num_workers=1 表示单进程采样；num_workers>1 会启动多进程并行采样。
         # learner 仍然在主进程单点更新。
-        "num_workers": 4,
+        "num_workers": 8,
 
         # learner 参数同步到 worker 的间隔。
         "worker_sync_interval": 1,
@@ -470,12 +470,12 @@ BASE_EXPERIMENT = {
         "collapse_resource_threshold": 1e-6,
 
         # 每隔多少个 update 做一次评估。
-        "eval_interval": 1000,
+        "eval_interval": 500,
 
         # 每次评估多少个 episode。
         "eval_episodes": 8,
 
-        # 训练设备：cpu 或 cuda。cuda:3
+        # 训练设备：cpu 或 cuda。
         "device": "cuda",
     },
 
