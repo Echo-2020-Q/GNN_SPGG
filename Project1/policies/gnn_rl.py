@@ -223,9 +223,10 @@ def _masked_edge_sum_by_receiver(edge_features: Tensor, edge_mask: Tensor) -> Te
     return (edge_features * mask).sum(dim=0)
 
 
-def _masked_global_edge_sum(edge_features: Tensor, edge_mask: Tensor) -> Tensor:
+def _masked_global_edge_normalized_sum(edge_features: Tensor, edge_mask: Tensor) -> Tensor:
     mask = edge_mask.unsqueeze(-1).to(dtype=edge_features.dtype)
-    return (edge_features * mask).sum(dim=(0, 1))
+    edge_count = edge_mask.sum().clamp_min(1).to(dtype=edge_features.dtype)
+    return (edge_features * mask).sum(dim=(0, 1)) / edge_count
 
 
 class GraphNetBlock(nn.Module):
@@ -300,8 +301,9 @@ class GraphNetBlock(nn.Module):
         )
         updated_nodes = self.node_model(node_inputs)
 
-        aggregated_nodes = updated_nodes.sum(dim=0)
-        aggregated_edges = _masked_global_edge_sum(updated_edges, state.edge_mask)
+        node_count = max(num_nodes, 1)
+        aggregated_nodes = updated_nodes.sum(dim=0) / float(node_count)
+        aggregated_edges = _masked_global_edge_normalized_sum(updated_edges, state.edge_mask)
         global_inputs = torch.cat(
             [
                 state.global_features,

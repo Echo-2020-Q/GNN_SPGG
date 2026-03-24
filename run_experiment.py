@@ -216,18 +216,36 @@ BASE_EXPERIMENT = {
     # ---------------------------
     "gnn": {
         # 节点嵌入隐藏维度。
+        # 这是全图两层 GraphNet backbone 的统一隐藏维度。
         "hidden_dim": 64,
 
+        # ego-local tiny GraphNet 的隐藏维度。
+        # 设为 None 时，自动回退到 hidden_dim。
+        "local_hidden_dim": None,
+
+        # 局部 score readout MLP 的隐藏维度。
+        # 设为 None 时，自动回退到 local_hidden_dim。
+        "score_hidden_dim": None,
+
+        # actor 内部全局 value head 的隐藏维度。
+        # 这个头当前在 TD3 主训练中不是核心训练对象，但模型结构里仍然保留。
+        # 设为 None 时，自动回退到 hidden_dim。
+        "critic_hidden_dim": None,
+
         # 消息传递层数。
+        # 当前实现固定为 2，不建议改成其他值，否则会触发配置校验错误。
         "num_message_passing_layers": 2,
 
         # 局部 softmax 温度参数 tau。
+        # 越小分配越尖锐，越大分配越平滑。
         "temperature": 1.0,
 
-        # Dirichlet 训练时的浓度缩放系数。
+        # Dirichlet 浓度缩放系数。
+        # 当前 TD3 的主探索是在 logits 空间完成，这个参数主要保留给 policy 内部兼容接口。
         "dirichlet_concentration_scale": 1.0,
 
         # Dirichlet 浓度下界，避免数值不稳定。
+        # 同样主要用于 policy 内部兼容接口。
         "dirichlet_concentration_floor": 0.1,
     },
 
@@ -307,6 +325,56 @@ BASE_EXPERIMENT = {
 
         # 训练设备：cpu 或 cuda。
         "device": "cuda",
+    },
+
+    # ---------------------------
+    # GNN-RL 训练时的环境随机化参数
+    # ---------------------------
+    "domain_randomization": {
+        # 是否启用 domain randomization。
+        # 关闭时，所有 worker 都使用当前 spec 对应的固定图和固定环境参数。
+        "enabled": False,
+
+        # worker 采样时允许出现的网络类型集合。
+        "network_types": ["regular", "erdos_renyi", "small_world", "scale_free"],
+
+        # 允许采样的节点数集合。
+        "num_nodes_choices": [100],
+
+        # regular 图可采样的度集合。
+        "regular_degree_choices": [4],
+
+        # ER 图可采样的目标平均度集合。
+        "er_mean_degree_choices": [4.0],
+
+        # WS 图可采样的度集合。
+        "ws_degree_choices": [4],
+
+        # WS 图可采样的重连概率集合。
+        "ws_rewiring_choices": [0.10],
+
+        # BA 图可采样的新节点连接数集合。
+        "ba_attachment_choices": [2],
+
+        # 初始资源随机区间 [low, high]。
+        # 设为 None 时，固定使用 dynamics.initial_resource。
+        "initial_resource_range": None,
+
+        # 初始合作概率随机区间 [low, high]。
+        # 设为 None 时，固定使用 dynamics.initial_cooperation_prob。
+        "initial_cooperation_prob_range": None,
+
+        # alpha 随机区间 [low, high]。
+        # 设为 None 时，固定使用 dynamics.alpha。
+        "alpha_range": None,
+
+        # r 随机区间 [low, high]。
+        # 设为 None 时，固定使用 dynamics.r。
+        "r_range": None,
+
+        # p_max 随机区间 [low, high]。
+        # 设为 None 时，固定使用 dynamics.p_max。
+        "p_max_range": None,
     },
 
     # ---------------------------
@@ -842,6 +910,9 @@ def build_gnn_policy(spec: Mapping[str, Any]) -> Any:
     return GNNAllocationPolicy(
         GNNPolicyConfig(
             hidden_dim=gnn["hidden_dim"],
+            local_hidden_dim=gnn.get("local_hidden_dim"),
+            score_hidden_dim=gnn.get("score_hidden_dim"),
+            critic_hidden_dim=gnn.get("critic_hidden_dim"),
             num_message_passing_layers=gnn["num_message_passing_layers"],
             temperature=gnn["temperature"],
             dirichlet_concentration_scale=gnn["dirichlet_concentration_scale"],
@@ -880,6 +951,56 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         eval_episodes=training["eval_episodes"],
         device=training["device"],
         seed=spec["seed"],
+    )
+
+
+def build_domain_randomization_config(spec: Mapping[str, Any]) -> Any:
+    from Project1.td3 import DomainRandomizationConfig
+
+    randomization = spec.get("domain_randomization", {})
+    if not randomization:
+        return DomainRandomizationConfig(enabled=False)
+
+    default_er_mean_degree = spec["network"].get("er_target_mean_degree")
+    if default_er_mean_degree is None:
+        default_er_mean_degree = 4.0
+
+    def _optional_range(key: str) -> tuple[float, float] | None:
+        values = randomization.get(key)
+        if values is None:
+            return None
+        if len(values) != 2:
+            raise ValueError("{0} must be a length-2 range or None.".format(key))
+        return (float(values[0]), float(values[1]))
+
+    return DomainRandomizationConfig(
+        enabled=bool(randomization.get("enabled", False)),
+        network_types=tuple(str(item) for item in randomization.get("network_types", ("regular",))),
+        num_nodes_choices=tuple(int(item) for item in randomization.get("num_nodes_choices", (int(spec["network"]["num_nodes"]),))),
+        regular_degree_choices=tuple(int(item) for item in randomization.get("regular_degree_choices", (int(spec["network"]["regular_degree"]),))),
+        er_mean_degree_choices=tuple(
+            float(item)
+            for item in randomization.get(
+                "er_mean_degree_choices",
+                (float(default_er_mean_degree),),
+            )
+        ),
+        ws_degree_choices=tuple(int(item) for item in randomization.get("ws_degree_choices", (int(spec["network"]["ws_degree"]),))),
+        ws_rewiring_choices=tuple(
+            float(item) for item in randomization.get("ws_rewiring_choices", (float(spec["network"]["ws_rewiring_prob"]),))
+        ),
+        ba_attachment_choices=tuple(
+            int(item)
+            for item in randomization.get(
+                "ba_attachment_choices",
+                (int(spec["network"]["ba_attachments_per_new_node"]),),
+            )
+        ),
+        initial_resource_range=_optional_range("initial_resource_range"),
+        initial_cooperation_prob_range=_optional_range("initial_cooperation_prob_range"),
+        alpha_range=_optional_range("alpha_range"),
+        r_range=_optional_range("r_range"),
+        p_max_range=_optional_range("p_max_range"),
     )
 
 
@@ -1265,12 +1386,14 @@ def run_gnn_training_mode(
     eval_env = SPGGEnv(env_config, graph)
     policy = build_gnn_policy(spec)
     trainer_config = build_trainer_config(spec)
+    randomization_config = build_domain_randomization_config(spec)
 
     trainer = CentralizedActorCriticTrainer(
         env=env,
         policy=policy,
         eval_env=eval_env,
         config=trainer_config,
+        randomization=randomization_config,
     )
 
     history = trainer.train(num_updates=spec["training"]["total_updates"])
