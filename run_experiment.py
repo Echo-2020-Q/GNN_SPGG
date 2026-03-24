@@ -26,6 +26,7 @@ import json
 import os
 from pathlib import Path
 from statistics import mean
+import sys
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -43,6 +44,8 @@ from Project1 import (
     make_watts_strogatz_graph,
 )
 from Project1.policies.rule_based import ProportionalContributionPolicy, UniformAllocationPolicy
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 # =============================================================================
@@ -375,7 +378,7 @@ BASE_EXPERIMENT = {
         # learner 内部做图张量化时的微批大小。
         # 这是为了避免把整个 replay batch 一次性展开成 dense [B, N, N, H] 图张量后显存占用过高。
         # 它不改变 replay sample 的 batch_size，只影响 actor / critic 在 GPU 上分几小块做前向与反向。
-        "graph_batch_chunk_size": 16,
+        "graph_batch_chunk_size": 24,
 
         # warm-up 环境步数。
         # 注意这是所有 worker 共享的“全局 warm-up 总步数”，不是每个 worker 单独的步数。
@@ -428,7 +431,7 @@ BASE_EXPERIMENT = {
         "train_every": 1,
 
         # 每个外层训练迭代做多少次梯度更新。
-        "gradient_steps_per_update": 2,
+        "gradient_steps_per_update": 4,
 
         # TD3 delayed policy update 频率。
         "policy_delay": 2,
@@ -472,7 +475,7 @@ BASE_EXPERIMENT = {
         # 每次评估多少个 episode。
         "eval_episodes": 8,
 
-        # 训练设备：cpu 或 cuda。
+        # 训练设备：cpu 或 cuda。cuda:3
         "device": "cuda",
     },
 
@@ -1627,7 +1630,9 @@ def print_header(spec: Mapping[str, Any], graph: Mapping[int, Sequence[int]], en
 
 
 def build_output_dir(spec: Mapping[str, Any]) -> Path:
-    root_dir = Path(spec["output"]["root_dir"])
+    root_dir = Path(spec["output"]["root_dir"]).expanduser()
+    if not root_dir.is_absolute():
+        root_dir = PROJECT_ROOT / root_dir
     experiment_dir = root_dir / spec["experiment_name"]
     experiment_dir.mkdir(parents=True, exist_ok=True)
     return experiment_dir
@@ -2414,6 +2419,8 @@ def run_gnn_training_mode(
 
         if resume_from_checkpoint:
             checkpoint_path = Path(str(resume_from_checkpoint)).expanduser()
+            if not checkpoint_path.is_absolute():
+                checkpoint_path = PROJECT_ROOT / checkpoint_path
             if not checkpoint_path.exists():
                 raise FileNotFoundError("Checkpoint path does not exist: {0}".format(checkpoint_path))
             checkpoint_payload = _load_checkpoint_payload(checkpoint_path)
@@ -2591,6 +2598,13 @@ def print_final_summary(results: Mapping[str, Any]) -> None:
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
+def _configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(line_buffering=True, write_through=True)
+
+
 def run_one_experiment(spec: Mapping[str, Any]) -> Dict[str, Any]:
     np.random.seed(spec["seed"])
 
@@ -2729,7 +2743,9 @@ def _save_scan_steady_state_plots(
 
 def run_scan_experiments() -> None:
     specs = build_scan_experiment_specs()
-    output_root = Path(SCAN_EXPERIMENT["output_root_dir"])
+    output_root = Path(SCAN_EXPERIMENT["output_root_dir"]).expanduser()
+    if not output_root.is_absolute():
+        output_root = PROJECT_ROOT / output_root
     output_root.mkdir(parents=True, exist_ok=True)
 
     manifest = {
@@ -2788,6 +2804,7 @@ def run_scan_experiments() -> None:
 
 
 def main() -> None:
+    _configure_stdio()
     if SCAN_EXPERIMENT["enabled"]:
         run_scan_experiments()
         return
