@@ -65,6 +65,11 @@ def _slice_observation_batch(observations: Mapping[str, Tensor], start: int, end
     return {key: value[start:end] for key, value in observations.items()}
 
 
+def _chunk_ranges(batch_size: int, chunk_size: int):
+    for start in range(0, batch_size, chunk_size):
+        yield start, min(start + chunk_size, batch_size)
+
+
 def _concat_batched_policy_outputs(outputs: list[BatchedPolicyOutput]) -> BatchedPolicyOutput:
     if not outputs:
         raise ValueError("outputs must contain at least one item.")
@@ -301,71 +306,126 @@ class GraphTD3Learner:
         actions = batch.action.allocation
         rewards = batch.reward
         dones = batch.done
-
-        with torch.no_grad():
-            target_outputs = self._batched_actor_outputs(self.target_actor, next_observations)
-            if target_outputs.logits is None:
-                raise ValueError("Target actor must provide logits for TD3 target smoothing.")
-            target_actions = self.target_explorer.apply_to_logits(
-                logits=target_outputs.logits,
-                ego_mask=next_observations["local_mask"],
-                pool_values=next_observations["pool_grown"],
-                noise_std=self.config.target_logit_noise_std,
-                noise_clip=self.config.target_logit_noise_clip,
-            ).allocation
-            target_q1, target_q2 = self._twin_critic_forward_batch(
-                self.target_critics,
-                next_observations,
-                target_actions,
-            )
-            target_q = rewards + (self.config.gamma * (1.0 - dones) * torch.minimum(target_q1, target_q2))
-
-        current_q1, current_q2 = self._twin_critic_forward_batch(
-            self.critics,
-            observations,
-            actions,
-        )
-        critic1_loss = F.mse_loss(current_q1, target_q)
-        critic2_loss = F.mse_loss(current_q2, target_q)
-        critic_loss = critic1_loss + critic2_loss
-
         self.critic_optimizer.zero_grad(set_to_none=True)
-        critic_loss.backward()
+
+        batch_size = _batch_size_from_observations(observations)
+        chunk_size = max(1, int(self.config.graph_batch_chunk_size))
+        total_critic1_loss = 0.0
+        total_critic2_loss = 0.0
+
+        for start, end in _chunk_ranges(batch_size, chunk_size):
+            chunk_observations = _slice_observation_batch(observations, start, end)
+            chunk_next_observations = _slice_observation_batch(next_observations, start, end)
+            chunk_actions = actions[start:end]
+            chunk_rewards = rewards[start:end]
+            chunk_dones = dones[start:end]
+
+            with torch.no_grad():
+                target_outputs = self.target_actor.deterministic_action_tensor_batch(chunk_next_observations)
+                if target_outputs.logits is None:
+                    raise ValueError("Target actor must provide logits for TD3 target smoothing.")
+                target_actions = self.target_explorer.apply_to_logits(
+                    logits=target_outputs.logits,
+                    ego_mask=chunk_next_observations["local_mask"],
+                    pool_values=chunk_next_observations["pool_grown"],
+                    noise_std=self.config.target_logit_noise_std,
+                    noise_clip=self.config.target_logit_noise_clip,
+                ).allocation
+                target_q1, target_q2 = self.target_critics.forward_tensor_batch(
+                    chunk_next_observations,
+                    target_actions,
+                )
+                target_q = chunk_rewards + (
+                    self.config.gamma * (1.0 - chunk_dones) * torch.minimum(target_q1, target_q2)
+                )
+
+            current_q1, current_q2 = self.critics.forward_tensor_batch(
+                chunk_observations,
+                chunk_actions,
+            )
+            critic1_loss_sum = F.mse_loss(current_q1, target_q, reduction="sum")
+            critic2_loss_sum = F.mse_loss(current_q2, target_q, reduction="sum")
+            chunk_loss = (critic1_loss_sum + critic2_loss_sum) / float(batch_size)
+            chunk_loss.backward()
+
+            total_critic1_loss += float(critic1_loss_sum.item())
+            total_critic2_loss += float(critic2_loss_sum.item())
+
         self.critic_optimizer.step()
 
+        critic1_loss = total_critic1_loss / float(batch_size)
+        critic2_loss = total_critic2_loss / float(batch_size)
+        critic_loss = critic1_loss + critic2_loss
+
         return {
-            "critic1_loss": float(critic1_loss.item()),
-            "critic2_loss": float(critic2_loss.item()),
-            "critic_loss": float(critic_loss.item()),
+            "critic1_loss": float(critic1_loss),
+            "critic2_loss": float(critic2_loss),
+            "critic_loss": float(critic_loss),
         }
 
     def update_actor(self, batch: TensorReplayBatch) -> dict[str, float]:
         observations = batch.obs
-        current_outputs = self._batched_actor_outputs(self.actor, observations)
-        actor_q = self._critic_forward_batch(self.critics.critic1, observations, current_outputs.allocation_matrix)
-        actor_q_loss = -actor_q.mean()
 
-        mean_entropy = actor_q_loss.new_zeros(())
-        mean_logit_l2 = actor_q_loss.new_zeros(())
-        mean_entropy = _mean_allocation_entropy(current_outputs.allocation_matrix)
-        if current_outputs.logits is not None:
-            mean_logit_l2 = _masked_mean_square(current_outputs.logits, observations["local_mask"])
+        self.actor_optimizer.zero_grad(set_to_none=True)
 
+        batch_size = _batch_size_from_observations(observations)
+        chunk_size = max(1, int(self.config.graph_batch_chunk_size))
+        total_actor_q = 0.0
+        total_entropy = 0.0
+        total_entropy_rows = 0
+        total_logit_square = 0.0
+        total_valid_logits = int(observations["local_mask"].sum().item())
+
+        for start, end in _chunk_ranges(batch_size, chunk_size):
+            chunk_observations = _slice_observation_batch(observations, start, end)
+            current_outputs = self.actor.deterministic_action_tensor_batch(chunk_observations)
+            actor_q = self.critics.critic1.forward_tensor_batch(
+                chunk_observations,
+                current_outputs.allocation_matrix,
+            )
+
+            actor_q_loss_chunk = -actor_q.sum() / float(batch_size)
+
+            allocation = current_outputs.allocation_matrix
+            safe_allocation = allocation.clamp_min(1e-12)
+            entropy_sum = -(allocation * safe_allocation.log()).sum(dim=-1).sum()
+            entropy_rows = int(allocation.shape[0] * allocation.shape[1])
+            entropy_term = entropy_sum / float(max(batch_size * allocation.shape[1], 1))
+
+            if current_outputs.logits is not None and total_valid_logits > 0:
+                valid_logits = current_outputs.logits[chunk_observations["local_mask"]]
+                logit_square_sum = valid_logits.pow(2).sum()
+                logit_l2_term = logit_square_sum / float(total_valid_logits)
+                total_logit_square += float(logit_square_sum.item())
+            else:
+                logit_l2_term = actor_q_loss_chunk.new_zeros(())
+
+            total_actor_q += float(actor_q.sum().item())
+            total_entropy += float(entropy_sum.item())
+            total_entropy_rows += entropy_rows
+
+            actor_reg_loss_chunk = (
+                (-float(self.config.actor_entropy_coef) * entropy_term)
+                + (float(self.config.actor_logit_l2_coef) * logit_l2_term)
+            )
+            (actor_q_loss_chunk + actor_reg_loss_chunk).backward()
+
+        self.actor_optimizer.step()
+
+        actor_q_loss = -(total_actor_q / float(batch_size))
+        mean_entropy = total_entropy / float(max(total_entropy_rows, 1))
+        mean_logit_l2 = total_logit_square / float(max(total_valid_logits, 1)) if total_valid_logits > 0 else 0.0
         actor_reg_loss = (
             (-float(self.config.actor_entropy_coef) * mean_entropy)
             + (float(self.config.actor_logit_l2_coef) * mean_logit_l2)
         )
         actor_loss = actor_q_loss + actor_reg_loss
 
-        self.actor_optimizer.zero_grad(set_to_none=True)
-        actor_loss.backward()
-        self.actor_optimizer.step()
-
-        self.last_actor_loss = float(actor_loss.item())
-        self.last_actor_q_loss = float(actor_q_loss.item())
-        self.last_actor_entropy = float(mean_entropy.item())
-        self.last_actor_logit_l2 = float(mean_logit_l2.item())
-        self.last_actor_reg_loss = float(actor_reg_loss.item())
+        self.last_actor_loss = float(actor_loss)
+        self.last_actor_q_loss = float(actor_q_loss)
+        self.last_actor_entropy = float(mean_entropy)
+        self.last_actor_logit_l2 = float(mean_logit_l2)
+        self.last_actor_reg_loss = float(actor_reg_loss)
         return {
             "actor_loss": self.last_actor_loss,
             "actor_q_loss": self.last_actor_q_loss,
