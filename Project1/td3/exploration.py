@@ -70,6 +70,56 @@ class LogitSpaceExplorer:
             pool_values=pool_values,
         )
 
+    def logits_from_allocation(
+        self,
+        allocation: Tensor | np.ndarray,
+        ego_mask: Tensor | np.ndarray,
+        device: torch.device | str = "cpu",
+    ) -> Tensor:
+        allocation_tensor = torch.as_tensor(allocation, dtype=torch.float32, device=device)
+        mask = torch.as_tensor(ego_mask, dtype=torch.bool, device=device)
+        masked_fill_value = torch.finfo(allocation_tensor.dtype).min
+        logits = torch.full_like(allocation_tensor, masked_fill_value)
+
+        positive_mask = mask & (allocation_tensor > 0.0)
+        logits = torch.where(
+            positive_mask,
+            torch.log(allocation_tensor.clamp_min(1e-12)),
+            logits,
+        )
+
+        rows_without_positive = positive_mask.sum(dim=1) == 0
+        if torch.any(rows_without_positive):
+            fallback_logits = torch.where(
+                mask[rows_without_positive],
+                torch.zeros_like(allocation_tensor[rows_without_positive]),
+                torch.full_like(allocation_tensor[rows_without_positive], masked_fill_value),
+            )
+            logits[rows_without_positive] = fallback_logits
+        return logits
+
+    def action_from_allocation(
+        self,
+        allocation: Tensor | np.ndarray,
+        ego_mask: Tensor | np.ndarray,
+        pool_values: Tensor | np.ndarray,
+        noise_std: float = 0.0,
+        noise_clip: float = 0.0,
+        device: torch.device | str = "cpu",
+    ) -> TensorActionRecord:
+        logits = self.logits_from_allocation(
+            allocation=allocation,
+            ego_mask=ego_mask,
+            device=device,
+        )
+        return self.apply_to_logits(
+            logits=logits,
+            ego_mask=torch.as_tensor(ego_mask, dtype=torch.bool, device=device),
+            pool_values=torch.as_tensor(pool_values, dtype=torch.float32, device=device),
+            noise_std=noise_std,
+            noise_clip=noise_clip,
+        )
+
     def sample_random_logits_action(
         self,
         ego_mask: np.ndarray,

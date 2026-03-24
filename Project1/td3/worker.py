@@ -16,6 +16,12 @@ from Project1.env import (
     make_watts_strogatz_graph,
 )
 from Project1.policies.gnn_rl import GNNAllocationPolicy
+from Project1.policies.rule_based import (
+    ConstantMixAllocationPolicy,
+    PoolPowerMixAllocationPolicy,
+    ProportionalContributionPolicy,
+    UniformAllocationPolicy,
+)
 
 from .config import DomainRandomizationConfig, GraphTD3Config, WorkerConfig
 from .data import Transition
@@ -25,6 +31,10 @@ from .replay import ReplayBuffer
 
 def _clone_graph_from_env(env: SPGGEnv) -> dict[int, list[int]]:
     return {node: list(neighbors) for node, neighbors in enumerate(env.graph.neighbors)}
+
+
+def _copy_module_state_to_cpu(module: nn.Module) -> dict[str, torch.Tensor]:
+    return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
 
 
 class RandomizedEnvFactory:
@@ -55,7 +65,11 @@ class RandomizedEnvFactory:
             env = SPGGEnv(self.base_config, self.base_graph)
             return env, {"network_type": "fixed", "num_nodes": env.num_nodes}
 
-        network_type = str(rng.choice(self.randomization.network_types))
+        network_probabilities = None
+        if self.randomization.network_type_weights is not None:
+            weight_array = np.asarray(self.randomization.network_type_weights, dtype=np.float64)
+            network_probabilities = weight_array / weight_array.sum()
+        network_type = str(rng.choice(self.randomization.network_types, p=network_probabilities))
         num_nodes = int(rng.choice(self.randomization.num_nodes_choices))
         graph = self._sample_graph(network_type, num_nodes, rng)
         config = self._sample_config(rng, num_nodes=num_nodes)
@@ -130,27 +144,84 @@ class RolloutWorker:
         self.env: SPGGEnv | None = None
         self.env_metadata: dict[str, Any] = {}
         self.observation: dict[str, np.ndarray] | None = None
+        self.uniform_policy = UniformAllocationPolicy()
+        self.proportional_policy = ProportionalContributionPolicy()
+        self.constant_mix_policy = ConstantMixAllocationPolicy(train_config.warmup_constant_mix_omega)
+        self.pool_power_mix_policy = PoolPowerMixAllocationPolicy(train_config.warmup_pool_power_k)
+        self.current_warmup_behavior_source: str | None = None
 
     def sync_actor(self, actor_state_dict: dict[str, torch.Tensor], version: int) -> None:
         self.actor.load_state_dict(actor_state_dict)
         self.actor.eval()
         self.actor_version = version
 
-    def collect(self, num_steps: int) -> dict[str, float]:
+    def set_env_factory(self, env_factory: RandomizedEnvFactory, reset_environment: bool = True) -> None:
+        self.env_factory = env_factory
+        if reset_environment:
+            self.env = None
+            self.env_metadata = {}
+            self.observation = None
+            self.current_warmup_behavior_source = None
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "config": {
+                "worker_id": int(self.config.worker_id),
+                "seed": int(self.config.seed),
+                "rollout_steps_per_sync": int(self.config.rollout_steps_per_sync),
+                "noise_scale_multiplier": float(self.config.noise_scale_multiplier),
+            },
+            "rng_state": self.rng.bit_generator.state,
+            "total_env_steps": int(self.total_env_steps),
+            "actor_version": int(self.actor_version),
+            "actor_state_dict": _copy_module_state_to_cpu(self.actor),
+            "env_metadata": dict(self.env_metadata),
+            "observation": (
+                {key: np.asarray(value).copy() for key, value in self.observation.items()}
+                if self.observation is not None
+                else None
+            ),
+            "env_state": self.env.state_dict() if self.env is not None else None,
+            "current_warmup_behavior_source": self.current_warmup_behavior_source,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.rng = np.random.default_rng()
+        self.rng.bit_generator.state = state_dict["rng_state"]
+        self.total_env_steps = int(state_dict["total_env_steps"])
+        self.actor_version = int(state_dict["actor_version"])
+        self.actor.load_state_dict(state_dict["actor_state_dict"])
+        self.actor.eval()
+        self.env_metadata = dict(state_dict.get("env_metadata", {}))
+        observation = state_dict.get("observation")
+        self.observation = (
+            {key: np.asarray(value).copy() for key, value in observation.items()}
+            if observation is not None
+            else None
+        )
+        env_state = state_dict.get("env_state")
+        if env_state is None:
+            self.env = None
+        else:
+            self.env = SPGGEnv(self.env_factory.base_config, self.env_factory.base_graph)
+            self.env.load_state_dict(env_state)
+        self.current_warmup_behavior_source = state_dict.get("current_warmup_behavior_source")
+
+    def collect(self, num_steps: int) -> dict[str, Any]:
         rewards: list[float] = []
         completed_episodes = 0
+        behavior_source_counts: dict[str, int] = {}
 
         for _ in range(num_steps):
             self._ensure_environment()
             assert self.observation is not None
 
-            if self.total_env_steps < self.train_config.warmup_steps:
-                action = self.explorer.sample_random_logits_action(
-                    ego_mask=self.observation["local_mask"],
-                    pool_values=self.observation["pool_grown"],
-                    rng=self.rng,
-                    device=self.device,
-                )
+            is_warmup = self.total_env_steps < self.train_config.warmup_steps
+            behavior_source = "actor_logits"
+
+            if is_warmup:
+                behavior_source = self._resolve_warmup_behavior_source()
+                action = self._sample_warmup_action(behavior_source)
             else:
                 with torch.no_grad():
                     policy_output = self.actor.deterministic_action(self.observation)
@@ -168,6 +239,7 @@ class RolloutWorker:
                     noise_clip=self.train_config.rollout_logit_noise_clip,
                 )
 
+            behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
             next_observation, reward, done, info = self.env.step(action.allocation.detach().cpu().numpy())
             transition = Transition(
                 obs=self.observation,
@@ -179,6 +251,8 @@ class RolloutWorker:
                 metadata={
                     "worker_id": self.config.worker_id,
                     "actor_version": self.actor_version,
+                    "is_warmup": bool(is_warmup),
+                    "behavior_source": behavior_source,
                     **self.env_metadata,
                 },
             )
@@ -195,6 +269,7 @@ class RolloutWorker:
             "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
             "episodes_completed": float(completed_episodes),
             "env_steps": float(self.total_env_steps),
+            "behavior_source_counts": behavior_source_counts,
         }
 
     def _ensure_environment(self) -> None:
@@ -205,3 +280,66 @@ class RolloutWorker:
         self.env, self.env_metadata = self.env_factory.sample_environment(self.rng)
         reset_seed = int(self.rng.integers(0, 2**31 - 1))
         self.observation = self.env.reset(seed=reset_seed)
+        self.current_warmup_behavior_source = None
+        if self.train_config.warmup_selection_granularity == "per_episode":
+            self.current_warmup_behavior_source = self._select_warmup_behavior_source()
+
+    def _resolve_warmup_behavior_source(self) -> str:
+        if self.train_config.warmup_selection_granularity == "per_step":
+            return self._select_warmup_behavior_source()
+        if self.current_warmup_behavior_source is None:
+            self.current_warmup_behavior_source = self._select_warmup_behavior_source()
+        return self.current_warmup_behavior_source
+
+    def _select_warmup_behavior_source(self) -> str:
+        if self.train_config.warmup_behavior_mode == "random_only":
+            return "random_logits"
+
+        candidates: list[str] = []
+        weights: list[float] = []
+        behavior_weights = (
+            ("uniform", self.train_config.warmup_uniform_prob),
+            ("proportional", self.train_config.warmup_proportional_prob),
+            ("constant_mix", self.train_config.warmup_constant_mix_prob),
+            ("pool_power_mix", self.train_config.warmup_pool_power_mix_prob),
+            ("random_logits", self.train_config.warmup_random_logits_prob),
+        )
+        for name, weight in behavior_weights:
+            if weight > 0.0:
+                candidates.append(name)
+                weights.append(float(weight))
+
+        weight_array = np.asarray(weights, dtype=np.float64)
+        weight_array = weight_array / weight_array.sum()
+        return str(self.rng.choice(candidates, p=weight_array))
+
+    def _sample_warmup_action(self, behavior_source: str):
+        assert self.observation is not None
+
+        if behavior_source == "random_logits":
+            return self.explorer.sample_random_logits_action(
+                ego_mask=self.observation["local_mask"],
+                pool_values=self.observation["pool_grown"],
+                rng=self.rng,
+                device=self.device,
+            )
+
+        if behavior_source == "uniform":
+            heuristic_allocation = self.uniform_policy.allocate(self.observation)
+        elif behavior_source == "proportional":
+            heuristic_allocation = self.proportional_policy.allocate(self.observation)
+        elif behavior_source == "constant_mix":
+            heuristic_allocation = self.constant_mix_policy.allocate(self.observation)
+        elif behavior_source == "pool_power_mix":
+            heuristic_allocation = self.pool_power_mix_policy.allocate(self.observation)
+        else:
+            raise ValueError("Unsupported warm-up behavior source: {0}".format(behavior_source))
+
+        return self.explorer.action_from_allocation(
+            allocation=heuristic_allocation,
+            ego_mask=self.observation["local_mask"],
+            pool_values=self.observation["pool_grown"],
+            noise_std=self.train_config.warmup_logit_noise_std,
+            noise_clip=self.train_config.warmup_logit_noise_clip,
+            device=self.device,
+        )

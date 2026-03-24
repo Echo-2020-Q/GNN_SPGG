@@ -34,6 +34,10 @@ class GraphTD3Evaluator:
         collapse_flags: list[float] = []
 
         per_network_returns: dict[str, list[float]] = {}
+        per_network_mean_total_resources: dict[str, list[float]] = {}
+        per_network_cooperation_rates: dict[str, list[float]] = {}
+        per_network_gini_values: dict[str, list[float]] = {}
+        per_network_collapse_flags: dict[str, list[float]] = {}
 
         for factory in self.env_factories:
             rng = np.random.default_rng(0)
@@ -55,15 +59,26 @@ class GraphTD3Evaluator:
 
                 final_mean_resource = float(np.asarray(observation["resources"]).mean())
                 returns.append(episode_return)
-                mean_total_resources.append(float(np.mean(resource_trace)) if resource_trace else 0.0)
-                cooperation_rates.append(
-                    float(final_info["actual_cooperation_rate"]) if final_info is not None else float(np.asarray(observation["x_actual"]).mean())
+                mean_total_resource = float(np.mean(resource_trace)) if resource_trace else 0.0
+                cooperation_rate = (
+                    float(final_info["actual_cooperation_rate"])
+                    if final_info is not None
+                    else float(np.asarray(observation["x_actual"]).mean())
                 )
-                gini_values.append(float(final_info["gini"]) if final_info is not None else 0.0)
-                collapse_flags.append(float(final_mean_resource <= self.config.collapse_resource_threshold))
+                gini_value = float(final_info["gini"]) if final_info is not None else 0.0
+                collapse_flag = float(final_mean_resource <= self.config.collapse_resource_threshold)
+
+                mean_total_resources.append(mean_total_resource)
+                cooperation_rates.append(cooperation_rate)
+                gini_values.append(gini_value)
+                collapse_flags.append(collapse_flag)
 
                 network_type = str(metadata.get("network_type", "unknown"))
                 per_network_returns.setdefault(network_type, []).append(episode_return)
+                per_network_mean_total_resources.setdefault(network_type, []).append(mean_total_resource)
+                per_network_cooperation_rates.setdefault(network_type, []).append(cooperation_rate)
+                per_network_gini_values.setdefault(network_type, []).append(gini_value)
+                per_network_collapse_flags.setdefault(network_type, []).append(collapse_flag)
 
         metrics = {
             "return_mean": float(np.mean(returns)) if returns else 0.0,
@@ -75,4 +90,12 @@ class GraphTD3Evaluator:
         }
         for network_type, values in per_network_returns.items():
             metrics["return_mean/{0}".format(network_type)] = float(np.mean(values))
+        for network_type, values in per_network_mean_total_resources.items():
+            metrics["mean_total_resource/{0}".format(network_type)] = float(np.mean(values))
+        for network_type, values in per_network_cooperation_rates.items():
+            metrics["cooperation_mean/{0}".format(network_type)] = float(np.mean(values))
+        for network_type, values in per_network_gini_values.items():
+            metrics["gini_mean/{0}".format(network_type)] = float(np.mean(values))
+        for network_type, values in per_network_collapse_flags.items():
+            metrics["collapse_rate/{0}".format(network_type)] = float(np.mean(values))
         return metrics

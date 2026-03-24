@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple, Union
 
 import numpy as np
@@ -391,6 +391,56 @@ class SPGGEnv:
             raise RuntimeError("Environment is not initialized. Call reset() first.")
         return self._copy_observation(self._current_observation)
 
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "config": asdict(self.config),
+            "graph": {node: list(neighbors) for node, neighbors in enumerate(self.graph.neighbors)},
+            "rng_state": self.rng.bit_generator.state,
+            "step_count": int(self._step_count),
+            "nominal_strategies": self._nominal_strategies.copy(),
+            "resources": self._resources.copy(),
+            "q_values": self._q_values.copy(),
+            "q_learning_previous_actions": self._q_learning_previous_actions.copy(),
+            "current_observation": (
+                self._copy_observation(self._current_observation)
+                if self._current_observation is not None
+                else None
+            ),
+        }
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        config_payload = dict(state_dict["config"])
+        reward_payload = dict(config_payload.pop("reward"))
+        self.config = SPGGConfig(
+            reward=RewardConfig(**reward_payload),
+            **config_payload,
+        )
+        self.graph = self._normalize_graph(state_dict["graph"], self.config.num_nodes)
+        self.num_nodes = self.graph.num_nodes
+        self.graph_mean_degree = float(self.graph.degrees.mean()) if self.num_nodes > 0 else 0.0
+        self.target_mean_degree = (
+            float(self.config.target_mean_degree)
+            if self.config.target_mean_degree is not None
+            else self.graph_mean_degree
+        )
+        self.resource_norm_reference = self._compute_resource_norm_reference()
+        self.rng = np.random.default_rng()
+        self.rng.bit_generator.state = state_dict["rng_state"]
+        self._step_count = int(state_dict["step_count"])
+        self._nominal_strategies = np.asarray(state_dict["nominal_strategies"], dtype=np.int8).copy()
+        self._resources = np.asarray(state_dict["resources"], dtype=np.float64).copy()
+        self._q_values = np.asarray(state_dict["q_values"], dtype=np.float64).copy()
+        self._q_learning_previous_actions = np.asarray(
+            state_dict["q_learning_previous_actions"],
+            dtype=np.int8,
+        ).copy()
+        current_observation = state_dict.get("current_observation")
+        self._current_observation = (
+            self._copy_observation(current_observation)
+            if current_observation is not None
+            else None
+        )
+
     def _coerce_resource_vector(
         self,
         initial_resources: float | Sequence[float] | np.ndarray | None,
@@ -464,6 +514,7 @@ class SPGGEnv:
             "degree_norm": degree_norm.astype(np.float64, copy=True),
             "strategy_norm": strategy_norm.astype(np.float64, copy=True),
             "gini": np.asarray(resource_gini, dtype=np.float64),
+            "p_max": np.asarray(self.config.p_max, dtype=np.float64),
             "local_mask": self.graph.local_mask.copy(),
         }
 

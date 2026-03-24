@@ -16,14 +16,17 @@ from __future__ import annotations
   2. 宏观图：同一实验过程中统计量随时间的变化曲线。
 """
 
+from collections import deque
 from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 from statistics import mean
+import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
@@ -60,7 +63,7 @@ BASE_EXPERIMENT = {
     # - "uniform"      ：人工规则，均匀分配
     # - "proportional" ：人工规则，按贡献比例分配
     # - "gnn_train"    ：训练 GNN-RL 分配器，再做训练后评估
-    "run_mode": "uniform",
+    "run_mode": "gnn_train",
 
     # ---------------------------
     # 网络配置
@@ -184,7 +187,7 @@ BASE_EXPERIMENT = {
 
         # 每个 episode 的时间步上限。
         # 到达这个步数后，本 episode 结束。
-        "episode_length": 10000, #150 10000
+        "episode_length": 150, #150 10000
 
         # 所有节点统一的初始资源。
         "initial_resource": 20.0,#10
@@ -198,6 +201,13 @@ BASE_EXPERIMENT = {
     # planner 奖励参数
     # ---------------------------
     "reward": {
+        # 环境返回给 RL planner 的标量奖励：
+        # reward =
+        #   lambda_payoff * mean(payoff)
+        #   + lambda_cooperation * mean(next_actual_cooperation)
+        #   - lambda_gini * gini(next_resources)
+        # 当前这组默认系数下，实际 reward = mean(payoff)。
+
         # 平均净收益项的权重。
         "lambda_payoff": 1.0,
 
@@ -217,15 +227,15 @@ BASE_EXPERIMENT = {
     "gnn": {
         # 节点嵌入隐藏维度。
         # 这是全图两层 GraphNet backbone 的统一隐藏维度。
-        "hidden_dim": 64,
+        "hidden_dim":128,
 
         # ego-local tiny GraphNet 的隐藏维度。
         # 设为 None 时，自动回退到 hidden_dim。
-        "local_hidden_dim": None,
+        "local_hidden_dim": 64,
 
         # 局部 score readout MLP 的隐藏维度。
         # 设为 None 时，自动回退到 local_hidden_dim。
-        "score_hidden_dim": None,
+        "score_hidden_dim":64,
 
         # actor 内部全局 value head 的隐藏维度。
         # 这个头当前在 TD3 主训练中不是核心训练对象，但模型结构里仍然保留。
@@ -237,16 +247,9 @@ BASE_EXPERIMENT = {
         "num_message_passing_layers": 2,
 
         # 局部 softmax 温度参数 tau。
+        # 当前已真实接入 actor 的局部 softmax：alpha_i = softmax(score_i / temperature)。
         # 越小分配越尖锐，越大分配越平滑。
-        "temperature": 1.0,
-
-        # Dirichlet 浓度缩放系数。
-        # 当前 TD3 的主探索是在 logits 空间完成，这个参数主要保留给 policy 内部兼容接口。
-        "dirichlet_concentration_scale": 1.0,
-
-        # Dirichlet 浓度下界，避免数值不稳定。
-        # 同样主要用于 policy 内部兼容接口。
-        "dirichlet_concentration_floor": 0.1,
+        "temperature": 1,
     },
 
     # ---------------------------
@@ -254,17 +257,30 @@ BASE_EXPERIMENT = {
     # ---------------------------
     "training": {
         # 外层训练迭代次数。
-        "total_updates": 50,
+        "total_updates": 5_000,#100_000 5_000*150=750_000步=0.75M 步
 
         # 每个 worker 在每次训练迭代中收集多少个环境步。
-        "steps_per_update": 64,
+        "steps_per_update": 150,#episode=150
+
+        # 是否强制把每次训练迭代的采样长度设为一个完整 episode。
+        # 为 True 时，会忽略上面的 steps_per_update，改为使用 dynamics.episode_length。
+        # 对当前演化博弈设定，这意味着每次 learner 更新前都会先采完整个演化过程。
+        # 训练总环境步数公式：
+        # effective_steps_per_update =
+        #   dynamics.episode_length if use_episode_length_as_steps_per_update else steps_per_update
+        # per_worker_total_env_steps = total_updates * effective_steps_per_update
+        # all_workers_total_env_steps = num_workers * per_worker_total_env_steps
+        # 当前配置：effective_steps_per_update = 150，
+        # 所以每个 worker 共 100_000 * 150 = 15_000_000 步=15M 步，1 个 workers 合计 100_000 * 150 = 15_000_000 步=15M 步。
+        "use_episode_length_as_steps_per_update": True,
 
         # 折扣因子 gamma。
         "gamma": 0.99,
 
         # 共享学习率。
         # 如果 actor_lr / critic_lr 为 None，就回退到这里。
-        "learning_rate": 3e-4,
+        # 当前默认作为指数退火的初始学习率。
+        "learning_rate": 1e-4,
 
         # Actor 学习率。
         "actor_lr": None,
@@ -272,20 +288,140 @@ BASE_EXPERIMENT = {
         # Critic 学习率。
         "critic_lr": None,
 
+        # 学习率调度类型：
+        # - "constant"          ：固定学习率
+        # - "exponential_decay" ：指数退火，lr = max(lr_final, lr_init * decay_rate^(step / decay_steps))
+        "lr_schedule_type": "exponential_decay",
+
+        # 指数退火的最小学习率下界。
+        "lr_final": 1e-5,
+
+        # 指数退火的 decay_rate。
+        "lr_decay_rate": 0.05,
+
+        # 指数退火的 decay_steps。
+        # 当 learner 的训练步数增加到这个量级时，学习率会衰减一个 decay_rate 的量级。
+        "lr_decay_steps": 5_000,
+
+        # 是否在训练过程中保存 checkpoint。
+        "save_checkpoints": True,
+
+        # checkpoint 保存间隔。
+        # 例如 100 表示每 100 个 update 保存一次。
+        "checkpoint_interval": 500,
+
+        # 是否额外保存最终 checkpoint。
+        "save_final_checkpoint": True,
+
+        # 是否按 eval_return_mean 额外保存一份当前最佳 checkpoint。
+        # 只有在该 update 触发评估时才会比较和更新。
+        "save_best_checkpoint": True,
+
+        # checkpoint 模式：
+        # - "lightweight" ：只保存 learner / optimizer / 历史 / update 进度，文件小很多，
+        #                   但恢复时不会找回 replay buffer 和 worker 当前环境状态。
+        # - "full_resume" ：额外保存 replay buffer / worker / env 运行态，可做真正的无损续训，
+        #                   但文件会很大，尤其 replay_capacity 较大时。
+        "checkpoint_mode": "lightweight",
+
+        # 从已有 checkpoint 恢复训练。
+        # 设为 None 表示从头开始训练；
+        # 设为字符串路径时，会恢复 actor / critics / optimizer / 训练历史 / update 进度。
+        # 若 checkpoint_mode == "full_resume" 保存出的文件，还会同时恢复 replay buffer /
+        # workers / 当前环境状态，实现更接近无损的续训。
+        "resume_from_checkpoint": None,
+
+        # Actor optimizer 的 L2 weight decay。
+        "actor_weight_decay": 0.0,
+
+        # Critic optimizer 的 L2 weight decay。
+        "critic_weight_decay": 0.0,
+
+        # Actor loss 里的分配熵正则权重。
+        # 这是训练目标里的辅助项，不是环境 reward。
+        # > 0 会鼓励分配更平滑、更不那么尖锐。
+        "actor_entropy_coef": 0.0,
+
+        # Actor loss 里的 valid logits L2 正则权重。
+        # > 0 会抑制 logits 绝对值过大，减轻策略过尖。
+        "actor_logit_l2_coef": 0.0,
+
+        # TD3 twin critics 的状态编码器隐藏维度。
+        # 对应 GraphActionCritic 里 state encoder 的 hidden_dim。
+        # 设为 None 时，自动回退到 gnn.hidden_dim。
+        "critic_state_hidden_dim": 64,
+
+        # TD3 twin critics 的局部动作编码器隐藏维度。
+        # 对应每个 pool 的 local action encoder MLP 宽度。
+        # 设为 None 时，自动回退到 gnn.hidden_dim。
+        "critic_action_hidden_dim":64,
+
+        # TD3 twin critics 的 pool token 编码器隐藏维度。
+        # 对应 pool-level encoder MLP 宽度。
+        # 设为 None 时，自动回退到 gnn.hidden_dim。
+        "critic_pool_hidden_dim": 64,
+
+        # TD3 twin critics 的最终 Q head 隐藏维度。
+        # 对应输出标量 Q(s, a) 前的最后一个 MLP 宽度。
+        # 设为 None 时，自动回退到 gnn.hidden_dim。
+        "critic_q_hidden_dim": 64,
+
         # replay buffer 容量。
-        "replay_capacity": 200_000,
+        "replay_capacity": 200_000,#200k 步=0.2M 步
 
         # learner 每次更新采样的 batch 大小。
-        "batch_size": 32,
+        "batch_size": 256,
 
-        # warm-up 步数。前期用随机 logits + softmax 动作填充 buffer。
-        "warmup_steps": 1_000,
+        # warm-up 步数。
+        # 注意这是每个 worker 自己的 warm-up 步数，不是全局总和。
+        "warmup_steps": 6_000,
+
+        # warm-up 行为模式：
+        # - "random_only"   ：只用随机 logits + softmax
+        # - "heuristic_mix" ：在启发式与随机 logits 之间按权重混合
+        "warmup_behavior_mode": "heuristic_mix",
+
+        # warm-up 行为源的采样粒度：
+        # - "per_episode" ：每个 episode 固定选一种 warm-up 行为
+        # - "per_step"    ：每一步都重新采样 warm-up 行为
+        "warmup_selection_granularity": "per_episode",
+
+        # warm-up 中均匀分配启发式的采样权重。
+        "warmup_uniform_prob": 0.20,
+
+        # warm-up 中按局部贡献比例分配启发式的采样权重。
+        "warmup_proportional_prob": 0.25,
+
+        # warm-up 中常数混合启发式的采样权重。
+        # 行为形式：omega * uniform + (1 - omega) * proportional。
+        "warmup_constant_mix_prob": 0.15,
+
+        # warm-up 中 pool 驱动混合启发式的采样权重。
+        # 行为形式：omega_i * uniform + (1 - omega_i) * proportional，
+        # 其中 omega_i = (clip(pool_raw_i, 0, p_max) / p_max) ^ k。
+        "warmup_pool_power_mix_prob": 0.25,
+
+        # warm-up 中随机 logits 行为的采样权重。
+        "warmup_random_logits_prob": 0.15,
+
+        # 常数混合启发式中的 omega。
+        "warmup_constant_mix_omega": 0.5,
+
+        # pool 驱动混合启发式中的幂指数 k。
+        "warmup_pool_power_k": 19.0,
+
+        # 启发式 warm-up 动作在 logits 空间追加的噪声标准差。
+        # 只对 uniform / proportional / mixed 这类启发式行为生效。
+        "warmup_logit_noise_std": 0.15,
+
+        # 启发式 warm-up logits 噪声的截断范围。
+        "warmup_logit_noise_clip": 0.25,
 
         # 每隔多少个外层训练迭代做一次 learner 更新。
         "train_every": 1,
 
         # 每个外层训练迭代做多少次梯度更新。
-        "gradient_steps_per_update": 1,
+        "gradient_steps_per_update": 2,
 
         # TD3 delayed policy update 频率。
         "policy_delay": 2,
@@ -309,7 +445,7 @@ BASE_EXPERIMENT = {
         "target_logit_noise_clip": 0.25,
 
         # worker 数量。
-        "num_workers": 8,
+        "num_workers": 1,
 
         # learner 参数同步到 worker 的间隔。
         "worker_sync_interval": 1,
@@ -318,10 +454,10 @@ BASE_EXPERIMENT = {
         "collapse_resource_threshold": 1e-6,
 
         # 每隔多少个 update 做一次评估。
-        "eval_interval": 10,
+        "eval_interval": 1000,
 
         # 每次评估多少个 episode。
-        "eval_episodes": 3,
+        "eval_episodes": 8,
 
         # 训练设备：cpu 或 cuda。
         "device": "cuda",
@@ -333,10 +469,14 @@ BASE_EXPERIMENT = {
     "domain_randomization": {
         # 是否启用 domain randomization。
         # 关闭时，所有 worker 都使用当前 spec 对应的固定图和固定环境参数。
-        "enabled": False,
+        "enabled": True,
 
         # worker 采样时允许出现的网络类型集合。
         "network_types": ["regular", "erdos_renyi", "small_world", "scale_free"],
+
+        # 与上面 network_types 一一对应的采样权重。
+        # 设为 None 时，默认对这些网络类型均匀采样。
+        "network_type_weights": None,
 
         # 允许采样的节点数集合。
         "num_nodes_choices": [100],
@@ -378,6 +518,84 @@ BASE_EXPERIMENT = {
     },
 
     # ---------------------------
+    # 周期评估环境配置
+    # ---------------------------
+    "evaluation": {
+        # 是否使用自定义评估环境族。
+        # 关闭时，训练过程中的周期评估使用当前 spec 对应的固定 eval_env。
+        "use_custom_env_families": True,
+
+        # 每个条目定义一个评估环境族。
+        # 对随机图模型，同一条目下不同评估 episode 会用不同图 seed 重新采样图，
+        # 但网络类型和超参数保持固定。
+        # 周期评估时，每个环境族都会跑 training.eval_episodes 个 episode。
+        "env_families": [
+            {
+                "network_type": "regular",
+                "num_nodes": 100,
+                "regular_degree": 4,
+            },
+            {
+                "network_type": "erdos_renyi",
+                "num_nodes": 100,
+                "er_target_mean_degree": 4.0,
+            },
+            {
+                "network_type": "small_world",
+                "num_nodes": 100,
+                "ws_degree": 4,
+                "ws_rewiring_prob": 0.10,
+            },
+            {
+                "network_type": "scale_free",
+                "num_nodes": 100,
+                "ba_attachments_per_new_node": 2,
+            },
+        ],
+    },
+
+    # ---------------------------
+    # GNN-RL 训练课程学习配置
+    # ---------------------------
+    "curriculum": {
+        # 是否启用按训练进度逐步扩展网络类型的 curriculum。
+        "enabled": True,
+
+        # 当前先只支持按训练 update 进度切阶段。
+        # 后续如果需要，再加按 f_c / eval 指标收敛触发的模式。
+        "mode": "update_steps",
+
+        # 各阶段按 total_updates 的比例切分。
+        # 下面这组默认含义是：
+        # - 前 40%：只训练 / 评估 regular
+        # - 接着 30%：训练 / 评估 regular + scale_free
+        # - 最后 30%：训练 / 评估 regular + scale_free + erdos_renyi + small_world
+        "stages": [
+            {
+                "label": "regular_only",
+                "portion": 0.40,
+                "train_network_types": ["regular"],
+                "train_network_type_weights": [1.0],
+                "eval_network_types": ["regular"],
+            },
+            {
+                "label": "regular_plus_scale_free",
+                "portion": 0.30,
+                "train_network_types": ["regular", "scale_free"],
+                "train_network_type_weights": [0.7, 0.3],
+                "eval_network_types": ["regular", "scale_free"],
+            },
+            {
+                "label": "all_topologies",
+                "portion": 0.30,
+                "train_network_types": ["regular", "scale_free", "erdos_renyi", "small_world"],
+                "train_network_type_weights": [0.4, 0.3, 0.15, 0.15],
+                "eval_network_types": ["regular", "scale_free", "erdos_renyi", "small_world"],
+            },
+        ],
+    },
+
+    # ---------------------------
     # 规则模式 / 评估模式运行长度
     # ---------------------------
     "rollout": {
@@ -386,7 +604,7 @@ BASE_EXPERIMENT = {
         "episodes": 5,
 
         # 在 gnn_train 模式下，训练结束后用训练好的策略再评估多少个 episode。
-        "post_training_eval_episodes": 2,
+        "post_training_eval_episodes": 5,
     },
 
     # ---------------------------
@@ -473,6 +691,43 @@ BASE_EXPERIMENT = {
     },
 
     # ---------------------------
+    # TensorBoard 日志配置
+    # ---------------------------
+    "tensorboard": {
+        # 是否启用 TensorBoard 标量日志。
+        "enabled": True,
+
+        # TensorBoard 事件文件相对于实验输出目录的子目录名。
+        "subdir": "tensorboard",
+
+        # SummaryWriter 的 flush_secs。
+        "flush_secs": 30,
+
+        # 是否把完整实验配置写成文本到 TensorBoard。
+        "write_config_text": True,
+
+        # 是否把静态图/环境/模型参数写成 step=0 的标量。
+        "write_static_scalars": True,
+
+        # 是否在控制台输出低频进度日志。
+        # 打印当前环境步数、总环境步数、耗时和预估剩余时间。
+        "console_progress_logs": True,
+
+        # 控制台进度日志的 update 间隔。
+        "console_progress_interval": 50,
+
+        # 是否在控制台输出低频的最近训练统计块。
+        # 开启后，会按最近若干个 update 的窗口均值打印 loss / reward / lr / 行为占比等。
+        "console_training_logs": True,
+
+        # 控制台最近训练统计块的 update 间隔。
+        "console_log_interval": 100,
+
+        # 控制台最近训练统计块使用的滑动窗口大小。
+        "console_recent_window_updates": 50,
+    },
+
+    # ---------------------------
     # 输出与保存参数
     # ---------------------------
     "output": {
@@ -511,54 +766,54 @@ BASE_EXPERIMENT = {
 # }
 #
 BATCH_EXPERIMENTS = [
-    {
-        "experiment_name": "regular_d4_prop_r15_q_learning",
-        "network": {"type": "regular", "regular_degree": 4},
-        "run_mode": "proportional",
-        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
-    },
-        {
-        "experiment_name": "regular_d4_uniform_r15_q_learning",
-        "network": {"type": "regular", "regular_degree": 4},
-        "run_mode": "uniform",
-        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
-    },
-        {
-        "experiment_name": "ba_m2_proportional_r15_q_learning",
-        "network": {"type": "scale_free", "ba_attachments_per_new_node": 2},
-        "run_mode": "proportional",
-        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
-    },
-        {
-        "experiment_name": "ba_m2_uniform_r15_q_learning",
-        "network": {"type": "scale_free", "ba_attachments_per_new_node": 2},
-        "run_mode": "uniform",
-        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
-    },
-        {
-        "experiment_name": "er_k4_proportional_r15_q_learning",
-        "network": {"type": "erdos_renyi", "er_target_mean_degree": 4.0},
-        "run_mode": "proportional",
-        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
-    },
-        {
-        "experiment_name": "er_k4_uniform_r15_q_learning",
-        "network": {"type": "erdos_renyi", "er_target_mean_degree": 4.0},
-        "run_mode": "uniform",
-        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
-    },
-        {
-        "experiment_name": "ws_k4_p01_proportional_r15_q_learning",
-        "network": {"type": "small_world", "ws_degree": 4, "ws_rewiring_prob": 0.1},
-        "run_mode": "proportional",
-        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
-    },
-        {
-        "experiment_name": "ws_k4_p01_uniform_r15_q_learning",
-        "network": {"type": "small_world", "ws_degree": 4, "ws_rewiring_prob": 0.1},
-        "run_mode": "uniform",
-        "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
-    },
+    # {
+    #     "experiment_name": "regular_d4_prop_r15_q_learning",
+    #     "network": {"type": "regular", "regular_degree": 4},
+    #     "run_mode": "proportional",
+    #     "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
+    # },
+    #     {
+    #     "experiment_name": "regular_d4_uniform_r15_q_learning",
+    #     "network": {"type": "regular", "regular_degree": 4},
+    #     "run_mode": "uniform",
+    #     "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
+    # },
+    #     {
+    #     "experiment_name": "ba_m2_proportional_r15_q_learning",
+    #     "network": {"type": "scale_free", "ba_attachments_per_new_node": 2},
+    #     "run_mode": "proportional",
+    #     "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
+    # },
+    #     {
+    #     "experiment_name": "ba_m2_uniform_r15_q_learning",
+    #     "network": {"type": "scale_free", "ba_attachments_per_new_node": 2},
+    #     "run_mode": "uniform",
+    #     "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
+    # },
+    #     {
+    #     "experiment_name": "er_k4_proportional_r15_q_learning",
+    #     "network": {"type": "erdos_renyi", "er_target_mean_degree": 4.0},
+    #     "run_mode": "proportional",
+    #     "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
+    # },
+    #     {
+    #     "experiment_name": "er_k4_uniform_r15_q_learning",
+    #     "network": {"type": "erdos_renyi", "er_target_mean_degree": 4.0},
+    #     "run_mode": "uniform",
+    #     "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
+    # },
+    #     {
+    #     "experiment_name": "ws_k4_p01_proportional_r15_q_learning",
+    #     "network": {"type": "small_world", "ws_degree": 4, "ws_rewiring_prob": 0.1},
+    #     "run_mode": "proportional",
+    #     "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
+    # },
+    #     {
+    #     "experiment_name": "ws_k4_p01_uniform_r15_q_learning",
+    #     "network": {"type": "small_world", "ws_degree": 4, "ws_rewiring_prob": 0.1},
+    #     "run_mode": "uniform",
+    #     "dynamics": {"r": 1,"strategy_update_rule": "q_learning"},
+    # },
 ]
 
 
@@ -566,7 +821,7 @@ BATCH_EXPERIMENTS = [
 # 参数扫描配置：启用后会忽略上面的 BATCH_EXPERIMENTS，自动生成扫描实验
 # =============================================================================
 SCAN_EXPERIMENT = {
-    "enabled": True,
+    "enabled": False,
     "name": "3_18_num_nodes_r_network_consumption_strategy_scan_proportional",
     "output_root_dir": "outputs/10000frame_r_network_consumption_strategy_scan_0.01_0.1tau",
     "parallel": True,
@@ -915,8 +1170,6 @@ def build_gnn_policy(spec: Mapping[str, Any]) -> Any:
             critic_hidden_dim=gnn.get("critic_hidden_dim"),
             num_message_passing_layers=gnn["num_message_passing_layers"],
             temperature=gnn["temperature"],
-            dirichlet_concentration_scale=gnn["dirichlet_concentration_scale"],
-            dirichlet_concentration_floor=gnn["dirichlet_concentration_floor"],
         )
     )
 
@@ -925,16 +1178,44 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
     from Project1.trainer import TrainerConfig
 
     training = spec["training"]
+    resolved_steps_per_update = (
+        int(spec["dynamics"]["episode_length"])
+        if training.get("use_episode_length_as_steps_per_update", False)
+        else int(training["steps_per_update"])
+    )
     return TrainerConfig(
         total_updates=training["total_updates"],
-        steps_per_update=training["steps_per_update"],
+        steps_per_update=resolved_steps_per_update,
         gamma=training["gamma"],
         learning_rate=training["learning_rate"],
         actor_lr=training.get("actor_lr"),
         critic_lr=training.get("critic_lr"),
+        lr_schedule_type=training["lr_schedule_type"],
+        lr_final=training["lr_final"],
+        lr_decay_rate=training["lr_decay_rate"],
+        lr_decay_steps=training["lr_decay_steps"],
+        actor_weight_decay=training.get("actor_weight_decay", 0.0),
+        critic_weight_decay=training.get("critic_weight_decay", 0.0),
+        actor_entropy_coef=training.get("actor_entropy_coef", 0.0),
+        actor_logit_l2_coef=training.get("actor_logit_l2_coef", 0.0),
+        critic_state_hidden_dim=training.get("critic_state_hidden_dim"),
+        critic_action_hidden_dim=training.get("critic_action_hidden_dim"),
+        critic_pool_hidden_dim=training.get("critic_pool_hidden_dim"),
+        critic_q_hidden_dim=training.get("critic_q_hidden_dim"),
         replay_capacity=training["replay_capacity"],
         batch_size=training["batch_size"],
         warmup_steps=training["warmup_steps"],
+        warmup_behavior_mode=training["warmup_behavior_mode"],
+        warmup_selection_granularity=training["warmup_selection_granularity"],
+        warmup_uniform_prob=training["warmup_uniform_prob"],
+        warmup_proportional_prob=training["warmup_proportional_prob"],
+        warmup_constant_mix_prob=training["warmup_constant_mix_prob"],
+        warmup_pool_power_mix_prob=training["warmup_pool_power_mix_prob"],
+        warmup_random_logits_prob=training["warmup_random_logits_prob"],
+        warmup_constant_mix_omega=training["warmup_constant_mix_omega"],
+        warmup_pool_power_k=training["warmup_pool_power_k"],
+        warmup_logit_noise_std=training["warmup_logit_noise_std"],
+        warmup_logit_noise_clip=training["warmup_logit_noise_clip"],
         train_every=training["train_every"],
         gradient_steps_per_update=training["gradient_steps_per_update"],
         policy_delay=training["policy_delay"],
@@ -973,9 +1254,18 @@ def build_domain_randomization_config(spec: Mapping[str, Any]) -> Any:
             raise ValueError("{0} must be a length-2 range or None.".format(key))
         return (float(values[0]), float(values[1]))
 
+    network_types = tuple(str(item) for item in randomization.get("network_types", ("regular",)))
+    network_type_weights_raw = randomization.get("network_type_weights")
+    network_type_weights = None
+    if network_type_weights_raw is not None:
+        network_type_weights = tuple(float(item) for item in network_type_weights_raw)
+        if len(network_type_weights) != len(network_types):
+            raise ValueError("domain_randomization.network_type_weights must align with network_types.")
+
     return DomainRandomizationConfig(
         enabled=bool(randomization.get("enabled", False)),
-        network_types=tuple(str(item) for item in randomization.get("network_types", ("regular",))),
+        network_types=network_types,
+        network_type_weights=network_type_weights,
         num_nodes_choices=tuple(int(item) for item in randomization.get("num_nodes_choices", (int(spec["network"]["num_nodes"]),))),
         regular_degree_choices=tuple(int(item) for item in randomization.get("regular_degree_choices", (int(spec["network"]["regular_degree"]),))),
         er_mean_degree_choices=tuple(
@@ -1002,6 +1292,212 @@ def build_domain_randomization_config(spec: Mapping[str, Any]) -> Any:
         r_range=_optional_range("r_range"),
         p_max_range=_optional_range("p_max_range"),
     )
+
+
+def _build_network_from_eval_family(
+    base_network: Mapping[str, Any],
+    family: Mapping[str, Any],
+) -> Dict[str, Any]:
+    network = deepcopy(base_network)
+    network_type = str(family.get("network_type", family.get("type", network["type"])))
+    network["type"] = network_type
+
+    if "num_nodes" in family:
+        network["num_nodes"] = int(family["num_nodes"])
+
+    if network_type == "regular":
+        network["regular_degree"] = int(family.get("regular_degree", network["regular_degree"]))
+    elif network_type == "erdos_renyi":
+        if family.get("er_target_mean_degree") is not None:
+            network["er_target_mean_degree"] = float(family["er_target_mean_degree"])
+            network["er_edge_prob"] = None
+        elif family.get("er_edge_prob") is not None:
+            network["er_target_mean_degree"] = None
+            network["er_edge_prob"] = float(family["er_edge_prob"])
+    elif network_type == "small_world":
+        network["ws_degree"] = int(family.get("ws_degree", network["ws_degree"]))
+        network["ws_rewiring_prob"] = float(family.get("ws_rewiring_prob", network["ws_rewiring_prob"]))
+    elif network_type == "scale_free":
+        network["ba_attachments_per_new_node"] = int(
+            family.get("ba_attachments_per_new_node", network["ba_attachments_per_new_node"])
+        )
+    elif network_type == "grid":
+        network["grid_rows"] = int(family.get("grid_rows", network["grid_rows"]))
+        network["grid_cols"] = int(family.get("grid_cols", network["grid_cols"]))
+        network["grid_periodic"] = bool(family.get("grid_periodic", network["grid_periodic"]))
+        network["num_nodes"] = int(network["grid_rows"]) * int(network["grid_cols"])
+    else:
+        raise ValueError("Unsupported evaluation network_type: {0}".format(network_type))
+
+    return network
+
+
+def _build_singleton_randomization_for_network(network: Mapping[str, Any]) -> Any:
+    from Project1.td3 import DomainRandomizationConfig
+
+    network_type = str(network["type"])
+    num_nodes = int(network["num_nodes"])
+    if network_type == "grid":
+        return DomainRandomizationConfig(enabled=False)
+
+    er_mean_degree = network.get("er_target_mean_degree")
+    if er_mean_degree is None:
+        er_mean_degree = float(_resolve_er_edge_prob(network) * max(num_nodes - 1, 0))
+
+    return DomainRandomizationConfig(
+        enabled=True,
+        network_types=(network_type,),
+        num_nodes_choices=(num_nodes,),
+        regular_degree_choices=(int(network.get("regular_degree", 4)),),
+        er_mean_degree_choices=(float(er_mean_degree),),
+        ws_degree_choices=(int(network.get("ws_degree", 4)),),
+        ws_rewiring_choices=(float(network.get("ws_rewiring_prob", 0.10)),),
+        ba_attachment_choices=(int(network.get("ba_attachments_per_new_node", 2)),),
+    )
+
+
+def build_evaluation_env_factories(spec: Mapping[str, Any]) -> Optional[List[Any]]:
+    from Project1.td3.worker import RandomizedEnvFactory
+
+    evaluation = spec.get("evaluation", {})
+    if not evaluation or not bool(evaluation.get("use_custom_env_families", False)):
+        return None
+
+    env_families = evaluation.get("env_families", [])
+    if not env_families:
+        return None
+
+    factories: List[Any] = []
+    base_seed = int(spec["seed"])
+    for family_index, family in enumerate(env_families):
+        family_network = _build_network_from_eval_family(spec["network"], family)
+        family_spec = deepcopy(spec)
+        family_spec["network"] = family_network
+        family_spec["seed"] = base_seed + 1_000 + family_index
+
+        graph = build_graph(family_spec)
+        env_config = build_env_config(family_spec, graph)
+        env = SPGGEnv(env_config, graph)
+        randomization = _build_singleton_randomization_for_network(family_network)
+        factories.append(RandomizedEnvFactory.from_env(env, randomization=randomization))
+
+    return factories
+
+
+def _build_stage_evaluation_env_factories(
+    spec: Mapping[str, Any],
+    network_types: Sequence[str],
+) -> Optional[List[Any]]:
+    evaluation = spec.get("evaluation", {})
+    if not evaluation or not bool(evaluation.get("use_custom_env_families", False)):
+        return None
+
+    allowed_types = {str(item) for item in network_types}
+    filtered_families = [
+        family
+        for family in evaluation.get("env_families", [])
+        if str(family.get("network_type", family.get("type", spec["network"]["type"]))) in allowed_types
+    ]
+    if not filtered_families:
+        raise ValueError(
+            "Curriculum eval_network_types {0} do not match any evaluation.env_families.".format(
+                sorted(allowed_types),
+            )
+        )
+
+    stage_spec = deepcopy(spec)
+    stage_spec["evaluation"] = {
+        **deepcopy(evaluation),
+        "env_families": filtered_families,
+    }
+    return build_evaluation_env_factories(stage_spec)
+
+
+def build_training_curriculum(spec: Mapping[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    from Project1.td3 import DomainRandomizationConfig
+
+    curriculum = spec.get("curriculum", {})
+    if not curriculum or not bool(curriculum.get("enabled", False)):
+        return None
+
+    mode = str(curriculum.get("mode", "update_steps"))
+    if mode != "update_steps":
+        raise ValueError("curriculum.mode must currently be 'update_steps'.")
+
+    stage_specs = list(curriculum.get("stages", []))
+    if not stage_specs:
+        raise ValueError("curriculum.stages must contain at least one stage when curriculum is enabled.")
+
+    base_randomization = build_domain_randomization_config(spec)
+    supported_network_types = {str(item) for item in base_randomization.network_types}
+    total_updates = int(spec["training"]["total_updates"])
+
+    portion_sum = 0.0
+    cumulative_portion = 0.0
+    stages: List[Dict[str, Any]] = []
+    for stage_index, stage_spec in enumerate(stage_specs):
+        portion = float(stage_spec["portion"])
+        if portion <= 0.0:
+            raise ValueError("curriculum stage portion must be positive.")
+        portion_sum += portion
+
+        train_network_types = tuple(str(item) for item in stage_spec.get("train_network_types", ()))
+        if not train_network_types:
+            raise ValueError("Each curriculum stage must define at least one train_network_types entry.")
+        unsupported_train_types = [item for item in train_network_types if item not in supported_network_types]
+        if unsupported_train_types:
+            raise ValueError(
+                "Curriculum train_network_types contain unsupported values: {0}".format(unsupported_train_types)
+            )
+        label = str(stage_spec.get("label", "stage_{0}".format(stage_index)))
+
+        train_network_type_weights_raw = stage_spec.get("train_network_type_weights")
+        if train_network_type_weights_raw is None:
+            train_network_type_weights = tuple(1.0 for _ in train_network_types)
+        else:
+            train_network_type_weights = tuple(float(item) for item in train_network_type_weights_raw)
+            if len(train_network_type_weights) != len(train_network_types):
+                raise ValueError(
+                    "curriculum train_network_type_weights must align with train_network_types in stage '{0}'.".format(
+                        label,
+                    )
+                )
+        if any(weight < 0.0 for weight in train_network_type_weights):
+            raise ValueError("curriculum train_network_type_weights must be non-negative.")
+        if sum(train_network_type_weights) <= 0.0:
+            raise ValueError("curriculum train_network_type_weights must sum to a positive value.")
+
+        eval_network_types = tuple(str(item) for item in stage_spec.get("eval_network_types", train_network_types))
+        activate_at_update = 1 if stage_index == 0 else (int(total_updates * cumulative_portion) + 1)
+        cumulative_portion += portion
+
+        train_randomization = replace(
+            base_randomization,
+            enabled=True,
+            network_types=train_network_types,
+            network_type_weights=train_network_type_weights,
+        )
+        if not isinstance(train_randomization, DomainRandomizationConfig):
+            raise RuntimeError("Failed to build curriculum DomainRandomizationConfig.")
+
+        stages.append(
+            {
+                "stage_index": stage_index,
+                "label": label,
+                "portion": portion,
+                "activate_at_update": activate_at_update,
+                "train_network_types": train_network_types,
+                "train_network_type_weights": train_network_type_weights,
+                "eval_network_types": eval_network_types,
+                "train_randomization": train_randomization,
+                "eval_env_factories": _build_stage_evaluation_env_factories(spec, eval_network_types),
+            }
+        )
+
+    if abs(portion_sum - 1.0) > 1e-6:
+        raise ValueError("curriculum stage portions must sum to 1.0.")
+
+    return stages
 
 
 def graph_summary(graph: Mapping[int, Sequence[int]]) -> Dict[str, float]:
@@ -1100,6 +1596,15 @@ def print_header(spec: Mapping[str, Any], graph: Mapping[int, Sequence[int]], en
             env_config.reward.lambda_payoff,
             env_config.reward.lambda_cooperation,
             env_config.reward.lambda_gini,
+        )
+    )
+    training = spec["training"]
+    print(
+        "Reg       : actor_wd={0}, critic_wd={1}, actor_entropy_coef={2}, actor_logit_l2_coef={3}".format(
+            training.get("actor_weight_decay", 0.0),
+            training.get("critic_weight_decay", 0.0),
+            training.get("actor_entropy_coef", 0.0),
+            training.get("actor_logit_l2_coef", 0.0),
         )
     )
     print("=" * 80)
@@ -1251,6 +1756,366 @@ def summarize_rule_based_episodes(
     }
 
 
+def _format_training_update_summary(item: Mapping[str, float]) -> str:
+    summary_text = (
+        "[Update {0:03d}] loss={1:.6f}, policy_loss={2:.6f}, value_loss={3:.6f}, entropy={4:.6f}, mean_rollout_reward={5:.6f}, actor_lr={6:.6g}, critic_lr={7:.6g}".format(
+            int(item["update"]),
+            float(item["loss"]),
+            float(item["policy_loss"]),
+            float(item["value_loss"]),
+            float(item["entropy"]),
+            float(item["mean_rollout_reward"]),
+            float(item["actor_lr"]),
+            float(item["critic_lr"]),
+        )
+    )
+    behavior_terms = []
+    for source in (
+        "uniform",
+        "proportional",
+        "constant_mix",
+        "pool_power_mix",
+        "random_logits",
+        "actor_logits",
+    ):
+        key = "behavior_frac_{0}".format(source)
+        if key in item:
+            behavior_terms.append("{0}={1:.2f}".format(source, float(item[key])))
+    if behavior_terms:
+        summary_text += ", behavior_mix={0}".format("/".join(behavior_terms))
+    if "eval_return_mean" in item:
+        summary_text += ", eval_return_mean={0:.6f}, eval_cooperation_mean={1:.6f}, eval_gini_mean={2:.6f}".format(
+            float(item["eval_return_mean"]),
+            float(item["eval_cooperation_mean"]),
+            float(item["eval_gini_mean"]),
+        )
+    return summary_text
+
+
+def _console_info(message: str) -> str:
+    return "[INFO {0}] train {1}".format(datetime.now().strftime("%H:%M:%S"), message)
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(int(round(float(seconds))), 0)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return "{0} hours, {1} minutes, {2} seconds".format(hours, minutes, secs)
+    if minutes > 0:
+        return "{0} minutes, {1} seconds".format(minutes, secs)
+    return "{0} seconds".format(secs)
+
+
+def _format_metric_rows(
+    items: Sequence[tuple[str, float]],
+    columns: int = 3,
+    label_width: int = 24,
+    value_width: int = 12,
+) -> List[str]:
+    if columns <= 0:
+        columns = 1
+    rows: List[str] = []
+    current_row: List[str] = []
+    for label, value in items:
+        current_row.append("{0:<{1}} {2:>{3}.4f}".format(label + ":", label_width, float(value), value_width))
+        if len(current_row) == columns:
+            rows.append("  ".join(current_row))
+            current_row = []
+    if current_row:
+        rows.append("  ".join(current_row))
+    return rows
+
+
+def _mean_of_recent_metrics(
+    recent_metrics: Sequence[Mapping[str, float]],
+    key: str,
+) -> Optional[float]:
+    values = [float(item[key]) for item in recent_metrics if key in item]
+    if not values:
+        return None
+    return float(np.mean(values))
+
+
+def _format_console_progress_lines(
+    update: int,
+    total_updates: int,
+    env_steps: int,
+    total_env_steps: int,
+    start_time: float,
+    eta_env_steps: Optional[int] = None,
+    eta_total_env_steps: Optional[int] = None,
+) -> List[str]:
+    now = time.time()
+    elapsed = max(now - start_time, 0.0)
+    progress_completed = int(env_steps if eta_env_steps is None else eta_env_steps)
+    progress_total = int(total_env_steps if eta_total_env_steps is None else eta_total_env_steps)
+    if progress_total > 0:
+        progress_ratio = min(max(float(progress_completed) / float(progress_total), 0.0), 1.0)
+    else:
+        progress_ratio = min(max(float(update) / max(total_updates, 1), 0.0), 1.0)
+
+    if progress_ratio > 0.0 and progress_ratio < 1.0:
+        estimated_total = elapsed / progress_ratio
+        eta = max(estimated_total - elapsed, 0.0)
+    elif progress_ratio >= 1.0:
+        eta = 0.0
+    else:
+        eta = float("inf")
+
+    lines = [
+        _console_info(
+            "t_env: {0} / {1} | update: {2} / {3}".format(
+                env_steps,
+                total_env_steps,
+                update,
+                total_updates,
+            )
+        )
+    ]
+    if np.isfinite(eta):
+        lines.append(
+            _console_info(
+                "Estimated time left: {0}. Time passed: {1}".format(
+                    _format_duration(eta),
+                    _format_duration(elapsed),
+                )
+            )
+        )
+    else:
+        lines.append(
+            _console_info(
+                "Estimated time left: unavailable. Time passed: {0}".format(
+                    _format_duration(elapsed)
+                )
+            )
+        )
+    return lines
+
+
+def _format_console_recent_stats_lines(
+    recent_metrics: Sequence[Mapping[str, float]],
+    latest_metrics: Mapping[str, float],
+    update: int,
+    total_updates: int,
+    env_steps: int,
+    total_env_steps: int,
+    stage_label: Optional[str],
+) -> List[str]:
+    header = "Recent Stats | update: {0} / {1} | t_env: {2} / {3}".format(
+        update,
+        total_updates,
+        env_steps,
+        total_env_steps,
+    )
+    if stage_label:
+        header += " | stage: {0}".format(stage_label)
+
+    ordered_keys = [
+        ("eval_cooperation_mean", "f_c"),
+        ("eval_gini_mean", "gini"),
+        ("eval_return_mean", "return_mean"),
+        ("eval_mean_total_resource", "mean_total_resource"),
+        ("eval_collapse_rate", "collapse_rate"),
+        ("loss", "loss"),
+        ("policy_loss", "policy_loss"),
+        ("value_loss", "value_loss"),
+        ("mean_rollout_reward", "mean_rollout_reward"),
+        ("entropy", "entropy"),
+        ("actor_logit_l2", "actor_logit_l2"),
+        ("actor_lr", "actor_lr"),
+        ("critic_lr", "critic_lr"),
+        ("replay_size", "replay_size"),
+        ("behavior_frac_uniform", "uniform"),
+        ("behavior_frac_proportional", "proportional"),
+        ("behavior_frac_constant_mix", "constant_mix"),
+        ("behavior_frac_pool_power_mix", "pool_power_mix"),
+        ("behavior_frac_random_logits", "random_logits"),
+        ("behavior_frac_actor_logits", "actor_logits"),
+    ]
+    metric_rows: List[tuple[str, float]] = []
+    for metric_key, label in ordered_keys:
+        value = _mean_of_recent_metrics(recent_metrics, metric_key)
+        if value is None:
+            continue
+        metric_rows.append((label, value))
+
+    lines = [_console_info(header)]
+    if not metric_rows:
+        lines.append("No recent numeric metrics available.")
+        return lines
+
+    for row in _format_metric_rows(metric_rows, columns=3):
+        lines.append(row)
+
+    if "eval_return_mean" in latest_metrics:
+        lines.append(
+            _console_info(
+                "Latest eval | f_c={0:.4f}, gini={1:.4f}, return={2:.4f}, resource={3:.4f}, collapse_rate={4:.4f}".format(
+                    float(latest_metrics["eval_cooperation_mean"]),
+                    float(latest_metrics["eval_gini_mean"]),
+                    float(latest_metrics["eval_return_mean"]),
+                    float(latest_metrics.get("eval_mean_total_resource", 0.0)),
+                    float(latest_metrics.get("eval_collapse_rate", 0.0)),
+                )
+            )
+        )
+    return lines
+
+
+def _tensorboard_tag_for_metric(metric_name: str) -> Optional[str]:
+    if metric_name == "update":
+        return None
+    if metric_name.startswith("behavior_frac_"):
+        return "behavior/{0}".format(metric_name[len("behavior_frac_"):])
+    if metric_name.startswith("eval_"):
+        return "eval/{0}".format(metric_name[len("eval_"):])
+    if metric_name in {"actor_lr", "critic_lr"}:
+        return "optim/{0}".format(metric_name)
+    if metric_name == "replay_size":
+        return "replay/size"
+    if metric_name == "curriculum_stage":
+        return "curriculum/stage_index"
+    if metric_name in {
+        "loss",
+        "policy_loss",
+        "value_loss",
+        "critic1_loss",
+        "critic2_loss",
+        "critic_loss",
+        "actor_loss",
+        "actor_q_loss",
+        "actor_reg_loss",
+    }:
+        return "loss/{0}".format(metric_name)
+    return "train/{0}".format(metric_name)
+
+
+def _log_tensorboard_static_metadata(
+    writer: Any,
+    spec: Mapping[str, Any],
+    graph: Mapping[int, Sequence[int]],
+    env_config: SPGGConfig,
+) -> None:
+    summary = graph_summary(graph)
+    static_scalars = {
+        "static/graph/num_nodes": float(summary["num_nodes"]),
+        "static/graph/num_edges": float(summary["num_edges"]),
+        "static/graph/degree_min": float(summary["degree_min"]),
+        "static/graph/degree_max": float(summary["degree_max"]),
+        "static/graph/degree_mean": float(summary["degree_mean"]),
+        "static/dynamics/alpha": float(env_config.alpha),
+        "static/dynamics/r": float(env_config.r),
+        "static/dynamics/p_max": float(env_config.p_max),
+        "static/dynamics/episode_length": float(env_config.episode_length),
+        "static/reward/lambda_payoff": float(env_config.reward.lambda_payoff),
+        "static/reward/lambda_cooperation": float(env_config.reward.lambda_cooperation),
+        "static/reward/lambda_gini": float(env_config.reward.lambda_gini),
+        "static/gnn/hidden_dim": float(spec["gnn"]["hidden_dim"]),
+        "static/gnn/local_hidden_dim": float(spec["gnn"].get("local_hidden_dim") or spec["gnn"]["hidden_dim"]),
+        "static/gnn/score_hidden_dim": float(
+            spec["gnn"].get("score_hidden_dim")
+            or spec["gnn"].get("local_hidden_dim")
+            or spec["gnn"]["hidden_dim"]
+        ),
+        "static/gnn/temperature": float(spec["gnn"]["temperature"]),
+        "static/training/steps_per_update": float(
+            spec["dynamics"]["episode_length"]
+            if spec["training"].get("use_episode_length_as_steps_per_update", False)
+            else spec["training"]["steps_per_update"]
+        ),
+        "static/training/num_workers": float(spec["training"]["num_workers"]),
+        "static/training/batch_size": float(spec["training"]["batch_size"]),
+        "static/training/replay_capacity": float(spec["training"]["replay_capacity"]),
+    }
+    for tag, value in static_scalars.items():
+        writer.add_scalar(tag, value, 0)
+
+
+def _log_tensorboard_update_metrics(
+    writer: Any,
+    metrics: Mapping[str, float],
+    curriculum_stages: Optional[Sequence[Mapping[str, Any]]] = None,
+    stage_log_state: Optional[Dict[str, Any]] = None,
+) -> None:
+    update = int(metrics["update"])
+    for key, value in metrics.items():
+        if not isinstance(value, (int, float)):
+            continue
+        tag = _tensorboard_tag_for_metric(key)
+        if tag is None:
+            continue
+        writer.add_scalar(tag, float(value), update)
+
+    if curriculum_stages is not None and stage_log_state is not None and "curriculum_stage" in metrics:
+        stage_index = int(metrics["curriculum_stage"])
+        if stage_log_state.get("last_stage_index") != stage_index:
+            stage_label = str(stage_index)
+            if 0 <= stage_index < len(curriculum_stages):
+                stage_label = str(curriculum_stages[stage_index].get("label", stage_label))
+            writer.add_text("curriculum/active_stage_label", stage_label, update)
+            stage_log_state["last_stage_index"] = stage_index
+
+
+def _log_tensorboard_post_training_evaluation(
+    writer: Any,
+    episode_summaries: Sequence[Mapping[str, float]],
+    final_update: int,
+) -> None:
+    if not episode_summaries:
+        return
+
+    for summary in episode_summaries:
+        episode_index = int(summary["episode_index"])
+        writer.add_scalar("post_eval/episode_return", float(summary["episode_return"]), episode_index)
+        writer.add_scalar(
+            "post_eval/final_actual_cooperation",
+            float(summary["final_actual_cooperation"]),
+            episode_index,
+        )
+        writer.add_scalar("post_eval/final_mean_resource", float(summary["final_mean_resource"]), episode_index)
+        writer.add_scalar("post_eval/final_mean_pool_grown", float(summary["final_mean_pool_grown"]), episode_index)
+        writer.add_scalar("post_eval/final_mean_consumption", float(summary["final_mean_consumption"]), episode_index)
+        writer.add_scalar("post_eval/final_mean_payoff", float(summary["final_mean_payoff"]), episode_index)
+        writer.add_scalar("post_eval/final_gini", float(summary["final_gini"]), episode_index)
+
+    writer.add_scalar(
+        "post_eval/return_mean",
+        float(np.mean([summary["episode_return"] for summary in episode_summaries])),
+        final_update,
+    )
+    writer.add_scalar(
+        "post_eval/final_actual_cooperation_mean",
+        float(np.mean([summary["final_actual_cooperation"] for summary in episode_summaries])),
+        final_update,
+    )
+    writer.add_scalar(
+        "post_eval/final_mean_resource_mean",
+        float(np.mean([summary["final_mean_resource"] for summary in episode_summaries])),
+        final_update,
+    )
+    writer.add_scalar(
+        "post_eval/final_mean_pool_grown_mean",
+        float(np.mean([summary["final_mean_pool_grown"] for summary in episode_summaries])),
+        final_update,
+    )
+    writer.add_scalar(
+        "post_eval/final_mean_consumption_mean",
+        float(np.mean([summary["final_mean_consumption"] for summary in episode_summaries])),
+        final_update,
+    )
+    writer.add_scalar(
+        "post_eval/final_mean_payoff_mean",
+        float(np.mean([summary["final_mean_payoff"] for summary in episode_summaries])),
+        final_update,
+    )
+    writer.add_scalar(
+        "post_eval/final_gini_mean",
+        float(np.mean([summary["final_gini"] for summary in episode_summaries])),
+        final_update,
+    )
+
+
 def run_rule_based_mode(
     spec: Mapping[str, Any],
     graph: Dict[int, List[int]],
@@ -1381,12 +2246,23 @@ def run_gnn_training_mode(
     output_dir: Path,
 ) -> Dict[str, Any]:
     from Project1.trainer import CentralizedActorCriticTrainer
+    import torch
 
     env = SPGGEnv(env_config, graph)
     eval_env = SPGGEnv(env_config, graph)
     policy = build_gnn_policy(spec)
     trainer_config = build_trainer_config(spec)
     randomization_config = build_domain_randomization_config(spec)
+    eval_env_factories = build_evaluation_env_factories(spec)
+    curriculum_stages = build_training_curriculum(spec)
+    training = spec["training"]
+    tensorboard = spec.get("tensorboard", {})
+    resume_from_checkpoint = training.get("resume_from_checkpoint")
+    steps_source = (
+        "dynamics.episode_length"
+        if training.get("use_episode_length_as_steps_per_update", False)
+        else "training.steps_per_update"
+    )
 
     trainer = CentralizedActorCriticTrainer(
         env=env,
@@ -1394,27 +2270,199 @@ def run_gnn_training_mode(
         eval_env=eval_env,
         config=trainer_config,
         randomization=randomization_config,
+        eval_env_factories=eval_env_factories,
+        curriculum_stages=curriculum_stages,
     )
+    print(
+        "Train CFG : steps_per_update={0}, source={1}".format(
+            trainer_config.steps_per_update,
+            steps_source,
+        )
+    )
+    print(
+        "Eval CFG  : mode={0}, periodic_eval_episodes={1}".format(
+            "custom_env_families({0})".format(len(eval_env_factories))
+            if eval_env_factories is not None
+            else "fixed_base_env",
+            trainer_config.eval_episodes,
+        )
+    )
+    if curriculum_stages:
+        stage_parts = [
+            "{0}@{1}[{2}]".format(
+                stage["label"],
+                stage["activate_at_update"],
+                ",".join(
+                    "{0}:{1:.2f}".format(network_type, float(weight))
+                    for network_type, weight in zip(
+                        stage["train_network_types"],
+                        stage["train_network_type_weights"],
+                    )
+                ),
+            )
+            for stage in curriculum_stages
+        ]
+        print("Curriculum: {0}".format(" | ".join(stage_parts)))
 
-    history = trainer.train(num_updates=spec["training"]["total_updates"])
-    for item in history:
-        summary_text = (
-            "[Update {0:03d}] loss={1:.6f}, policy_loss={2:.6f}, value_loss={3:.6f}, entropy={4:.6f}, mean_rollout_reward={5:.6f}".format(
-                int(item["update"]),
-                item["loss"],
-                item["policy_loss"],
-                item["value_loss"],
-                item["entropy"],
-                item["mean_rollout_reward"],
+    checkpoint_dir = output_dir / "checkpoints"
+    should_save_checkpoints = bool(training.get("save_checkpoints", False))
+    save_final_checkpoint = bool(training.get("save_final_checkpoint", True))
+    save_best_checkpoint = bool(training.get("save_best_checkpoint", True))
+    checkpoint_interval = int(training.get("checkpoint_interval", 0))
+    checkpoint_mode = str(training.get("checkpoint_mode", "lightweight"))
+    if checkpoint_mode not in {"lightweight", "full_resume"}:
+        raise ValueError("training.checkpoint_mode must be one of {'lightweight', 'full_resume'}.")
+    best_eval_return = float("-inf")
+    resumed_update = 0
+    tensorboard_enabled = bool(tensorboard.get("enabled", False))
+    console_progress_logs = bool(tensorboard.get("console_progress_logs", True))
+    console_progress_interval = int(tensorboard.get("console_progress_interval", 50))
+    console_training_logs = bool(tensorboard.get("console_training_logs", False))
+    console_log_interval = int(tensorboard.get("console_log_interval", 50))
+    console_recent_window_updates = int(tensorboard.get("console_recent_window_updates", 50))
+    writer: Any = None
+    tensorboard_stage_log_state: Dict[str, Any] = {"last_stage_index": None}
+    training_start_time = time.time()
+    effective_steps_per_update = int(trainer_config.steps_per_update) * int(trainer_config.num_workers)
+    total_env_steps = int(trainer_config.total_updates) * effective_steps_per_update
+    recent_metrics: deque[dict[str, float]] = deque(maxlen=max(console_recent_window_updates, 1))
+
+    def _current_stage_label(metrics: Mapping[str, float]) -> Optional[str]:
+        if "curriculum_stage" not in metrics:
+            return None
+        stage_index = int(metrics["curriculum_stage"])
+        if curriculum_stages and 0 <= stage_index < len(curriculum_stages):
+            return str(curriculum_stages[stage_index].get("label", stage_index))
+        return str(stage_index)
+
+    def _load_checkpoint_payload(checkpoint_path: Path) -> Dict[str, Any]:
+        try:
+            return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(checkpoint_path, map_location="cpu")
+
+    if should_save_checkpoints or save_final_checkpoint or save_best_checkpoint:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    if resume_from_checkpoint:
+        checkpoint_path = Path(str(resume_from_checkpoint)).expanduser()
+        if not checkpoint_path.exists():
+            raise FileNotFoundError("Checkpoint path does not exist: {0}".format(checkpoint_path))
+        checkpoint_payload = _load_checkpoint_payload(checkpoint_path)
+        resumed_checkpoint_mode = trainer.load_checkpoint(checkpoint_payload)
+        resumed_update = int(trainer.completed_updates)
+        best_eval_return = float(checkpoint_payload.get("best_eval_return_so_far", float("-inf")))
+        print(
+            "Resume    : checkpoint={0}, resume_update={1}, checkpoint_mode={2}".format(
+                checkpoint_path,
+                resumed_update,
+                resumed_checkpoint_mode,
             )
         )
-        if "eval_return_mean" in item:
-            summary_text += ", eval_return_mean={0:.6f}, eval_cooperation_mean={1:.6f}, eval_gini_mean={2:.6f}".format(
-                item["eval_return_mean"],
-                item["eval_cooperation_mean"],
-                item["eval_gini_mean"],
+
+    if tensorboard_enabled:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as exc:
+            raise ImportError(
+                "TensorBoard logging is enabled, but torch.utils.tensorboard is unavailable. "
+                "Install the 'tensorboard' package or disable spec['tensorboard']['enabled']."
+            ) from exc
+
+        tensorboard_dir = output_dir / str(tensorboard.get("subdir", "tensorboard"))
+        tensorboard_dir.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(
+            log_dir=str(tensorboard_dir),
+            flush_secs=int(tensorboard.get("flush_secs", 30)),
+        )
+        print("TensorBoard: log_dir={0}".format(tensorboard_dir))
+        if bool(tensorboard.get("write_static_scalars", True)):
+            _log_tensorboard_static_metadata(writer, spec, graph, env_config)
+        if bool(tensorboard.get("write_config_text", True)):
+            writer.add_text(
+                "config/spec_json",
+                "```json\n{0}\n```".format(json.dumps(spec, ensure_ascii=False, indent=2)),
+                0,
             )
-        print(summary_text)
+        writer.flush()
+
+    def _save_checkpoint(filename: str, update: int, metrics: Mapping[str, float]) -> None:
+        checkpoint_path = checkpoint_dir / filename
+        payload = trainer.build_checkpoint(
+            update=update,
+            metrics=metrics,
+            checkpoint_mode=checkpoint_mode,
+        )
+        payload["best_eval_return_so_far"] = float(best_eval_return)
+        torch.save(payload, checkpoint_path)
+        print("Checkpoint saved: {0}".format(checkpoint_path))
+
+    def _on_update(metrics: dict[str, float]) -> None:
+        nonlocal best_eval_return
+        update = int(metrics["update"])
+        recent_metrics.append(dict(metrics))
+        if should_save_checkpoints and checkpoint_interval > 0 and update % checkpoint_interval == 0:
+            _save_checkpoint("update_{0:06d}.pt".format(update), update=update, metrics=metrics)
+            _save_checkpoint("latest.pt", update=update, metrics=metrics)
+        if save_best_checkpoint and "eval_return_mean" in metrics:
+            eval_return = float(metrics["eval_return_mean"])
+            if eval_return > best_eval_return:
+                best_eval_return = eval_return
+                _save_checkpoint("best_eval.pt", update=update, metrics=metrics)
+        if writer is not None:
+            _log_tensorboard_update_metrics(
+                writer,
+                metrics,
+                curriculum_stages=curriculum_stages,
+                stage_log_state=tensorboard_stage_log_state,
+            )
+        env_steps = update * effective_steps_per_update
+        should_log_progress = console_progress_logs and (
+            update == resumed_update + 1
+            or update == int(trainer_config.total_updates)
+            or update % max(console_progress_interval, 1) == 0
+        )
+        should_log_recent_stats = console_training_logs and (
+            update == resumed_update + 1
+            or update == int(trainer_config.total_updates)
+            or update % max(console_log_interval, 1) == 0
+        )
+        if should_log_progress:
+            session_env_steps = max(update - resumed_update, 0) * effective_steps_per_update
+            session_total_env_steps = max(int(trainer_config.total_updates) - resumed_update, 0) * effective_steps_per_update
+            for line in _format_console_progress_lines(
+                update=update,
+                total_updates=int(trainer_config.total_updates),
+                env_steps=env_steps,
+                total_env_steps=total_env_steps,
+                start_time=training_start_time,
+                eta_env_steps=session_env_steps,
+                eta_total_env_steps=session_total_env_steps,
+            ):
+                print(line)
+        if should_log_recent_stats:
+            for line in _format_console_recent_stats_lines(
+                recent_metrics=list(recent_metrics),
+                latest_metrics=metrics,
+                update=update,
+                total_updates=int(trainer_config.total_updates),
+                env_steps=env_steps,
+                total_env_steps=total_env_steps,
+                stage_label=_current_stage_label(metrics),
+            ):
+                print(line)
+
+    history = trainer.train(
+        num_updates=spec["training"]["total_updates"],
+        on_update=_on_update,
+    )
+    if history and save_final_checkpoint:
+        final_metrics = history[-1]
+        _save_checkpoint(
+            "final.pt",
+            update=int(final_metrics["update"]),
+            metrics=final_metrics,
+        )
 
     evaluation_summaries = run_trained_policy_evaluation(
         spec=spec,
@@ -1423,6 +2471,11 @@ def run_gnn_training_mode(
         policy=policy,
         output_dir=output_dir,
     )
+    if writer is not None:
+        final_update = int(history[-1]["update"]) if history else resumed_update
+        _log_tensorboard_post_training_evaluation(writer, evaluation_summaries, final_update=final_update)
+        writer.flush()
+        writer.close()
 
     return {
         "experiment_name": spec["experiment_name"],

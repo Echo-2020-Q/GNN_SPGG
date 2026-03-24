@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -17,9 +17,32 @@ class GraphTD3Config:
     learning_rate: float = 3e-4
     actor_lr: float | None = None
     critic_lr: float | None = None
+    lr_schedule_type: str = "constant"
+    lr_final: float = 1e-5
+    lr_decay_rate: float = 0.05
+    lr_decay_steps: int = 1_000
+    actor_weight_decay: float = 0.0
+    critic_weight_decay: float = 0.0
+    actor_entropy_coef: float = 0.0
+    actor_logit_l2_coef: float = 0.0
+    critic_state_hidden_dim: int | None = None
+    critic_action_hidden_dim: int | None = None
+    critic_pool_hidden_dim: int | None = None
+    critic_q_hidden_dim: int | None = None
     batch_size: int = 32
     replay_capacity: int = 200_000
     warmup_steps: int = 1_000
+    warmup_behavior_mode: str = "random_only"
+    warmup_selection_granularity: str = "per_episode"
+    warmup_uniform_prob: float = 0.0
+    warmup_proportional_prob: float = 0.0
+    warmup_constant_mix_prob: float = 0.0
+    warmup_pool_power_mix_prob: float = 0.0
+    warmup_random_logits_prob: float = 1.0
+    warmup_constant_mix_omega: float = 0.5
+    warmup_pool_power_k: float = 19.0
+    warmup_logit_noise_std: float = 0.0
+    warmup_logit_noise_clip: float = 0.0
     train_every: int = 1
     gradient_steps_per_update: int = 1
     policy_delay: int = 2
@@ -57,12 +80,70 @@ class GraphTD3Config:
             raise ValueError("actor_lr must be positive.")
         if self.critic_lr <= 0.0:
             raise ValueError("critic_lr must be positive.")
+        if self.lr_schedule_type not in {"constant", "exponential_decay"}:
+            raise ValueError("lr_schedule_type must be one of {'constant', 'exponential_decay'}.")
+        if self.lr_final <= 0.0:
+            raise ValueError("lr_final must be positive.")
+        if self.lr_final > min(self.actor_lr, self.critic_lr):
+            raise ValueError("lr_final must be <= min(actor_lr, critic_lr).")
+        if self.lr_decay_rate <= 0.0 or self.lr_decay_rate > 1.0:
+            raise ValueError("lr_decay_rate must be in (0, 1].")
+        if self.lr_decay_steps <= 0:
+            raise ValueError("lr_decay_steps must be positive.")
+        if self.actor_weight_decay < 0.0:
+            raise ValueError("actor_weight_decay must be non-negative.")
+        if self.critic_weight_decay < 0.0:
+            raise ValueError("critic_weight_decay must be non-negative.")
+        if self.actor_entropy_coef < 0.0:
+            raise ValueError("actor_entropy_coef must be non-negative.")
+        if self.actor_logit_l2_coef < 0.0:
+            raise ValueError("actor_logit_l2_coef must be non-negative.")
+        if self.critic_state_hidden_dim is not None and self.critic_state_hidden_dim <= 0:
+            raise ValueError("critic_state_hidden_dim must be positive when provided.")
+        if self.critic_action_hidden_dim is not None and self.critic_action_hidden_dim <= 0:
+            raise ValueError("critic_action_hidden_dim must be positive when provided.")
+        if self.critic_pool_hidden_dim is not None and self.critic_pool_hidden_dim <= 0:
+            raise ValueError("critic_pool_hidden_dim must be positive when provided.")
+        if self.critic_q_hidden_dim is not None and self.critic_q_hidden_dim <= 0:
+            raise ValueError("critic_q_hidden_dim must be positive when provided.")
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive.")
         if self.replay_capacity <= 0:
             raise ValueError("replay_capacity must be positive.")
         if self.warmup_steps < 0:
             raise ValueError("warmup_steps must be non-negative.")
+        if self.warmup_behavior_mode not in {"random_only", "heuristic_mix"}:
+            raise ValueError("warmup_behavior_mode must be one of {'random_only', 'heuristic_mix'}.")
+        if self.warmup_selection_granularity not in {"per_episode", "per_step"}:
+            raise ValueError("warmup_selection_granularity must be one of {'per_episode', 'per_step'}.")
+        if self.warmup_uniform_prob < 0.0:
+            raise ValueError("warmup_uniform_prob must be non-negative.")
+        if self.warmup_proportional_prob < 0.0:
+            raise ValueError("warmup_proportional_prob must be non-negative.")
+        if self.warmup_constant_mix_prob < 0.0:
+            raise ValueError("warmup_constant_mix_prob must be non-negative.")
+        if self.warmup_pool_power_mix_prob < 0.0:
+            raise ValueError("warmup_pool_power_mix_prob must be non-negative.")
+        if self.warmup_random_logits_prob < 0.0:
+            raise ValueError("warmup_random_logits_prob must be non-negative.")
+        if self.warmup_constant_mix_omega < 0.0 or self.warmup_constant_mix_omega > 1.0:
+            raise ValueError("warmup_constant_mix_omega must be in [0, 1].")
+        if self.warmup_pool_power_k < 0.0:
+            raise ValueError("warmup_pool_power_k must be non-negative.")
+        if self.warmup_logit_noise_std < 0.0:
+            raise ValueError("warmup_logit_noise_std must be non-negative.")
+        if self.warmup_logit_noise_clip < 0.0:
+            raise ValueError("warmup_logit_noise_clip must be non-negative.")
+        if self.warmup_behavior_mode == "heuristic_mix":
+            warmup_mix_total = (
+                self.warmup_uniform_prob
+                + self.warmup_proportional_prob
+                + self.warmup_constant_mix_prob
+                + self.warmup_pool_power_mix_prob
+                + self.warmup_random_logits_prob
+            )
+            if warmup_mix_total <= 0.0:
+                raise ValueError("heuristic warm-up requires at least one positive behavior probability.")
         if self.train_every <= 0:
             raise ValueError("train_every must be positive.")
         if self.gradient_steps_per_update <= 0:
@@ -103,6 +184,7 @@ class WorkerConfig:
 class DomainRandomizationConfig:
     enabled: bool = False
     network_types: tuple[str, ...] = ("regular",)
+    network_type_weights: tuple[float, ...] | None = None
     num_nodes_choices: tuple[int, ...] = (100,)
     regular_degree_choices: tuple[int, ...] = (4,)
     er_mean_degree_choices: tuple[float, ...] = (4.0,)
@@ -115,16 +197,23 @@ class DomainRandomizationConfig:
     r_range: tuple[float, float] | None = None
     p_max_range: tuple[float, float] | None = None
 
+    def __post_init__(self) -> None:
+        if not self.network_types:
+            raise ValueError("network_types must contain at least one entry.")
+        if self.network_type_weights is not None:
+            if len(self.network_type_weights) != len(self.network_types):
+                raise ValueError("network_type_weights must have the same length as network_types.")
+            if any(weight < 0.0 for weight in self.network_type_weights):
+                raise ValueError("network_type_weights must be non-negative.")
+            if sum(self.network_type_weights) <= 0.0:
+                raise ValueError("network_type_weights must sum to a positive value.")
+
 
 @dataclass
 class EvalConfig:
     num_episodes: int = 3
     collapse_resource_threshold: float = 1e-6
-    per_network_episode_budget: int = 0
-    tracked_network_types: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if self.num_episodes <= 0:
             raise ValueError("num_episodes must be positive.")
-        if self.per_network_episode_budget < 0:
-            raise ValueError("per_network_episode_budget must be non-negative.")

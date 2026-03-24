@@ -16,8 +16,6 @@ class GNNPolicyConfig:
     score_hidden_dim: int | None = None
     critic_hidden_dim: int | None = None
     temperature: float = 1.0
-    dirichlet_concentration_scale: float = 1.0
-    dirichlet_concentration_floor: float = 0.1
 
     def __post_init__(self) -> None:
         if self.hidden_dim <= 0:
@@ -38,10 +36,6 @@ class GNNPolicyConfig:
             raise ValueError("critic_hidden_dim must be positive.")
         if self.temperature <= 0.0:
             raise ValueError("temperature must be positive.")
-        if self.dirichlet_concentration_scale <= 0.0:
-            raise ValueError("dirichlet_concentration_scale must be positive.")
-        if self.dirichlet_concentration_floor <= 0.0:
-            raise ValueError("dirichlet_concentration_floor must be positive.")
 
 
 @dataclass(frozen=True)
@@ -469,10 +463,15 @@ class ScoreReadout(nn.Module):
 class AllocationHead(nn.Module):
     """Applies ego-local softmax to obtain alpha_ij and x_ij = P_i * alpha_ij."""
 
-    def forward(self, scores: Tensor, pool_value: Tensor) -> tuple[Tensor, Tensor]:
-        allocation = torch.softmax(scores, dim=0)
+    def __init__(self, temperature: float):
+        super().__init__()
+        self.temperature = float(temperature)
+
+    def forward(self, scores: Tensor, pool_value: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        logits = scores / self.temperature
+        allocation = torch.softmax(logits, dim=0)
         transferred = allocation * pool_value
-        return allocation, transferred
+        return logits, allocation, transferred
 
 
 class GlobalCritic(nn.Module):
@@ -515,7 +514,7 @@ class GNNAllocationPolicy(nn.Module):
             local_hidden_dim=config.local_hidden_dim,
             hidden_dim=config.score_hidden_dim,
         )
-        self.allocation_head = AllocationHead()
+        self.allocation_head = AllocationHead(config.temperature)
         self.critic = GlobalCritic(
             global_hidden_dim=config.hidden_dim,
             hidden_dim=config.critic_hidden_dim,
@@ -546,11 +545,14 @@ class GNNAllocationPolicy(nn.Module):
             local_output = self.local_graph_net(ego_subgraph)
             center_embedding = local_output.node_embeddings[ego_subgraph.center_local_index]
             local_scores = self.score_readout(local_output.node_embeddings, center_embedding)
-            local_allocation, local_transferred = self.allocation_head(local_scores, ego_subgraph.pool_value)
+            local_logits, local_allocation, local_transferred = self.allocation_head(
+                local_scores,
+                ego_subgraph.pool_value,
+            )
 
             allocation_matrix[center_index, ego_subgraph.member_indices] = local_allocation
             transferred_resources[center_index, ego_subgraph.member_indices] = local_transferred
-            score_matrix[center_index, ego_subgraph.member_indices] = local_scores
+            score_matrix[center_index, ego_subgraph.member_indices] = local_logits
 
         value = self.critic(backbone_output.global_embedding)
         incoming_resources = transferred_resources.sum(dim=0)
