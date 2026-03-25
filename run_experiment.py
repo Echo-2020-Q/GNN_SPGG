@@ -125,7 +125,7 @@ BASE_EXPERIMENT = {
         # 节点总数 n。
         # 对 regular / erdos_renyi / small_world / scale_free 都使用这个值。
         # 对 grid 网络，这个值会被 grid_rows * grid_cols 取代。
-        "num_nodes": 100,
+        "num_nodes": 50,
 
         # regular 网络参数：每个节点的度。
         # 例如 degree=4 表示每个节点都恰好连 4 条边。
@@ -427,7 +427,7 @@ BASE_EXPERIMENT = {
         "replay_capacity": 300_000, # 300k 步=0.3M 步
 
         # learner 每次更新采样的 batch 大小。
-        "batch_size": 512,
+        "batch_size": 256,
 
         # learner 内部做图张量化时的微批大小。
         # 这是为了避免把整个 replay batch 一次性展开成 dense [B, N, N, H] 图张量后显存占用过高。
@@ -482,7 +482,7 @@ BASE_EXPERIMENT = {
         "train_every": 1,
 
         # 每个外层训练迭代做多少次梯度更新。
-        "gradient_steps_per_update": 8,
+        "gradient_steps_per_update": 4,
 
         # TD3 delayed policy update 频率。
         "policy_delay": 2,
@@ -522,7 +522,7 @@ BASE_EXPERIMENT = {
         # - "cuda:1"  ：把所有 rollout worker 的 actor 推理放到指定 GPU
         # - ["cuda:1", "cuda:2"] ：按 worker 轮转分配 rollout 推理设备
         # learner 训练设备仍由下面的 device 单独控制。
-        "rollout_device": "cuda:2",
+        "rollout_device": "cuda:0",
 
         # rollout 推理模式：
         # - "local"       ：每个 worker 自己持有 actor，并在本地前向
@@ -536,7 +536,7 @@ BASE_EXPERIMENT = {
 
         # learner 训练设备：cpu / cuda / cuda:0 等。
         # 这只控制主进程里的 actor/critic 训练，不控制 rollout worker 的推理设备。
-        "device": "cuda:3",
+        "device": "cuda:1",
 
         # 并行 rollout worker 进程内的 PyTorch CPU 线程数。
         # 仅对多进程 worker 生效，用于减少小图前向时的线程争抢。
@@ -569,7 +569,7 @@ BASE_EXPERIMENT = {
         "network_type_weights": None,
 
         # 允许采样的节点数集合。
-        "num_nodes_choices": [100],
+        "num_nodes_choices": [50],
 
         # regular 图可采样的度集合。
         "regular_degree_choices": [4],
@@ -622,23 +622,23 @@ BASE_EXPERIMENT = {
         "env_families": [
             {
                 "network_type": "regular",
-                "num_nodes": 100,
+                "num_nodes": 50,
                 "regular_degree": 4,
             },
             {
                 "network_type": "erdos_renyi",
-                "num_nodes": 100,
+                "num_nodes": 50,
                 "er_target_mean_degree": 4.0,
             },
             {
                 "network_type": "small_world",
-                "num_nodes": 100,
+                "num_nodes": 50,
                 "ws_degree": 4,
                 "ws_rewiring_prob": 0.10,
             },
             {
                 "network_type": "scale_free",
-                "num_nodes": 100,
+                "num_nodes": 50,
                 "ba_attachments_per_new_node": 2,
             },
         ],
