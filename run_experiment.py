@@ -16,6 +16,7 @@ from __future__ import annotations
   2. 宏观图：同一实验过程中统计量随时间的变化曲线。
 """
 
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from collections import deque
 from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -23,6 +24,7 @@ import csv
 from dataclasses import asdict, replace
 from datetime import datetime
 import json
+from math import ceil
 import os
 from pathlib import Path
 from statistics import mean
@@ -48,6 +50,46 @@ from Project1.policies.rule_based import ProportionalContributionPolicy, Uniform
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
+class _TeeStream:
+    def __init__(self, *streams: Any):
+        self._streams = streams
+        self.encoding = getattr(streams[0], "encoding", "utf-8") if streams else "utf-8"
+
+    def write(self, data: str) -> int:
+        for stream in self._streams:
+            stream.write(data)
+            stream.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
+
+    def isatty(self) -> bool:
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self._streams)
+
+    def fileno(self) -> int:
+        return self._streams[0].fileno()
+
+
+@contextmanager
+def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
+    output = spec.get("output", {})
+    if not bool(output.get("save_console_log", True)):
+        yield None
+        return
+
+    log_filename = str(output.get("console_log_filename", "train.log"))
+    log_path = output_dir / log_filename
+    with log_path.open("a", encoding="utf-8", buffering=1) as handle:
+        tee_stream = _TeeStream(sys.stdout, handle)
+        tee_error_stream = _TeeStream(sys.stderr, handle)
+        with ExitStack() as stack:
+            stack.enter_context(redirect_stdout(tee_stream))
+            stack.enter_context(redirect_stderr(tee_error_stream))
+            yield log_path
+
+
 # =============================================================================
 # 基础实验配置：如果你只想跑一组实验，通常只改这里
 # =============================================================================
@@ -55,7 +97,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "spgg_CNN_demo1_8workers",
+    "experiment_name": "spgg_CNN_demo1_4workers_3_25",
 
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -259,23 +301,35 @@ BASE_EXPERIMENT = {
     # 训练参数
     # ---------------------------
     "training": {
-        # 外层训练迭代次数。
-        "total_updates": 2_500,  # 2_500 * 150 = 375_000 步 = 0.375M 步
+        # 训练总环境步数。
+        # 这是推荐直接调的“全局总步数”入口，单位与 warmup / eval_interval 保持一致。
+        # 程序内部会按：
+        #   total_updates = ceil(total_env_steps / (num_workers * effective_steps_per_update))
+        # 自动换算成 update 次数。
+        "total_env_steps": 15_000_000,#episode需要用总的steps除以episode_length=150
+
+        # warm-up 总环境步数。
+        # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
+        "warmup_env_steps": 60_000,
+
+        # 每隔多少个全局环境步做一次评估。
+        # 程序内部会自动换算成 update 间隔。
+        "eval_interval_env_steps": 2_000_000,
+
+        # 兼容旧配置的回退项：只有 total_env_steps 为 None 时才使用。
+        "total_updates": None,
 
         # 每个 worker 在每次训练迭代中收集多少个环境步。
-        "steps_per_update": 150,  # episode=150
+        # 这是“每个 worker 每个 update”的采样粒度，不是全局总步数。
+        "steps_per_update": 1500,  # episode_length=150
 
         # 是否强制把每次训练迭代的采样长度设为一个完整 episode。
         # 为 True 时，会忽略上面的 steps_per_update，改为使用 dynamics.episode_length。
-        # 对当前演化博弈设定，这意味着每次 learner 更新前都会先采完整个演化过程。
-        # 训练总环境步数公式：
-        # effective_steps_per_update =
-        #   dynamics.episode_length if use_episode_length_as_steps_per_update else steps_per_update
-        # per_worker_total_env_steps = total_updates * effective_steps_per_update
-        # all_workers_total_env_steps = num_workers * per_worker_total_env_steps
-        # 当前配置：effective_steps_per_update = 150，
-        # 所以每个 worker 共 2_500 * 150 = 375_000 步 = 0.375M 步，1 个 worker 合计也是 375_000 步 = 0.375M 步。
-        "use_episode_length_as_steps_per_update": True,
+        # 对当前演化博弈设定，这意味着每个 worker 每个 update 都会先采完整个演化过程。
+        # 这里不需要你手动再乘 num_workers，程序会自动根据：
+        #   global_env_steps_per_update = num_workers * effective_steps_per_update
+        # 去换算 total_updates / eval_interval_updates。
+        "use_episode_length_as_steps_per_update": False,
 
         # 折扣因子 gamma。
         "gamma": 0.99,
@@ -373,18 +427,15 @@ BASE_EXPERIMENT = {
         "replay_capacity": 300_000, # 300k 步=0.3M 步
 
         # learner 每次更新采样的 batch 大小。
-        "batch_size": 256,
+        "batch_size": 384,
 
         # learner 内部做图张量化时的微批大小。
         # 这是为了避免把整个 replay batch 一次性展开成 dense [B, N, N, H] 图张量后显存占用过高。
         # 它不改变 replay sample 的 batch_size，只影响 actor / critic 在 GPU 上分几小块做前向与反向。
-        "graph_batch_chunk_size": 24,
+        "graph_batch_chunk_size": 48,
 
-        # warm-up 环境步数。
-        # 注意这是所有 worker 共享的“全局 warm-up 总步数”，不是每个 worker 单独的步数。
-        # 例如 num_workers=4、steps_per_update=150、warmup_steps=150_000 时，
-        # 程序会在所有 worker 的采样结果之间按全局预算分配 warm-up，而不是变成 4 倍。
-        "warmup_steps": 150_000,    #   warm-up/episode= 1000个update 步= x 个 episode 
+        # 兼容旧配置的回退项：只有 warmup_env_steps 为 None 时才使用。
+        "warmup_steps": None,
 
         # warm-up 行为模式：
         # - "random_only"   ：只用随机 logits + softmax
@@ -431,7 +482,7 @@ BASE_EXPERIMENT = {
         "train_every": 1,
 
         # 每个外层训练迭代做多少次梯度更新。
-        "gradient_steps_per_update": 4,
+        "gradient_steps_per_update": 8,
 
         # TD3 delayed policy update 频率。
         "policy_delay": 2,
@@ -457,20 +508,20 @@ BASE_EXPERIMENT = {
         # 真实并行的 rollout worker 进程数。
         # num_workers=1 表示单进程采样；num_workers>1 会启动多进程并行采样。
         # learner 仍然在主进程单点更新。
-        "num_workers": 8,
+        "num_workers": 4,
 
         # learner 参数同步到 worker 的间隔。
         "worker_sync_interval": 1,
 
         # 并行 worker RPC 的超时时间（秒）。
         # 包括 actor 参数同步、collect 回传、state_dict/load_state_dict 等控制消息。
-        "worker_rpc_timeout_seconds": 300.0,
+        "worker_rpc_timeout_seconds": 1200.0,
 
         # 评估时资源低于该阈值视为 collapse。
         "collapse_resource_threshold": 1e-6,
 
-        # 每隔多少个 update 做一次评估。
-        "eval_interval": 500,
+        # 兼容旧配置的回退项：只有 eval_interval_env_steps 为 None 时才使用。
+        "eval_interval": None,
 
         # 每次评估多少个 episode。
         "eval_episodes": 8,
@@ -750,7 +801,7 @@ BASE_EXPERIMENT = {
     "output": {
         # 所有输出结果的根目录。
         # 每个实验会在下面单独建一个子目录。
-        "root_dir": "outputs/200frame_piecewise_degree_Pmax100_R020_r2_len200",#"outputs",
+        "root_dir": "outputs/GNN_SPGG",#"outputs",
 
         # 是否保存结果 JSON。
         "save_results_json": True,
@@ -761,6 +812,12 @@ BASE_EXPERIMENT = {
 
         # 是否把宏观时间序列图真正落盘。
         "save_macro_timeseries": True,
+
+        # 是否把控制台 stdout/stderr 同步写入实验目录下的日志文件。
+        "save_console_log": True,
+
+        # 控制台日志文件名。
+        "console_log_filename": "train.log",
     },
 }
 
@@ -1191,18 +1248,92 @@ def build_gnn_policy(spec: Mapping[str, Any]) -> Any:
     )
 
 
+def _resolve_effective_steps_per_update(spec: Mapping[str, Any]) -> int:
+    training = spec["training"]
+    if training.get("use_episode_length_as_steps_per_update", False):
+        return int(spec["dynamics"]["episode_length"])
+    return int(training["steps_per_update"])
+
+
+def _resolve_training_schedule(spec: Mapping[str, Any]) -> Dict[str, Any]:
+    training = spec["training"]
+    effective_steps_per_update = _resolve_effective_steps_per_update(spec)
+    num_workers = int(training["num_workers"])
+    global_env_steps_per_update = effective_steps_per_update * num_workers
+
+    total_env_steps_config = training.get("total_env_steps")
+    if total_env_steps_config is not None:
+        total_env_steps_requested = int(total_env_steps_config)
+        if total_env_steps_requested <= 0:
+            raise ValueError("training.total_env_steps must be positive when provided.")
+        total_updates = max(1, int(ceil(total_env_steps_requested / float(global_env_steps_per_update))))
+        total_updates_source = "training.total_env_steps"
+    else:
+        total_updates_raw = training.get("total_updates")
+        if total_updates_raw is None:
+            raise ValueError("Either training.total_env_steps or training.total_updates must be provided.")
+        total_updates = int(total_updates_raw)
+        if total_updates <= 0:
+            raise ValueError("training.total_updates must be positive when provided.")
+        total_env_steps_requested = total_updates * global_env_steps_per_update
+        total_updates_source = "training.total_updates"
+    total_env_steps_effective = total_updates * global_env_steps_per_update
+
+    warmup_env_steps_config = training.get("warmup_env_steps")
+    if warmup_env_steps_config is not None:
+        warmup_env_steps = int(warmup_env_steps_config)
+        if warmup_env_steps < 0:
+            raise ValueError("training.warmup_env_steps must be non-negative when provided.")
+        warmup_steps_source = "training.warmup_env_steps"
+    else:
+        warmup_steps_raw = training.get("warmup_steps")
+        if warmup_steps_raw is None:
+            raise ValueError("Either training.warmup_env_steps or training.warmup_steps must be provided.")
+        warmup_env_steps = int(warmup_steps_raw)
+        if warmup_env_steps < 0:
+            raise ValueError("training.warmup_steps must be non-negative when provided.")
+        warmup_steps_source = "training.warmup_steps"
+
+    eval_interval_env_steps_config = training.get("eval_interval_env_steps")
+    if eval_interval_env_steps_config is not None:
+        eval_interval_env_steps = int(eval_interval_env_steps_config)
+        if eval_interval_env_steps <= 0:
+            raise ValueError("training.eval_interval_env_steps must be positive when provided.")
+        eval_interval_updates = max(1, int(ceil(eval_interval_env_steps / float(global_env_steps_per_update))))
+        eval_interval_source = "training.eval_interval_env_steps"
+    else:
+        eval_interval_raw = training.get("eval_interval")
+        if eval_interval_raw is None:
+            raise ValueError("Either training.eval_interval_env_steps or training.eval_interval must be provided.")
+        eval_interval_updates = int(eval_interval_raw)
+        if eval_interval_updates <= 0:
+            raise ValueError("training.eval_interval must be positive when provided.")
+        eval_interval_env_steps = eval_interval_updates * global_env_steps_per_update
+        eval_interval_source = "training.eval_interval"
+
+    return {
+        "effective_steps_per_update": effective_steps_per_update,
+        "global_env_steps_per_update": global_env_steps_per_update,
+        "total_updates": total_updates,
+        "total_env_steps_requested": total_env_steps_requested,
+        "total_env_steps_effective": total_env_steps_effective,
+        "total_updates_source": total_updates_source,
+        "warmup_env_steps": warmup_env_steps,
+        "warmup_steps_source": warmup_steps_source,
+        "eval_interval_updates": eval_interval_updates,
+        "eval_interval_env_steps": eval_interval_env_steps,
+        "eval_interval_source": eval_interval_source,
+    }
+
+
 def build_trainer_config(spec: Mapping[str, Any]) -> Any:
     from Project1.trainer import TrainerConfig
 
     training = spec["training"]
-    resolved_steps_per_update = (
-        int(spec["dynamics"]["episode_length"])
-        if training.get("use_episode_length_as_steps_per_update", False)
-        else int(training["steps_per_update"])
-    )
+    training_schedule = _resolve_training_schedule(spec)
     return TrainerConfig(
-        total_updates=training["total_updates"],
-        steps_per_update=resolved_steps_per_update,
+        total_updates=training_schedule["total_updates"],
+        steps_per_update=training_schedule["effective_steps_per_update"],
         gamma=training["gamma"],
         learning_rate=training["learning_rate"],
         actor_lr=training.get("actor_lr"),
@@ -1222,7 +1353,7 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         replay_capacity=training["replay_capacity"],
         batch_size=training["batch_size"],
         graph_batch_chunk_size=training.get("graph_batch_chunk_size", 16),
-        warmup_steps=training["warmup_steps"],
+        warmup_steps=training_schedule["warmup_env_steps"],
         warmup_behavior_mode=training["warmup_behavior_mode"],
         warmup_selection_granularity=training["warmup_selection_granularity"],
         warmup_uniform_prob=training["warmup_uniform_prob"],
@@ -1247,7 +1378,7 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         worker_sync_interval=training["worker_sync_interval"],
         worker_rpc_timeout_seconds=training.get("worker_rpc_timeout_seconds", 300.0),
         collapse_resource_threshold=training["collapse_resource_threshold"],
-        eval_interval=training["eval_interval"],
+        eval_interval=training_schedule["eval_interval_updates"],
         eval_episodes=training["eval_episodes"],
         device=training["device"],
         seed=spec["seed"],
@@ -1449,7 +1580,8 @@ def build_training_curriculum(spec: Mapping[str, Any]) -> Optional[List[Dict[str
 
     base_randomization = build_domain_randomization_config(spec)
     supported_network_types = {str(item) for item in base_randomization.network_types}
-    total_updates = int(spec["training"]["total_updates"])
+    training_schedule = _resolve_training_schedule(spec)
+    total_updates = int(training_schedule["total_updates"])
 
     portion_sum = 0.0
     cumulative_portion = 0.0
@@ -2054,6 +2186,7 @@ def _log_tensorboard_static_metadata(
     env_config: SPGGConfig,
 ) -> None:
     summary = graph_summary(graph)
+    training_schedule = _resolve_training_schedule(spec)
     static_scalars = {
         "static/graph/num_nodes": float(summary["num_nodes"]),
         "static/graph/num_edges": float(summary["num_edges"]),
@@ -2076,10 +2209,12 @@ def _log_tensorboard_static_metadata(
         ),
         "static/gnn/temperature": float(spec["gnn"]["temperature"]),
         "static/training/steps_per_update": float(
-            spec["dynamics"]["episode_length"]
-            if spec["training"].get("use_episode_length_as_steps_per_update", False)
-            else spec["training"]["steps_per_update"]
+            training_schedule["effective_steps_per_update"]
         ),
+        "static/training/global_env_steps_per_update": float(training_schedule["global_env_steps_per_update"]),
+        "static/training/total_env_steps": float(training_schedule["total_env_steps_effective"]),
+        "static/training/warmup_env_steps": float(training_schedule["warmup_env_steps"]),
+        "static/training/eval_interval_env_steps": float(training_schedule["eval_interval_env_steps"]),
         "static/training/num_workers": float(spec["training"]["num_workers"]),
         "static/training/batch_size": float(spec["training"]["batch_size"]),
         "static/training/graph_batch_chunk_size": float(spec["training"].get("graph_batch_chunk_size", 16)),
@@ -2324,6 +2459,7 @@ def run_gnn_training_mode(
     eval_env = SPGGEnv(env_config, graph)
     policy = build_gnn_policy(spec)
     trainer_config = build_trainer_config(spec)
+    training_schedule = _resolve_training_schedule(spec)
     randomization_config = build_domain_randomization_config(spec)
     eval_env_factories = build_evaluation_env_factories(spec)
     curriculum_stages = build_training_curriculum(spec)
@@ -2348,17 +2484,25 @@ def run_gnn_training_mode(
     writer: Any = None
     try:
         print(
-            "Train CFG : steps_per_update={0}, source={1}".format(
+            "Train CFG : steps_per_update={0}, source={1}, total_env_steps={2} ({3}), total_updates={4}, warmup_env_steps={5} ({6})".format(
                 trainer_config.steps_per_update,
                 steps_source,
+                training_schedule["total_env_steps_effective"],
+                training_schedule["total_updates_source"],
+                trainer_config.total_updates,
+                training_schedule["warmup_env_steps"],
+                training_schedule["warmup_steps_source"],
             )
         )
         print(
-            "Eval CFG  : mode={0}, periodic_eval_episodes={1}".format(
+            "Eval CFG  : mode={0}, periodic_eval_episodes={1}, eval_interval_env_steps={2} ({3}), eval_interval_updates={4}".format(
                 "custom_env_families({0})".format(len(eval_env_factories))
                 if eval_env_factories is not None
                 else "fixed_base_env",
                 trainer_config.eval_episodes,
+                training_schedule["eval_interval_env_steps"],
+                training_schedule["eval_interval_source"],
+                trainer_config.eval_interval,
             )
         )
         if curriculum_stages:
@@ -2397,7 +2541,7 @@ def run_gnn_training_mode(
         tensorboard_stage_log_state: Dict[str, Any] = {"last_stage_index": None}
         training_start_time = time.time()
         effective_steps_per_update = int(trainer_config.steps_per_update) * int(trainer_config.num_workers)
-        total_env_steps = int(trainer_config.total_updates) * effective_steps_per_update
+        total_env_steps = int(training_schedule["total_env_steps_effective"])
         recent_metrics: deque[dict[str, float]] = deque(maxlen=max(console_recent_window_updates, 1))
 
         def _current_stage_label(metrics: Mapping[str, float]) -> Optional[str]:
@@ -2494,7 +2638,7 @@ def run_gnn_training_mode(
                     curriculum_stages=curriculum_stages,
                     stage_log_state=tensorboard_stage_log_state,
                 )
-            env_steps = update * effective_steps_per_update
+            env_steps = int(metrics.get("global_env_steps", update * effective_steps_per_update))
             should_log_progress = console_progress_logs and (
                 update == resumed_update + 1
                 or update == int(trainer_config.total_updates)
@@ -2531,7 +2675,7 @@ def run_gnn_training_mode(
                     print(line)
 
         history = trainer.train(
-            num_updates=spec["training"]["total_updates"],
+            num_updates=trainer_config.total_updates,
             on_update=_on_update,
         )
         if history and save_final_checkpoint:
@@ -2611,18 +2755,21 @@ def run_one_experiment(spec: Mapping[str, Any]) -> Dict[str, Any]:
     graph = build_graph(spec)
     env_config = build_env_config(spec, graph)
     output_dir = build_output_dir(spec)
-    print_header(spec, graph, env_config)
+    with experiment_console_log_context(spec, output_dir) as console_log_path:
+        if console_log_path is not None:
+            print("Console Log: {0}".format(console_log_path))
+        print_header(spec, graph, env_config)
 
-    if spec["run_mode"] in {"uniform", "proportional"}:
-        results = run_rule_based_mode(spec, graph, env_config, output_dir)
-    elif spec["run_mode"] == "gnn_train":
-        results = run_gnn_training_mode(spec, graph, env_config, output_dir)
-    else:
-        raise ValueError("Unsupported run_mode: {0}".format(spec["run_mode"]))
+        if spec["run_mode"] in {"uniform", "proportional"}:
+            results = run_rule_based_mode(spec, graph, env_config, output_dir)
+        elif spec["run_mode"] == "gnn_train":
+            results = run_gnn_training_mode(spec, graph, env_config, output_dir)
+        else:
+            raise ValueError("Unsupported run_mode: {0}".format(spec["run_mode"]))
 
-    print_final_summary(results)
-    save_results_json(spec, graph, env_config, results, output_dir)
-    return results
+        print_final_summary(results)
+        save_results_json(spec, graph, env_config, results, output_dir)
+        return results
 
 
 def _run_scan_experiment_worker(spec: Mapping[str, Any]) -> Dict[str, Any]:
