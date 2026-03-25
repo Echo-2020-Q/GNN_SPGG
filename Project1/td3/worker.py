@@ -57,13 +57,73 @@ def _configure_rollout_worker_runtime(device: str, num_threads: int | None) -> N
         torch.set_num_threads(int(num_threads))
 
 
-def _serialize_inference_observation(observation: Mapping[str, Any]) -> dict[str, np.ndarray]:
+def _numpy_dtype_for_observation_field(key: str) -> np.dtype:
+    dtype = REPLAY_OBSERVATION_DTYPES[key]
+    if dtype == torch.bool:
+        return np.dtype(np.bool_)
+    if dtype == torch.float32:
+        return np.dtype(np.float32)
+    raise TypeError("Unsupported observation dtype for key '{0}': {1}".format(key, dtype))
+
+
+def _serialize_inference_observation_batch(observations: list[Mapping[str, Any]]) -> dict[str, np.ndarray]:
+    if not observations:
+        raise ValueError("observations must contain at least one item.")
+
     payload: dict[str, np.ndarray] = {}
+    first_num_nodes: int | None = None
     for key in REPLAY_OBSERVATION_DTYPES:
-        if key not in observation:
-            raise KeyError("Observation is missing inference field '{0}'.".format(key))
-        payload[key] = np.asarray(observation[key]).copy()
+        arrays: list[np.ndarray] = []
+        for observation in observations:
+            if key not in observation:
+                raise KeyError("Observation is missing inference field '{0}'.".format(key))
+            array = np.asarray(observation[key], dtype=_numpy_dtype_for_observation_field(key))
+            if key == "local_mask":
+                if array.ndim != 2 or array.shape[0] != array.shape[1]:
+                    raise ValueError("Observation field 'local_mask' must be a square matrix.")
+                if first_num_nodes is None:
+                    first_num_nodes = int(array.shape[0])
+                elif int(array.shape[0]) != first_num_nodes:
+                    raise ValueError("Inference batch requires all observations to share the same node count.")
+            arrays.append(array)
+        payload[key] = np.ascontiguousarray(np.stack(arrays, axis=0))
     return payload
+
+
+def _normalize_serialized_inference_batch(observations_batch: Mapping[str, Any]) -> dict[str, np.ndarray]:
+    payload: dict[str, np.ndarray] = {}
+    batch_size: int | None = None
+    num_nodes: int | None = None
+    for key in REPLAY_OBSERVATION_DTYPES:
+        if key not in observations_batch:
+            raise KeyError("Inference batch is missing field '{0}'.".format(key))
+        array = np.asarray(observations_batch[key], dtype=_numpy_dtype_for_observation_field(key))
+        if array.ndim < 1:
+            raise ValueError("Inference batch field '{0}' must include a batch dimension.".format(key))
+        if batch_size is None:
+            batch_size = int(array.shape[0])
+        elif int(array.shape[0]) != batch_size:
+            raise ValueError("Inference batch fields must share the same batch dimension.")
+        if key == "local_mask":
+            if array.ndim != 3 or array.shape[1] != array.shape[2]:
+                raise ValueError("Inference batch field 'local_mask' must have shape [batch, num_nodes, num_nodes].")
+            num_nodes = int(array.shape[1])
+        elif num_nodes is not None and array.ndim >= 2 and int(array.shape[1]) != num_nodes:
+            raise ValueError(
+                "Inference batch field '{0}' must share the same num_nodes dimension as local_mask.".format(key)
+            )
+        payload[key] = np.ascontiguousarray(array)
+    return payload
+
+
+def _concat_serialized_inference_batches(batches: list[Mapping[str, Any]]) -> dict[str, np.ndarray]:
+    if not batches:
+        raise ValueError("batches must contain at least one item.")
+    normalized_batches = [_normalize_serialized_inference_batch(batch) for batch in batches]
+    return {
+        key: np.ascontiguousarray(np.concatenate([batch[key] for batch in normalized_batches], axis=0))
+        for key in REPLAY_OBSERVATION_DTYPES
+    }
 
 
 def _slice_action_record(action: TensorActionRecord, index: int) -> TensorActionRecord:
@@ -95,12 +155,16 @@ class RolloutInferenceClient:
         return logits_batch[0], batch_size
 
     def infer_logits_batch(self, observations: list[Mapping[str, Any]]) -> tuple[torch.Tensor, int]:
-        if not observations:
-            raise ValueError("observations must contain at least one item.")
+        return self.infer_logits_tensor_batch(_serialize_inference_observation_batch(observations))
+
+    def infer_logits_tensor_batch(self, observations_batch: Mapping[str, Any]) -> tuple[torch.Tensor, int]:
+        payload_batch = _normalize_serialized_inference_batch(observations_batch)
+        if int(payload_batch["local_mask"].shape[0]) <= 0:
+            raise ValueError("observations_batch must contain at least one item.")
         self._connection.send(
             {
                 "command": "infer_logits_batch",
-                "observations": [_serialize_inference_observation(observation) for observation in observations],
+                "observations_batch": payload_batch,
             }
         )
         if not self._connection.poll(self._timeout_seconds):
@@ -465,6 +529,7 @@ class RolloutWorker:
         warmup_budget = max(0, int(global_warmup_steps))
         env_step_seconds = 0.0
         inference_wait_seconds = 0.0
+        inference_request_build_seconds = 0.0
         local_policy_forward_seconds = 0.0
         action_to_numpy_seconds = 0.0
         transition_encode_seconds = 0.0
@@ -498,31 +563,53 @@ class RolloutWorker:
 
             if actor_slots:
                 if self.inference_client is not None:
+                    inference_request_build_start = perf_counter()
+                    actor_observation_batch = _serialize_inference_observation_batch(actor_observations)
+                    inference_request_build_seconds += perf_counter() - inference_request_build_start
                     inference_wait_start = perf_counter()
-                    logits_batch, inference_batch_size = self.inference_client.infer_logits_batch(actor_observations)
+                    logits_batch, inference_batch_size = self.inference_client.infer_logits_tensor_batch(
+                        actor_observation_batch
+                    )
                     inference_wait_seconds += perf_counter() - inference_wait_start
                     inference_batch_sizes.append(int(inference_batch_size))
+                    ego_mask_batch = torch.as_tensor(
+                        actor_observation_batch["local_mask"],
+                        dtype=torch.bool,
+                        device=self.device,
+                    )
+                    pool_values_batch = torch.as_tensor(
+                        actor_observation_batch["pool_grown"],
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
                 else:
                     policy_forward_start = perf_counter()
                     with torch.inference_mode():
                         logits_batch = self.actor.rollout_logits_batch(actor_observations)
                     local_policy_forward_seconds += perf_counter() - policy_forward_start
                     inference_batch_sizes.append(len(actor_slots))
-
-                ego_mask_batch = torch.stack(
-                    [
-                        torch.as_tensor(self.observations[slot_index]["local_mask"], dtype=torch.bool, device=self.device)
-                        for slot_index in actor_slots
-                    ],
-                    dim=0,
-                )
-                pool_values_batch = torch.stack(
-                    [
-                        torch.as_tensor(self.observations[slot_index]["pool_grown"], dtype=torch.float32, device=self.device)
-                        for slot_index in actor_slots
-                    ],
-                    dim=0,
-                )
+                    ego_mask_batch = torch.stack(
+                        [
+                            torch.as_tensor(
+                                self.observations[slot_index]["local_mask"],
+                                dtype=torch.bool,
+                                device=self.device,
+                            )
+                            for slot_index in actor_slots
+                        ],
+                        dim=0,
+                    )
+                    pool_values_batch = torch.stack(
+                        [
+                            torch.as_tensor(
+                                self.observations[slot_index]["pool_grown"],
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            for slot_index in actor_slots
+                        ],
+                        dim=0,
+                    )
                 noise_std_batch = [
                     self.explorer.current_noise_std(
                         base_std=self.train_config.rollout_logit_noise_std,
@@ -597,6 +684,7 @@ class RolloutWorker:
             "collect_wall_seconds": float(perf_counter() - collect_start),
             "env_step_seconds": float(env_step_seconds),
             "inference_wait_seconds": float(inference_wait_seconds),
+            "inference_request_build_seconds": float(inference_request_build_seconds),
             "local_policy_forward_seconds": float(local_policy_forward_seconds),
             "action_to_numpy_seconds": float(action_to_numpy_seconds),
             "transition_encode_seconds": float(transition_encode_seconds),
@@ -707,39 +795,36 @@ def _parallel_rollout_inference_server_main(
         except (BrokenPipeError, EOFError, OSError):
             pass
 
-    def _process_pending_requests(pending_requests: list[tuple[Any, list[dict[str, np.ndarray]]]]) -> None:
+    def _process_pending_requests(pending_requests: list[tuple[Any, dict[str, np.ndarray]]]) -> None:
         if not pending_requests:
             return
         grouped_requests: dict[int, dict[str, Any]] = {}
-        for connection, observations in pending_requests:
-            if not observations:
-                _send_error(connection, ValueError("Inference request observations must contain at least one item."))
+        for connection, observations_batch in pending_requests:
+            try:
+                normalized_batch = _normalize_serialized_inference_batch(observations_batch)
+            except Exception as exc:
+                _send_error(connection, exc)
                 continue
-            num_nodes = int(np.asarray(observations[0]["local_mask"]).shape[0])
-            if any(int(np.asarray(observation["local_mask"]).shape[0]) != num_nodes for observation in observations):
-                _send_error(connection, ValueError("Inference request observations must all have the same node count."))
-                continue
+            batch_size = int(normalized_batch["local_mask"].shape[0])
+            num_nodes = int(normalized_batch["local_mask"].shape[1])
             group = grouped_requests.setdefault(
                 num_nodes,
                 {
-                    "observations": [],
+                    "observation_batches": [],
                     "requests": [],
                 },
             )
-            start_index = len(group["observations"])
-            group["observations"].extend(observations)
-            end_index = len(group["observations"])
+            start_index = sum(int(batch["local_mask"].shape[0]) for batch in group["observation_batches"])
+            group["observation_batches"].append(normalized_batch)
+            end_index = start_index + batch_size
             group["requests"].append((connection, start_index, end_index))
 
         try:
             with torch.inference_mode():
                 for group in grouped_requests.values():
-                    observations = list(group["observations"])
-                    if len(observations) == 1:
-                        logits_batch = actor.rollout_logits(observations[0]).unsqueeze(0)
-                    else:
-                        logits_batch = actor.rollout_logits_batch(observations)
-                    batch_size = len(observations)
+                    observations_batch = _concat_serialized_inference_batches(list(group["observation_batches"]))
+                    logits_batch = actor.rollout_logits_tensor_batch(observations_batch)
+                    batch_size = int(observations_batch["local_mask"].shape[0])
                     for connection, start_index, end_index in group["requests"]:
                         try:
                             connection.send(
@@ -771,10 +856,17 @@ def _parallel_rollout_inference_server_main(
                         continue
                     command = str(message["command"])
                     if command == "infer_logits":
-                        pending_requests.append((connection, [dict(message["observation"])]))
+                        pending_requests.append(
+                            (connection, _serialize_inference_observation_batch([dict(message["observation"])]))
+                        )
                         continue
                     if command == "infer_logits_batch":
-                        pending_requests.append((connection, [dict(item) for item in message["observations"]]))
+                        if "observations_batch" in message:
+                            pending_requests.append((connection, dict(message["observations_batch"])))
+                        else:
+                            pending_requests.append(
+                                (connection, _serialize_inference_observation_batch([dict(item) for item in message["observations"]]))
+                            )
                         continue
                     if command == "sync_actor":
                         try:

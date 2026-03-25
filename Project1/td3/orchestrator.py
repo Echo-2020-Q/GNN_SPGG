@@ -503,6 +503,9 @@ class GraphTD3Trainer:
             mean_rollout_collect_worker_seconds = float(np.mean([item.get("collect_wall_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
             mean_rollout_env_step_seconds = float(np.mean([item.get("env_step_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
             mean_rollout_inference_wait_seconds = float(np.mean([item.get("inference_wait_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_inference_request_build_seconds = float(
+                np.mean([item.get("inference_request_build_seconds", 0.0) for item in rollout_metrics])
+            ) if rollout_metrics else 0.0
             mean_rollout_local_policy_forward_seconds = float(np.mean([item.get("local_policy_forward_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
             mean_rollout_action_to_numpy_seconds = float(np.mean([item.get("action_to_numpy_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
             mean_rollout_transition_encode_seconds = float(np.mean([item.get("transition_encode_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
@@ -551,6 +554,7 @@ class GraphTD3Trainer:
                 "profile_rollout_collect_worker_seconds": mean_rollout_collect_worker_seconds,
                 "profile_rollout_env_step_seconds": mean_rollout_env_step_seconds,
                 "profile_rollout_inference_wait_seconds": mean_rollout_inference_wait_seconds,
+                "profile_rollout_inference_request_build_seconds": mean_rollout_inference_request_build_seconds,
                 "profile_rollout_local_policy_forward_seconds": mean_rollout_local_policy_forward_seconds,
                 "profile_rollout_action_to_numpy_seconds": mean_rollout_action_to_numpy_seconds,
                 "profile_rollout_transition_encode_seconds": mean_rollout_transition_encode_seconds,

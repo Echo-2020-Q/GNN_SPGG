@@ -2133,6 +2133,7 @@ def _format_console_recent_stats_lines(
         ("profile_rollout_collect_worker_seconds", "worker_collect_s"),
         ("profile_rollout_env_step_seconds", "env_step_s"),
         ("profile_rollout_inference_wait_seconds", "inference_wait_s"),
+        ("profile_rollout_inference_request_build_seconds", "infer_build_s"),
         ("profile_rollout_local_policy_forward_seconds", "local_forward_s"),
         ("profile_rollout_action_to_numpy_seconds", "action_to_numpy_s"),
         ("profile_rollout_transition_encode_seconds", "transition_encode_s"),

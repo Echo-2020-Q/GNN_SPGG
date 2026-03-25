@@ -59,6 +59,7 @@ PROFILE_KEYS = [
     "profile_rollout_shared_memory_deserialize_seconds",
     "profile_rollout_collect_worker_seconds",
     "profile_rollout_inference_wait_seconds",
+    "profile_rollout_inference_request_build_seconds",
     "profile_rollout_local_policy_forward_seconds",
     "profile_rollout_finish_wait_seconds",
     "profile_rollout_overlap_seconds",
