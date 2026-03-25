@@ -97,7 +97,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "spgg_CNN_demo1_4workers_3_25",
+    "experiment_name": "spgg_CNN_demo1_4workers_2GPU_3_25",
 
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -310,7 +310,7 @@ BASE_EXPERIMENT = {
 
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
-        "warmup_env_steps": 60_000,
+        "warmup_env_steps": 6_000,
 
         # 每隔多少个全局环境步做一次评估。
         # 程序内部会自动换算成 update 间隔。
