@@ -427,7 +427,7 @@ BASE_EXPERIMENT = {
         "replay_capacity": 300_000, # 300k 步=0.3M 步
 
         # learner 每次更新采样的 batch 大小。
-        "batch_size": 384,
+        "batch_size": 512,
 
         # learner 内部做图张量化时的微批大小。
         # 这是为了避免把整个 replay batch 一次性展开成 dense [B, N, N, H] 图张量后显存占用过高。
@@ -517,6 +517,32 @@ BASE_EXPERIMENT = {
         # 包括 actor 参数同步、collect 回传、state_dict/load_state_dict 等控制消息。
         "worker_rpc_timeout_seconds": 1200.0,
 
+        # rollout actor 的推理设备。
+        # - "cpu"     ：保持当前最稳的 CPU rollout 路径
+        # - "cuda:1"  ：把所有 rollout worker 的 actor 推理放到指定 GPU
+        # - ["cuda:1", "cuda:2"] ：按 worker 轮转分配 rollout 推理设备
+        # learner 训练设备仍由下面的 device 单独控制。
+        "rollout_device": "cuda:2",
+
+        # rollout 推理模式：
+        # - "local"       ：每个 worker 自己持有 actor，并在本地前向
+        # - "centralized" ：worker 只做环境推进，把 observation 发给集中式 batched
+        #                   inference server，由 rollout_device 上的 actor 批量前向
+        "rollout_inference_mode": "centralized",
+
+        # 中央 rollout inference server 为了攒 batch 最多额外等待多少毫秒。
+        # 设为 0 表示只处理当前已到达的请求，不额外等待。
+        "rollout_inference_batch_timeout_ms": 2.0,
+
+        # learner 训练设备：cpu / cuda / cuda:0 等。
+        # 这只控制主进程里的 actor/critic 训练，不控制 rollout worker 的推理设备。
+        "device": "cuda:3",
+
+        # 并行 rollout worker 进程内的 PyTorch CPU 线程数。
+        # 仅对多进程 worker 生效，用于减少小图前向时的线程争抢。
+        # 设为 1 通常更稳；设为 None 则保持 PyTorch 默认值。
+        "rollout_num_threads": 1,
+
         # 评估时资源低于该阈值视为 collapse。
         "collapse_resource_threshold": 1e-6,
 
@@ -525,9 +551,6 @@ BASE_EXPERIMENT = {
 
         # 每次评估多少个 episode。
         "eval_episodes": 8,
-
-        # 训练设备：cpu 或 cuda。
-        "device": "cuda",
     },
 
     # ---------------------------
@@ -1377,6 +1400,10 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         num_workers=training["num_workers"],
         worker_sync_interval=training["worker_sync_interval"],
         worker_rpc_timeout_seconds=training.get("worker_rpc_timeout_seconds", 300.0),
+        rollout_device=training.get("rollout_device", "cpu"),
+        rollout_inference_mode=training.get("rollout_inference_mode", "local"),
+        rollout_inference_batch_timeout_ms=training.get("rollout_inference_batch_timeout_ms", 2.0),
+        rollout_num_threads=training.get("rollout_num_threads"),
         collapse_resource_threshold=training["collapse_resource_threshold"],
         eval_interval=training_schedule["eval_interval_updates"],
         eval_episodes=training["eval_episodes"],
@@ -2089,6 +2116,15 @@ def _format_console_recent_stats_lines(
         ("actor_lr", "actor_lr"),
         ("critic_lr", "critic_lr"),
         ("replay_size", "replay_size"),
+        ("profile_rollout_steps_per_second", "rollout_sps"),
+        ("profile_rollout_collect_seconds", "rollout_collect_s"),
+        ("profile_rollout_collect_worker_seconds", "worker_collect_s"),
+        ("profile_rollout_env_step_seconds", "env_step_s"),
+        ("profile_rollout_inference_wait_seconds", "inference_wait_s"),
+        ("profile_rollout_local_policy_forward_seconds", "local_forward_s"),
+        ("profile_learner_update_seconds", "learner_update_s"),
+        ("profile_rollout_inference_batch_size_mean", "infer_batch_mean"),
+        ("profile_rollout_inference_batch_size_max", "infer_batch_max"),
         ("behavior_frac_uniform", "uniform"),
         ("behavior_frac_proportional", "proportional"),
         ("behavior_frac_constant_mix", "constant_mix"),
@@ -2136,6 +2172,8 @@ def _tensorboard_tag_for_metric(metric_name: str) -> Optional[str]:
         return "behavior/{0}".format(metric_name[len("behavior_frac_"):])
     if metric_name.startswith("rollout_"):
         return "train_global/{0}".format(metric_name[len("rollout_"):])
+    if metric_name.startswith("profile_"):
+        return "profile/{0}".format(metric_name[len("profile_"):])
     if metric_name.startswith("eval_"):
         eval_key = metric_name[len("eval_"):]
         if "/" in eval_key:
@@ -2219,9 +2257,27 @@ def _log_tensorboard_static_metadata(
         "static/training/batch_size": float(spec["training"]["batch_size"]),
         "static/training/graph_batch_chunk_size": float(spec["training"].get("graph_batch_chunk_size", 16)),
         "static/training/replay_capacity": float(spec["training"]["replay_capacity"]),
+        "static/training/rollout_inference_batch_timeout_ms": float(
+            spec["training"].get("rollout_inference_batch_timeout_ms", 2.0)
+        ),
     }
+    rollout_num_threads = spec["training"].get("rollout_num_threads")
+    if rollout_num_threads is not None:
+        static_scalars["static/training/rollout_num_threads"] = float(rollout_num_threads)
     for tag, value in static_scalars.items():
         writer.add_scalar(tag, value, 0)
+    writer.add_text("static/training/learner_device", str(spec["training"]["device"]), 0)
+    rollout_device = spec["training"].get("rollout_device", "cpu")
+    if isinstance(rollout_device, (list, tuple)):
+        rollout_device_text = ",".join(str(item) for item in rollout_device)
+    else:
+        rollout_device_text = str(rollout_device)
+    writer.add_text("static/training/rollout_device", rollout_device_text, 0)
+    writer.add_text(
+        "static/training/rollout_inference_mode",
+        str(spec["training"].get("rollout_inference_mode", "local")),
+        0,
+    )
 
 
 def _log_tensorboard_custom_layout(writer: Any) -> None:
@@ -2246,13 +2302,14 @@ def _log_tensorboard_update_metrics(
     stage_log_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     update = int(metrics["update"])
+    tensorboard_step = int(metrics.get("global_env_steps", update))
     for key, value in metrics.items():
         if not isinstance(value, (int, float)):
             continue
         tag = _tensorboard_tag_for_metric(key)
         if tag is None:
             continue
-        writer.add_scalar(tag, float(value), update)
+        writer.add_scalar(tag, float(value), tensorboard_step)
 
     if curriculum_stages is not None and stage_log_state is not None and "curriculum_stage" in metrics:
         stage_index = int(metrics["curriculum_stage"])
@@ -2260,14 +2317,14 @@ def _log_tensorboard_update_metrics(
             stage_label = str(stage_index)
             if 0 <= stage_index < len(curriculum_stages):
                 stage_label = str(curriculum_stages[stage_index].get("label", stage_label))
-            writer.add_text("curriculum/active_stage_label", stage_label, update)
+            writer.add_text("curriculum/active_stage_label", stage_label, tensorboard_step)
             stage_log_state["last_stage_index"] = stage_index
 
 
 def _log_tensorboard_post_training_evaluation(
     writer: Any,
     episode_summaries: Sequence[Mapping[str, float]],
-    final_update: int,
+    final_env_steps: int,
 ) -> None:
     if not episode_summaries:
         return
@@ -2289,37 +2346,37 @@ def _log_tensorboard_post_training_evaluation(
     writer.add_scalar(
         "post_eval/return_mean",
         float(np.mean([summary["episode_return"] for summary in episode_summaries])),
-        final_update,
+        final_env_steps,
     )
     writer.add_scalar(
         "post_eval/final_actual_cooperation_mean",
         float(np.mean([summary["final_actual_cooperation"] for summary in episode_summaries])),
-        final_update,
+        final_env_steps,
     )
     writer.add_scalar(
         "post_eval/final_mean_resource_mean",
         float(np.mean([summary["final_mean_resource"] for summary in episode_summaries])),
-        final_update,
+        final_env_steps,
     )
     writer.add_scalar(
         "post_eval/final_mean_pool_grown_mean",
         float(np.mean([summary["final_mean_pool_grown"] for summary in episode_summaries])),
-        final_update,
+        final_env_steps,
     )
     writer.add_scalar(
         "post_eval/final_mean_consumption_mean",
         float(np.mean([summary["final_mean_consumption"] for summary in episode_summaries])),
-        final_update,
+        final_env_steps,
     )
     writer.add_scalar(
         "post_eval/final_mean_payoff_mean",
         float(np.mean([summary["final_mean_payoff"] for summary in episode_summaries])),
-        final_update,
+        final_env_steps,
     )
     writer.add_scalar(
         "post_eval/final_gini_mean",
         float(np.mean([summary["final_gini"] for summary in episode_summaries])),
-        final_update,
+        final_env_steps,
     )
 
 
@@ -2483,6 +2540,12 @@ def run_gnn_training_mode(
     )
     writer: Any = None
     try:
+        rollout_device = trainer_config.rollout_device
+        rollout_device_text = (
+            ",".join(str(item) for item in rollout_device)
+            if isinstance(rollout_device, tuple)
+            else str(rollout_device)
+        )
         print(
             "Train CFG : steps_per_update={0}, source={1}, total_env_steps={2} ({3}), total_updates={4}, warmup_env_steps={5} ({6})".format(
                 trainer_config.steps_per_update,
@@ -2492,6 +2555,15 @@ def run_gnn_training_mode(
                 trainer_config.total_updates,
                 training_schedule["warmup_env_steps"],
                 training_schedule["warmup_steps_source"],
+            )
+        )
+        print(
+            "Train DEV : learner_device={0}, rollout_device={1}, rollout_mode={2}, rollout_batch_timeout_ms={3}, rollout_num_threads={4}".format(
+                trainer_config.device,
+                rollout_device_text,
+                trainer_config.rollout_inference_mode,
+                trainer_config.rollout_inference_batch_timeout_ms,
+                trainer_config.rollout_num_threads if trainer_config.rollout_num_threads is not None else "default",
             )
         )
         print(
@@ -2694,8 +2766,12 @@ def run_gnn_training_mode(
             output_dir=output_dir,
         )
         if writer is not None:
-            final_update = int(history[-1]["update"]) if history else resumed_update
-            _log_tensorboard_post_training_evaluation(writer, evaluation_summaries, final_update=final_update)
+            final_env_steps = int(history[-1].get("global_env_steps", 0)) if history else 0
+            _log_tensorboard_post_training_evaluation(
+                writer,
+                evaluation_summaries,
+                final_env_steps=final_env_steps,
+            )
             writer.flush()
 
         return {

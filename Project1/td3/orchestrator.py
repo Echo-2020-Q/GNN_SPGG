@@ -4,6 +4,7 @@ import copy
 from dataclasses import asdict
 from collections import Counter
 from multiprocessing.connection import wait
+from time import perf_counter
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -17,7 +18,23 @@ from .evaluator import GraphTD3Evaluator
 from .exploration import LogitSpaceExplorer
 from .learner import GraphTD3Learner
 from .replay import ReplayBuffer
-from .worker import ParallelRolloutWorker, RandomizedEnvFactory, RolloutResult, RolloutWorker
+from .worker import (
+    ParallelRolloutInferenceServer,
+    ParallelRolloutWorker,
+    RandomizedEnvFactory,
+    RolloutResult,
+    RolloutWorker,
+)
+
+
+def _resolve_rollout_device_for_worker(rollout_device: str | tuple[str, ...], worker_id: int) -> str:
+    if isinstance(rollout_device, tuple):
+        return str(rollout_device[worker_id % len(rollout_device)])
+    return str(rollout_device)
+
+
+def _should_use_centralized_rollout_inference(config: GraphTD3Config) -> bool:
+    return config.num_workers > 1 and config.rollout_inference_mode == "centralized"
 
 
 class GraphTD3Trainer:
@@ -74,20 +91,41 @@ class GraphTD3Trainer:
         train_factory = RandomizedEnvFactory.from_env(env, randomization=randomization)
         self.train_factory = train_factory
         self.rollout_explorer = LogitSpaceExplorer()
+        self.rollout_inference_servers: list[ParallelRolloutInferenceServer] = []
         self.workers = []
+        centralized_rollout_inference = _should_use_centralized_rollout_inference(config)
+        worker_inference_connections: dict[int, Any] = {}
+        if centralized_rollout_inference:
+            worker_ids_by_device: dict[str, list[int]] = {}
+            for worker_id in range(config.num_workers):
+                worker_device = _resolve_rollout_device_for_worker(config.rollout_device, worker_id)
+                worker_ids_by_device.setdefault(worker_device, []).append(worker_id)
+            for worker_device, worker_ids in worker_ids_by_device.items():
+                inference_server = ParallelRolloutInferenceServer(
+                    actor=copy.deepcopy(policy),
+                    train_config=config,
+                    device=worker_device,
+                    num_clients=len(worker_ids),
+                )
+                self.rollout_inference_servers.append(inference_server)
+                for local_index, worker_id in enumerate(worker_ids):
+                    worker_inference_connections[worker_id] = inference_server.take_worker_connection(local_index)
+
         for worker_id in range(config.num_workers):
             worker_config = WorkerConfig(
                 worker_id=worker_id,
                 seed=(config.seed or 0) + worker_id,
                 rollout_steps_per_sync=config.steps_per_update,
             )
+            worker_device = _resolve_rollout_device_for_worker(config.rollout_device, worker_id)
             if config.num_workers > 1:
                 worker = ParallelRolloutWorker(
                     actor=copy.deepcopy(policy),
                     env_factory=train_factory,
                     config=worker_config,
                     train_config=config,
-                    device="cpu",
+                    device="cpu" if centralized_rollout_inference else worker_device,
+                    inference_connection=worker_inference_connections.get(worker_id),
                 )
             else:
                 worker = RolloutWorker(
@@ -96,7 +134,7 @@ class GraphTD3Trainer:
                     env_factory=train_factory,
                     config=worker_config,
                     train_config=config,
-                    device="cpu",
+                    device=worker_device,
                 )
             self.workers.append(worker)
 
@@ -121,6 +159,10 @@ class GraphTD3Trainer:
     def close(self) -> None:
         for worker in self.workers:
             close_method = getattr(worker, "close", None)
+            if callable(close_method):
+                close_method()
+        for inference_server in self.rollout_inference_servers:
+            close_method = getattr(inference_server, "close", None)
             if callable(close_method):
                 close_method()
 
@@ -182,6 +224,10 @@ class GraphTD3Trainer:
             return
         self._activate_curriculum_stage(update, stage_index, stage, reset_workers=True)
 
+    def _sync_rollout_inference_servers(self, actor_state_dict: Mapping[str, Any]) -> None:
+        for inference_server in self.rollout_inference_servers:
+            inference_server.sync_actor(dict(actor_state_dict))
+
     def build_checkpoint(
         self,
         update: int,
@@ -236,8 +282,12 @@ class GraphTD3Trainer:
                 worker.load_state_dict(dict(worker_state))
         else:
             actor_state_dict, actor_version = self.learner.publish_actor_state()
+            self._sync_rollout_inference_servers(actor_state_dict)
             for worker in self.workers:
                 worker.sync_actor(actor_state_dict, version=actor_version)
+
+        actor_state_dict, _ = self.learner.publish_actor_state()
+        self._sync_rollout_inference_servers(actor_state_dict)
 
         resolved_stage = self._resolve_curriculum_stage(max(1, self.completed_updates + 1))
         if resolved_stage is not None:
@@ -320,10 +370,13 @@ class GraphTD3Trainer:
             self._apply_curriculum_stage(update)
             if update == 1 or ((update - 1) % self.config.worker_sync_interval == 0):
                 actor_state_dict, actor_version = self.learner.publish_actor_state()
+                self._sync_rollout_inference_servers(actor_state_dict)
                 for worker in self.workers:
                     worker.sync_actor(actor_state_dict, version=actor_version)
 
+            rollout_collect_start = perf_counter()
             rollout_results = self._collect_rollouts()
+            rollout_collect_seconds = float(perf_counter() - rollout_collect_start)
             rollout_metrics = [result.metrics for result in rollout_results]
             mean_rollout_reward = float(np.mean([item["mean_reward"] for item in rollout_metrics])) if rollout_metrics else 0.0
             mean_rollout_cooperation = float(np.mean([item["mean_actual_cooperation_rate"] for item in rollout_metrics])) if rollout_metrics else 0.0
@@ -332,6 +385,18 @@ class GraphTD3Trainer:
             mean_rollout_payoff = float(np.mean([item["mean_payoff"] for item in rollout_metrics])) if rollout_metrics else 0.0
             mean_rollout_pool_grown = float(np.mean([item["mean_pool_grown"] for item in rollout_metrics])) if rollout_metrics else 0.0
             mean_rollout_pool_raw = float(np.mean([item["mean_pool_raw"] for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_collect_worker_seconds = float(np.mean([item.get("collect_wall_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_env_step_seconds = float(np.mean([item.get("env_step_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_inference_wait_seconds = float(np.mean([item.get("inference_wait_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_local_policy_forward_seconds = float(np.mean([item.get("local_policy_forward_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_inference_batch_size = float(np.mean([item.get("inference_batch_size_mean", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
+            max_rollout_inference_batch_size = float(max((item.get("inference_batch_size_max", 0.0) for item in rollout_metrics), default=0.0))
+            total_rollout_steps_collected = float(sum(item.get("steps_collected", 0.0) for item in rollout_metrics))
+            rollout_steps_per_second = (
+                total_rollout_steps_collected / rollout_collect_seconds
+                if rollout_collect_seconds > 0.0
+                else 0.0
+            )
             behavior_counts: Counter[str] = Counter()
             for item in rollout_metrics:
                 behavior_counts.update(item.get("behavior_source_counts", {}))
@@ -350,9 +415,11 @@ class GraphTD3Trainer:
                 "actor_lr": float(self.learner.actor_optimizer.param_groups[0]["lr"]),
                 "critic_lr": float(self.learner.critic_optimizer.param_groups[0]["lr"]),
             }
+            learner_update_start = perf_counter()
             if update % self.config.train_every == 0:
                 for _ in range(self.config.gradient_steps_per_update):
                     learner_metrics = self.learner.train_step()
+            learner_update_seconds = float(perf_counter() - learner_update_start)
 
             metrics = {
                 "update": float(update),
@@ -379,6 +446,15 @@ class GraphTD3Trainer:
                 "rollout_payoff_mean": mean_rollout_payoff,
                 "rollout_pool_grown_mean": mean_rollout_pool_grown,
                 "rollout_pool_mean": mean_rollout_pool_raw,
+                "profile_rollout_collect_seconds": rollout_collect_seconds,
+                "profile_rollout_collect_worker_seconds": mean_rollout_collect_worker_seconds,
+                "profile_rollout_env_step_seconds": mean_rollout_env_step_seconds,
+                "profile_rollout_inference_wait_seconds": mean_rollout_inference_wait_seconds,
+                "profile_rollout_local_policy_forward_seconds": mean_rollout_local_policy_forward_seconds,
+                "profile_rollout_steps_per_second": rollout_steps_per_second,
+                "profile_rollout_inference_batch_size_mean": mean_rollout_inference_batch_size,
+                "profile_rollout_inference_batch_size_max": max_rollout_inference_batch_size,
+                "profile_learner_update_seconds": learner_update_seconds,
                 "global_env_steps": float(self.global_env_steps),
             }
             total_behavior_samples = float(sum(behavior_counts.values()))

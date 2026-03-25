@@ -70,6 +70,10 @@ class TrainerSmokeTests(unittest.TestCase):
                 eval_interval=1,
                 eval_episodes=1,
                 num_workers=2,
+                rollout_inference_mode="centralized",
+                rollout_device=("cpu", "cpu"),
+                rollout_inference_batch_timeout_ms=0.0,
+                rollout_num_threads=1,
                 warmup_steps=2,
                 seed=0,
             ),
@@ -82,6 +86,9 @@ class TrainerSmokeTests(unittest.TestCase):
             self.assertIn("eval_return_mean", history[0])
             self.assertIn("global_env_steps", history[0])
             self.assertEqual(int(history[0]["global_env_steps"]), 6)
+            self.assertIn("profile_rollout_collect_seconds", history[0])
+            self.assertIn("profile_rollout_env_step_seconds", history[0])
+            self.assertIn("profile_learner_update_seconds", history[0])
         finally:
             trainer.close()
 

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import multiprocessing as mp
+from multiprocessing.connection import wait
 from multiprocessing import shared_memory
+from time import perf_counter
 import traceback
 from typing import Any, Mapping
 
@@ -27,7 +29,7 @@ from Project1.policies.rule_based import (
 )
 
 from .config import DomainRandomizationConfig, GraphTD3Config, WorkerConfig
-from .data import TensorActionRecord, TensorReplayBatch, TensorTransition, stack_tensor_transitions
+from .data import REPLAY_OBSERVATION_DTYPES, TensorActionRecord, TensorReplayBatch, TensorTransition, stack_tensor_transitions
 from .exploration import LogitSpaceExplorer
 
 
@@ -45,6 +47,75 @@ def _serialize_module_state(state_dict: dict[str, torch.Tensor]) -> dict[str, np
 
 def _deserialize_module_state(state_dict: dict[str, Any]) -> dict[str, torch.Tensor]:
     return {key: torch.as_tensor(value, device="cpu") for key, value in state_dict.items()}
+
+
+def _configure_rollout_worker_runtime(device: str, num_threads: int | None) -> None:
+    resolved_device = torch.device(device)
+    if resolved_device.type == "cuda":
+        torch.cuda.set_device(resolved_device)
+    if num_threads is not None:
+        torch.set_num_threads(int(num_threads))
+
+
+def _serialize_inference_observation(observation: Mapping[str, Any]) -> dict[str, np.ndarray]:
+    payload: dict[str, np.ndarray] = {}
+    for key in REPLAY_OBSERVATION_DTYPES:
+        if key not in observation:
+            raise KeyError("Observation is missing inference field '{0}'.".format(key))
+        payload[key] = np.asarray(observation[key]).copy()
+    return payload
+
+
+class RolloutInferenceClient:
+    def __init__(
+        self,
+        connection,
+        timeout_seconds: float,
+        device: torch.device | str = "cpu",
+        worker_id: int | None = None,
+    ):
+        self._connection = connection
+        self._timeout_seconds = float(timeout_seconds)
+        self._device = torch.device(device)
+        self._worker_id = worker_id
+
+    def infer_logits(self, observation: Mapping[str, Any]) -> tuple[torch.Tensor, int]:
+        self._connection.send(
+            {
+                "command": "infer_logits",
+                "observation": _serialize_inference_observation(observation),
+            }
+        )
+        if not self._connection.poll(self._timeout_seconds):
+            raise TimeoutError(
+                "Timed out waiting {0:.1f}s for rollout inference response{1}.".format(
+                    self._timeout_seconds,
+                    "" if self._worker_id is None else " for worker {0}".format(self._worker_id),
+                )
+            )
+        response = self._connection.recv()
+        status = str(response.get("status", "ok"))
+        if status != "ok":
+            error_payload = dict(response.get("error", {}))
+            raise RuntimeError(
+                "Rollout inference server failed{0} with {1}: {2}\n{3}".format(
+                    "" if self._worker_id is None else " for worker {0}".format(self._worker_id),
+                    str(error_payload.get("type", "Exception")),
+                    str(error_payload.get("message", "")),
+                    str(error_payload.get("traceback", "")),
+                )
+            )
+        payload = dict(response.get("payload", {}))
+        return (
+            torch.as_tensor(payload["logits"], dtype=torch.float32, device=self._device),
+            int(payload.get("batch_size", 1)),
+        )
+
+    def close(self) -> None:
+        try:
+            self._connection.close()
+        except OSError:
+            pass
 
 
 def _serialize_remote_exception(exc: Exception) -> dict[str, str]:
@@ -271,6 +342,7 @@ class RolloutWorker:
         config: WorkerConfig,
         train_config: GraphTD3Config,
         device: torch.device | str = "cpu",
+        inference_client: RolloutInferenceClient | None = None,
     ):
         self.actor = actor.to(device)
         self.actor.eval()
@@ -279,6 +351,7 @@ class RolloutWorker:
         self.config = config
         self.train_config = train_config
         self.device = torch.device(device)
+        self.inference_client = inference_client
         self.rng = np.random.default_rng(config.seed)
         self.total_env_steps = 0
         self.actor_version = 0
@@ -349,6 +422,7 @@ class RolloutWorker:
         self.current_warmup_behavior_source = state_dict.get("current_warmup_behavior_source")
 
     def collect(self, num_steps: int, global_warmup_steps: int = 0) -> RolloutResult:
+        collect_start = perf_counter()
         rewards: list[float] = []
         completed_episodes = 0
         behavior_source_counts: dict[str, int] = {}
@@ -360,6 +434,10 @@ class RolloutWorker:
         mean_pool_raws: list[float] = []
         transitions: list[TensorTransition] = []
         warmup_budget = max(0, int(global_warmup_steps))
+        env_step_seconds = 0.0
+        inference_wait_seconds = 0.0
+        local_policy_forward_seconds = 0.0
+        inference_batch_sizes: list[int] = []
 
         for step_index in range(num_steps):
             self._ensure_environment()
@@ -372,16 +450,28 @@ class RolloutWorker:
                 behavior_source = self._resolve_warmup_behavior_source()
                 action = self._sample_warmup_action(behavior_source)
             else:
-                with torch.no_grad():
-                    policy_output = self.actor.deterministic_action(self.observation)
+                if self.inference_client is not None:
+                    inference_wait_start = perf_counter()
+                    logits, inference_batch_size = self.inference_client.infer_logits(self.observation)
+                    inference_wait_seconds += perf_counter() - inference_wait_start
+                    inference_batch_sizes.append(int(inference_batch_size))
+                else:
+                    policy_forward_start = perf_counter()
+                    with torch.inference_mode():
+                        policy_output = self.actor.deterministic_action(self.observation)
+                    local_policy_forward_seconds += perf_counter() - policy_forward_start
+                    if policy_output.logits is None:
+                        raise ValueError("policy_output.logits is required for rollout exploration.")
+                    logits = policy_output.logits
+                    inference_batch_sizes.append(1)
                 noise_std = self.explorer.current_noise_std(
                     base_std=self.train_config.rollout_logit_noise_std,
                     step=self.total_env_steps,
                     decay=self.train_config.rollout_noise_decay,
                     multiplier=self.config.noise_scale_multiplier,
                 )
-                action = self.explorer.apply_to_policy_output(
-                    policy_output=policy_output,
+                action = self.explorer.apply_to_logits(
+                    logits=logits,
                     ego_mask=torch.as_tensor(self.observation["local_mask"], dtype=torch.bool, device=self.device),
                     pool_values=torch.as_tensor(self.observation["pool_grown"], dtype=torch.float32, device=self.device),
                     noise_std=noise_std,
@@ -389,7 +479,9 @@ class RolloutWorker:
                 )
 
             behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
+            env_step_start = perf_counter()
             next_observation, reward, done, info = self.env.step(action.allocation.detach().cpu().numpy())
+            env_step_seconds += perf_counter() - env_step_start
             transition = TensorTransition.from_step(
                 obs=self.observation,
                 action=action,
@@ -423,6 +515,12 @@ class RolloutWorker:
             "mean_payoff": float(np.mean(mean_payoffs)) if mean_payoffs else 0.0,
             "mean_pool_grown": float(np.mean(mean_pool_growns)) if mean_pool_growns else 0.0,
             "mean_pool_raw": float(np.mean(mean_pool_raws)) if mean_pool_raws else 0.0,
+            "collect_wall_seconds": float(perf_counter() - collect_start),
+            "env_step_seconds": float(env_step_seconds),
+            "inference_wait_seconds": float(inference_wait_seconds),
+            "local_policy_forward_seconds": float(local_policy_forward_seconds),
+            "inference_batch_size_mean": float(np.mean(inference_batch_sizes)) if inference_batch_sizes else 0.0,
+            "inference_batch_size_max": float(max(inference_batch_sizes)) if inference_batch_sizes else 0.0,
             "behavior_source_counts": behavior_source_counts,
         }
         replay_batch = stack_tensor_transitions(transitions)
@@ -501,6 +599,228 @@ class RolloutWorker:
         )
 
 
+def _parallel_rollout_inference_server_main(
+    control_connection,
+    worker_connections: tuple[Any, ...],
+    actor_config: GNNPolicyConfig,
+    actor_state_dict: dict[str, Any],
+    device: str,
+    batch_timeout_ms: float,
+    num_threads: int | None,
+) -> None:
+    _configure_rollout_worker_runtime(device=device, num_threads=num_threads)
+    actor = GNNAllocationPolicy(actor_config)
+    actor.load_state_dict(_deserialize_module_state(actor_state_dict))
+    actor = actor.to(device)
+    actor.eval()
+
+    all_connections = [control_connection, *worker_connections]
+    batch_timeout_seconds = max(float(batch_timeout_ms), 0.0) / 1000.0
+
+    def _send_error(connection, exc: Exception) -> None:
+        try:
+            connection.send({"status": "error", "error": _serialize_remote_exception(exc)})
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+
+    def _process_pending_requests(pending_requests: list[tuple[Any, dict[str, np.ndarray]]]) -> None:
+        if not pending_requests:
+            return
+        grouped_requests: dict[int, list[tuple[Any, dict[str, np.ndarray]]]] = {}
+        for connection, observation in pending_requests:
+            num_nodes = int(np.asarray(observation["local_mask"]).shape[0])
+            grouped_requests.setdefault(num_nodes, []).append((connection, observation))
+
+        try:
+            with torch.inference_mode():
+                for group in grouped_requests.values():
+                    observations = [observation for _, observation in group]
+                    if len(observations) == 1:
+                        outputs = [actor.deterministic_action(observations[0])]
+                    else:
+                        outputs = actor.deterministic_action_batch(observations)
+                    batch_size = len(observations)
+                    for (connection, _), output in zip(group, outputs):
+                        if output.logits is None:
+                            raise ValueError("policy_output.logits is required for centralized rollout inference.")
+                        try:
+                            connection.send(
+                                {
+                                    "status": "ok",
+                                    "payload": {
+                                        "logits": output.logits.detach().cpu().numpy().copy(),
+                                        "batch_size": int(batch_size),
+                                    },
+                                }
+                            )
+                        except (BrokenPipeError, EOFError, OSError):
+                            pass
+        except Exception as exc:
+            for connection, _ in pending_requests:
+                _send_error(connection, exc)
+
+    try:
+        while True:
+            ready_connections = list(wait(all_connections))
+            pending_requests: list[tuple[Any, dict[str, np.ndarray]]] = []
+            should_close = False
+
+            while True:
+                for connection in ready_connections:
+                    try:
+                        message = connection.recv()
+                    except EOFError:
+                        continue
+                    command = str(message["command"])
+                    if command == "infer_logits":
+                        pending_requests.append((connection, dict(message["observation"])))
+                        continue
+                    if command == "sync_actor":
+                        try:
+                            actor.load_state_dict(_deserialize_module_state(dict(message["actor_state_dict"])))
+                            actor.eval()
+                            connection.send({"status": "ok", "payload": None})
+                        except Exception as exc:
+                            _send_error(connection, exc)
+                        continue
+                    if command == "close":
+                        try:
+                            connection.send({"status": "ok", "payload": None})
+                        except (BrokenPipeError, EOFError, OSError):
+                            pass
+                        if connection is control_connection:
+                            should_close = True
+                        continue
+                    _send_error(connection, ValueError("Unsupported inference command: {0}".format(command)))
+
+                if should_close or batch_timeout_seconds <= 0.0:
+                    break
+                ready_connections = list(wait(all_connections, timeout=batch_timeout_seconds))
+                if not ready_connections:
+                    break
+
+            _process_pending_requests(pending_requests)
+            if should_close:
+                break
+    finally:
+        for connection in all_connections:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+
+class ParallelRolloutInferenceServer:
+    def __init__(
+        self,
+        actor: GNNAllocationPolicy,
+        train_config: GraphTD3Config,
+        device: str,
+        num_clients: int,
+    ):
+        self._ctx = mp.get_context("spawn")
+        self._device = str(device)
+        self._rpc_timeout_seconds = float(train_config.worker_rpc_timeout_seconds)
+        control_parent, control_child = self._ctx.Pipe()
+        self._control_connection = control_parent
+        server_connections: list[Any] = []
+        self._worker_connections: list[Any | None] = []
+        for _ in range(num_clients):
+            server_connection, worker_connection = self._ctx.Pipe()
+            server_connections.append(server_connection)
+            self._worker_connections.append(worker_connection)
+
+        actor_state = _serialize_module_state(_copy_module_state_to_cpu(actor))
+        self._process = self._ctx.Process(
+            target=_parallel_rollout_inference_server_main,
+            args=(
+                control_child,
+                tuple(server_connections),
+                actor.config,
+                actor_state,
+                self._device,
+                float(train_config.rollout_inference_batch_timeout_ms),
+                train_config.rollout_num_threads,
+            ),
+        )
+        self._process.start()
+        control_child.close()
+        for connection in server_connections:
+            connection.close()
+
+    def take_worker_connection(self, worker_index: int):
+        connection = self._worker_connections[worker_index]
+        if connection is None:
+            raise RuntimeError("Worker connection {0} has already been claimed.".format(worker_index))
+        self._worker_connections[worker_index] = None
+        return connection
+
+    def _recv_response(self) -> Any:
+        if not self._control_connection.poll(self._rpc_timeout_seconds):
+            raise TimeoutError(
+                "Timed out waiting {0:.1f}s for rollout inference server RPC response on device {1}.".format(
+                    self._rpc_timeout_seconds,
+                    self._device,
+                )
+            )
+        response = self._control_connection.recv()
+        status = str(response.get("status", "ok"))
+        if status != "ok":
+            error_payload = dict(response.get("error", {}))
+            raise RuntimeError(
+                "Rollout inference server on {0} failed with {1}: {2}\n{3}".format(
+                    self._device,
+                    str(error_payload.get("type", "Exception")),
+                    str(error_payload.get("message", "")),
+                    str(error_payload.get("traceback", "")),
+                )
+            )
+        return response.get("payload")
+
+    def sync_actor(self, actor_state_dict: dict[str, torch.Tensor]) -> None:
+        self._control_connection.send(
+            {
+                "command": "sync_actor",
+                "actor_state_dict": _serialize_module_state(actor_state_dict),
+            }
+        )
+        self._recv_response()
+
+    def close(self) -> None:
+        if getattr(self, "_control_connection", None) is None:
+            return
+        try:
+            self._control_connection.send({"command": "close"})
+            try:
+                self._recv_response()
+            except Exception:
+                pass
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        except Exception:
+            pass
+        try:
+            self._control_connection.close()
+        except OSError:
+            pass
+        for connection in self._worker_connections:
+            if connection is not None:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+        self._process.join(timeout=5.0)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=5.0)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def _parallel_rollout_worker_main(
     connection,
     actor_config: GNNPolicyConfig,
@@ -509,16 +829,27 @@ def _parallel_rollout_worker_main(
     config: WorkerConfig,
     train_config: GraphTD3Config,
     device: str,
+    inference_connection=None,
 ) -> None:
+    _configure_rollout_worker_runtime(device=device, num_threads=train_config.rollout_num_threads)
     actor = GNNAllocationPolicy(actor_config)
     actor.load_state_dict(_deserialize_module_state(actor_state_dict))
+    inference_client = None
+    if inference_connection is not None:
+        inference_client = RolloutInferenceClient(
+            inference_connection,
+            timeout_seconds=float(train_config.worker_rpc_timeout_seconds),
+            device="cpu",
+            worker_id=config.worker_id,
+        )
     worker = RolloutWorker(
         actor=actor,
         explorer=LogitSpaceExplorer(),
         env_factory=env_factory,
         config=config,
         train_config=train_config,
-        device=device,
+        device="cpu" if inference_client is not None else device,
+        inference_client=inference_client,
     )
 
     try:
@@ -573,6 +904,8 @@ def _parallel_rollout_worker_main(
                     }
                 )
     finally:
+        if inference_client is not None:
+            inference_client.close()
         connection.close()
 
 
@@ -584,6 +917,7 @@ class ParallelRolloutWorker:
         config: WorkerConfig,
         train_config: GraphTD3Config,
         device: str = "cpu",
+        inference_connection=None,
     ):
         self.config = config
         self._device = str(device)
@@ -602,10 +936,16 @@ class ParallelRolloutWorker:
                 config,
                 train_config,
                 self._device,
+                inference_connection,
             ),
         )
         self._process.start()
         child_connection.close()
+        if inference_connection is not None:
+            try:
+                inference_connection.close()
+            except OSError:
+                pass
         self._collect_inflight = False
 
     @property

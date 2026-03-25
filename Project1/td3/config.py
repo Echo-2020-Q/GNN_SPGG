@@ -57,6 +57,10 @@ class GraphTD3Config:
     num_workers: int = 1
     worker_sync_interval: int = 1
     worker_rpc_timeout_seconds: float = 300.0
+    rollout_device: str | tuple[str, ...] = "cpu"
+    rollout_inference_mode: str = "local"
+    rollout_inference_batch_timeout_ms: float = 2.0
+    rollout_num_threads: int | None = None
     collapse_resource_threshold: float = 1e-6
 
     def __post_init__(self) -> None:
@@ -170,6 +174,29 @@ class GraphTD3Config:
             raise ValueError("worker_sync_interval must be positive.")
         if self.worker_rpc_timeout_seconds <= 0.0:
             raise ValueError("worker_rpc_timeout_seconds must be positive.")
+        if self.rollout_inference_mode not in {"local", "centralized"}:
+            raise ValueError("rollout_inference_mode must be one of {'local', 'centralized'}.")
+        if self.rollout_inference_batch_timeout_ms < 0.0:
+            raise ValueError("rollout_inference_batch_timeout_ms must be non-negative.")
+        rollout_device = self.rollout_device
+        if isinstance(rollout_device, list):
+            rollout_device = tuple(str(item) for item in rollout_device)
+        elif isinstance(rollout_device, tuple):
+            rollout_device = tuple(str(item) for item in rollout_device)
+        elif isinstance(rollout_device, str):
+            rollout_device = str(rollout_device)
+        else:
+            raise ValueError("rollout_device must be a string or a sequence of strings.")
+        if isinstance(rollout_device, tuple):
+            if not rollout_device:
+                raise ValueError("rollout_device sequence must contain at least one device.")
+            if any(not item for item in rollout_device):
+                raise ValueError("rollout_device entries must be non-empty strings.")
+        elif not rollout_device:
+            raise ValueError("rollout_device must be a non-empty string.")
+        self.rollout_device = rollout_device
+        if self.rollout_num_threads is not None and self.rollout_num_threads <= 0:
+            raise ValueError("rollout_num_threads must be positive when provided.")
 
 
 @dataclass
