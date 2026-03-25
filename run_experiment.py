@@ -310,7 +310,7 @@ BASE_EXPERIMENT = {
 
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
-        "warmup_env_steps": 1,
+        "warmup_env_steps": 9000,
 
         # 每隔多少个全局环境步做一次评估。
         # 程序内部会自动换算成 update 间隔。
@@ -531,7 +531,7 @@ BASE_EXPERIMENT = {
         # 默认建议先用 "cpu"，让 worker 侧保持最简单、最稳定的本地 CPU rollout。
         # 如果后面要专门做 rollout 推理加速，再改成某张 GPU 或多张 GPU 列表。
         # learner 训练设备仍由下面的 device 单独控制。
-        "rollout_device": "cpu",
+        "rollout_device": "cuda:1",
 
         # rollout 推理模式：
         # - "local"       ：每个 worker 自己持有 actor，并在本地前向
@@ -546,7 +546,7 @@ BASE_EXPERIMENT = {
 
         # learner 训练设备：cpu / cuda / cuda:0 等。
         # 这只控制主进程里的 actor/critic 训练，不控制 rollout worker 的推理设备。
-        "device": "cuda:0",
+        "device": "cuda:2",
 
         # 并行 rollout worker 进程内的 PyTorch CPU 线程数。
         # 仅对多进程 worker 生效，用于减少小图前向时的线程争抢。
@@ -717,7 +717,7 @@ BASE_EXPERIMENT = {
 
         # 是否生成宏观时间序列图。
         # 开启后，每个选中的 episode 都会保存一张统计量随时间变化的折线图。
-        "enable_macro_timeseries": True,
+        "enable_macro_timeseries": False,
 
         # 想要可视化哪些 episode。
         # 用 1-based 编号，例如 [1, 3] 表示只可视化第 1 和第 3 个 episode。
