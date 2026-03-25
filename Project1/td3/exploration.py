@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 from torch import Tensor
+from typing import Any
 
 from Project1.policies.gnn_rl import PolicyOutput
 
@@ -47,12 +48,23 @@ class LogitSpaceExplorer:
         logits: Tensor,
         ego_mask: Tensor,
         pool_values: Tensor,
-        noise_std: float,
+        noise_std: Any,
         noise_clip: float,
     ) -> TensorActionRecord:
         mask = ego_mask.to(dtype=torch.bool, device=logits.device)
         pool_tensor = pool_values.to(dtype=torch.float32, device=logits.device)
-        noise = torch.randn_like(logits) * float(noise_std)
+        if isinstance(noise_std, Tensor):
+            noise_scale = noise_std.to(dtype=logits.dtype, device=logits.device)
+        elif isinstance(noise_std, (list, tuple, np.ndarray)):
+            noise_scale = torch.as_tensor(noise_std, dtype=logits.dtype, device=logits.device)
+        else:
+            noise_scale = float(noise_std)
+        if isinstance(noise_scale, Tensor):
+            while noise_scale.ndim < logits.ndim:
+                noise_scale = noise_scale.unsqueeze(-1)
+            noise = torch.randn_like(logits) * noise_scale
+        else:
+            noise = torch.randn_like(logits) * noise_scale
         if noise_clip > 0.0:
             noise = noise.clamp(-float(noise_clip), float(noise_clip))
         noise = noise * mask.to(dtype=logits.dtype)

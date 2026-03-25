@@ -321,7 +321,7 @@ BASE_EXPERIMENT = {
 
         # 每个 worker 在每次训练迭代中收集多少个环境步。
         # 这是“每个 worker 每个 update”的采样粒度，不是全局总步数。
-        "steps_per_update": 1500,  # episode_length=150
+        "steps_per_update": 750,  # episode_length=150
 
         # 是否强制把每次训练迭代的采样长度设为一个完整 episode。
         # 为 True 时，会忽略上面的 steps_per_update，改为使用 dynamics.episode_length。
@@ -508,27 +508,37 @@ BASE_EXPERIMENT = {
         # 真实并行的 rollout worker 进程数。
         # num_workers=1 表示单进程采样；num_workers>1 会启动多进程并行采样。
         # learner 仍然在主进程单点更新。
-        "num_workers": 4,
+        "num_workers": 12,
+
+        # 每个 worker 内同时维护多少个环境实例。
+        # 这些环境会在 worker 内做 batched actor forward，但总环境步数语义保持不变：
+        # steps_per_update 仍然表示“每个 worker 每个 update 一共采多少步”，而不是每个 env 各采多少步。
+        # 固定 num_nodes 时，4 或 8 往往比继续堆 worker 更值得先试。
+        "num_envs_per_worker": 4,
 
         # learner 参数同步到 worker 的间隔。
         "worker_sync_interval": 1,
+
+        # 是否把下一轮 rollout collect 和当前轮 learner update 做第一阶段双缓冲重叠。
+        # 只在 num_workers > 1 时生效。
+        "overlap_rollout_and_update": True,
 
         # 并行 worker RPC 的超时时间（秒）。
         # 包括 actor 参数同步、collect 回传、state_dict/load_state_dict 等控制消息。
         "worker_rpc_timeout_seconds": 12000.0,
 
         # rollout actor 的推理设备。
-        # - "cpu"     ：保持当前最稳的 CPU rollout 路径
-        # - "cuda:1"  ：把所有 rollout worker 的 actor 推理放到指定 GPU
-        # - ["cuda:1", "cuda:2"] ：按 worker 轮转分配 rollout 推理设备
+        # 默认建议先用 "cpu"，让 worker 侧保持最简单、最稳定的本地 CPU rollout。
+        # 如果后面要专门做 rollout 推理加速，再改成某张 GPU 或多张 GPU 列表。
         # learner 训练设备仍由下面的 device 单独控制。
-        "rollout_device": "cuda:0",
+        "rollout_device": "cpu",
 
         # rollout 推理模式：
         # - "local"       ：每个 worker 自己持有 actor，并在本地前向
         # - "centralized" ：worker 只做环境推进，把 observation 发给集中式 batched
         #                   inference server，由 rollout_device 上的 actor 批量前向
-        "rollout_inference_mode": "centralized",
+        # 默认先用 local，避免多进程 worker 全部去排一个中央 inference server。
+        "rollout_inference_mode": "local",
 
         # 中央 rollout inference server 为了攒 batch 最多额外等待多少毫秒。
         # 设为 0 表示只处理当前已到达的请求，不额外等待。
@@ -536,7 +546,7 @@ BASE_EXPERIMENT = {
 
         # learner 训练设备：cpu / cuda / cuda:0 等。
         # 这只控制主进程里的 actor/critic 训练，不控制 rollout worker 的推理设备。
-        "device": "cuda:1",
+        "device": "cuda:0",
 
         # 并行 rollout worker 进程内的 PyTorch CPU 线程数。
         # 仅对多进程 worker 生效，用于减少小图前向时的线程争抢。
@@ -1398,7 +1408,9 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         target_logit_noise_std=training["target_logit_noise_std"],
         target_logit_noise_clip=training["target_logit_noise_clip"],
         num_workers=training["num_workers"],
+        num_envs_per_worker=training.get("num_envs_per_worker", 1),
         worker_sync_interval=training["worker_sync_interval"],
+        overlap_rollout_and_update=training.get("overlap_rollout_and_update", True),
         worker_rpc_timeout_seconds=training.get("worker_rpc_timeout_seconds", 300.0),
         rollout_device=training.get("rollout_device", "cpu"),
         rollout_inference_mode=training.get("rollout_inference_mode", "local"),
@@ -2122,6 +2134,8 @@ def _format_console_recent_stats_lines(
         ("profile_rollout_env_step_seconds", "env_step_s"),
         ("profile_rollout_inference_wait_seconds", "inference_wait_s"),
         ("profile_rollout_local_policy_forward_seconds", "local_forward_s"),
+        ("profile_rollout_finish_wait_seconds", "rollout_wait_s"),
+        ("profile_rollout_overlap_seconds", "overlap_s"),
         ("profile_learner_update_seconds", "learner_update_s"),
         ("profile_rollout_inference_batch_size_mean", "infer_batch_mean"),
         ("profile_rollout_inference_batch_size_max", "infer_batch_max"),
@@ -2254,6 +2268,10 @@ def _log_tensorboard_static_metadata(
         "static/training/warmup_env_steps": float(training_schedule["warmup_env_steps"]),
         "static/training/eval_interval_env_steps": float(training_schedule["eval_interval_env_steps"]),
         "static/training/num_workers": float(spec["training"]["num_workers"]),
+        "static/training/num_envs_per_worker": float(spec["training"].get("num_envs_per_worker", 1)),
+        "static/training/overlap_rollout_and_update": float(
+            1.0 if spec["training"].get("overlap_rollout_and_update", True) else 0.0
+        ),
         "static/training/batch_size": float(spec["training"]["batch_size"]),
         "static/training/graph_batch_chunk_size": float(spec["training"].get("graph_batch_chunk_size", 16)),
         "static/training/replay_capacity": float(spec["training"]["replay_capacity"]),
@@ -2558,12 +2576,14 @@ def run_gnn_training_mode(
             )
         )
         print(
-            "Train DEV : learner_device={0}, rollout_device={1}, rollout_mode={2}, rollout_batch_timeout_ms={3}, rollout_num_threads={4}".format(
+            "Train DEV : learner_device={0}, rollout_device={1}, rollout_mode={2}, rollout_batch_timeout_ms={3}, rollout_num_threads={4}, num_envs_per_worker={5}, overlap_rollout_update={6}".format(
                 trainer_config.device,
                 rollout_device_text,
                 trainer_config.rollout_inference_mode,
                 trainer_config.rollout_inference_batch_timeout_ms,
                 trainer_config.rollout_num_threads if trainer_config.rollout_num_threads is not None else "default",
+                trainer_config.num_envs_per_worker,
+                trainer_config.overlap_rollout_and_update,
             )
         )
         print(

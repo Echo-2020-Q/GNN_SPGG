@@ -16,7 +16,15 @@ if NUMPY_AVAILABLE:
 if NUMPY_AVAILABLE and TORCH_AVAILABLE:
     import torch
 
-    from Project1.policies.gnn_rl import GNNAllocationPolicy, GNNPolicyConfig, extract_ego_subgraph
+    from Project1.policies.gnn_rl import (
+        GNNAllocationPolicy,
+        GNNPolicyConfig,
+        GraphNetBlock,
+        GraphTensorState,
+        _masked_edge_sum_by_receiver,
+        _masked_global_edge_normalized_sum,
+        extract_ego_subgraph,
+    )
 
 
 @unittest.skipUnless(NUMPY_AVAILABLE, "numpy is required for rule-based policy tests")
@@ -49,6 +57,98 @@ class RuleBasedPolicyTests(unittest.TestCase):
 
 @unittest.skipUnless(NUMPY_AVAILABLE and TORCH_AVAILABLE, "numpy and torch are required for GNN policy tests")
 class GNNPolicyTests(unittest.TestCase):
+    def test_graphnet_block_matches_concat_reference(self) -> None:
+        torch.manual_seed(0)
+        block = GraphNetBlock(
+            global_input_dim=5,
+            node_input_dim=4,
+            edge_input_dim=3,
+            hidden_dim=7,
+            global_output_dim=6,
+            node_output_dim=8,
+            edge_output_dim=9,
+        )
+
+        state = GraphTensorState(
+            global_features=torch.randn(2, 5),
+            node_features=torch.randn(2, 4, 4),
+            edge_features=torch.randn(2, 4, 4, 3),
+            edge_mask=torch.tensor(
+                [
+                    [
+                        [True, True, False, False],
+                        [True, True, True, False],
+                        [False, True, True, True],
+                        [False, False, True, True],
+                    ],
+                    [
+                        [True, True, True, False],
+                        [True, True, False, False],
+                        [True, False, True, True],
+                        [False, False, True, True],
+                    ],
+                ],
+                dtype=torch.bool,
+            ),
+            node_mask=torch.tensor(
+                [
+                    [True, True, True, False],
+                    [True, True, True, True],
+                ],
+                dtype=torch.bool,
+            ),
+        )
+
+        actual = block(state)
+
+        global_features = state.global_features
+        node_features = state.node_features
+        edge_features = state.edge_features
+        edge_mask = state.edge_mask
+        node_mask = state.node_mask
+        batch_size, num_nodes = node_features.shape[:2]
+
+        edge_inputs = torch.cat(
+            [
+                edge_features,
+                node_features[:, :, None, :].expand(batch_size, num_nodes, num_nodes, -1),
+                node_features[:, None, :, :].expand(batch_size, num_nodes, num_nodes, -1),
+                global_features[:, None, None, :].expand(batch_size, num_nodes, num_nodes, -1),
+            ],
+            dim=-1,
+        )
+        expected_edges = block.edge_model(edge_inputs)
+        expected_edges = expected_edges * edge_mask.unsqueeze(-1).to(dtype=expected_edges.dtype)
+
+        aggregated_edge_messages = _masked_edge_sum_by_receiver(expected_edges, edge_mask)
+        node_inputs = torch.cat(
+            [
+                node_features,
+                aggregated_edge_messages,
+                global_features[:, None, :].expand(batch_size, num_nodes, -1),
+            ],
+            dim=-1,
+        )
+        expected_nodes = block.node_model(node_inputs)
+        expected_nodes = expected_nodes * node_mask.unsqueeze(-1).to(dtype=expected_nodes.dtype)
+
+        node_count = node_mask.sum(dim=1).clamp_min(1).to(dtype=expected_nodes.dtype).unsqueeze(-1)
+        aggregated_nodes = expected_nodes.sum(dim=1) / node_count
+        aggregated_edges = _masked_global_edge_normalized_sum(expected_edges, edge_mask)
+        global_inputs = torch.cat(
+            [
+                global_features,
+                aggregated_nodes,
+                aggregated_edges,
+            ],
+            dim=-1,
+        )
+        expected_global = block.global_model(global_inputs)
+
+        self.assertTrue(torch.allclose(actual.edge_features, expected_edges, atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.allclose(actual.node_features, expected_nodes, atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.allclose(actual.global_features, expected_global, atol=1e-6, rtol=1e-6))
+
     def test_ego_subgraph_extraction_keeps_induced_neighbor_edges(self) -> None:
         env = SPGGEnv(
             SPGGConfig(alpha=0.0, r=0.5, p_max=5.0, beta=1.0, episode_length=2),

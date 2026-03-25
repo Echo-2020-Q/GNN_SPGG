@@ -55,7 +55,9 @@ class GraphTD3Config:
     target_logit_noise_clip: float = 0.25
 
     num_workers: int = 1
+    num_envs_per_worker: int = 1
     worker_sync_interval: int = 1
+    overlap_rollout_and_update: bool = True
     worker_rpc_timeout_seconds: float = 300.0
     rollout_device: str | tuple[str, ...] = "cpu"
     rollout_inference_mode: str = "local"
@@ -170,8 +172,12 @@ class GraphTD3Config:
             raise ValueError("target_logit_noise_clip must be non-negative.")
         if self.num_workers <= 0:
             raise ValueError("num_workers must be positive.")
+        if self.num_envs_per_worker <= 0:
+            raise ValueError("num_envs_per_worker must be positive.")
         if self.worker_sync_interval <= 0:
             raise ValueError("worker_sync_interval must be positive.")
+        if not isinstance(self.overlap_rollout_and_update, bool):
+            raise ValueError("overlap_rollout_and_update must be a bool.")
         if self.worker_rpc_timeout_seconds <= 0.0:
             raise ValueError("worker_rpc_timeout_seconds must be positive.")
         if self.rollout_inference_mode not in {"local", "centralized"}:
@@ -204,11 +210,14 @@ class WorkerConfig:
     worker_id: int
     seed: int
     rollout_steps_per_sync: int = 256
+    num_envs_per_worker: int = 1
     noise_scale_multiplier: float = 1.0
 
     def __post_init__(self) -> None:
         if self.rollout_steps_per_sync <= 0:
             raise ValueError("rollout_steps_per_sync must be positive.")
+        if self.num_envs_per_worker <= 0:
+            raise ValueError("num_envs_per_worker must be positive.")
         if self.noise_scale_multiplier < 0.0:
             raise ValueError("noise_scale_multiplier must be non-negative.")
 

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from Project1.env import Observation
@@ -133,6 +134,22 @@ class BatchedEgoSubgraph:
 
 
 @dataclass(frozen=True)
+class FlattenedBatchedEgoSubgraphs:
+    """Flattened ego-subgraph batch over (graph, center) pairs."""
+
+    batch_indices: Tensor
+    center_indices: Tensor
+    center_local_indices: Tensor
+    member_indices: Tensor
+    local_node_features: Tensor
+    local_node_mask: Tensor
+    local_edge_features: Tensor
+    local_edge_mask: Tensor
+    local_global_features: Tensor
+    pool_value: Tensor
+
+
+@dataclass(frozen=True)
 class LocalGraphOutput:
     """Local tiny GraphNet output on one induced ego-subgraph."""
 
@@ -167,6 +184,7 @@ class BatchedPolicyOutput:
     logits: Tensor | None = None
 
 
+
 class MLP(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
@@ -178,6 +196,40 @@ class MLP(nn.Module):
 
     def forward(self, inputs: Tensor) -> Tensor:
         return self.net(inputs)
+
+
+def _apply_partitioned_linear(
+    linear: nn.Linear,
+    inputs: Sequence[Tensor],
+    input_dims: Sequence[int],
+) -> Tensor:
+    """Apply one linear layer to logical input parts without materializing their concat."""
+
+    if len(inputs) != len(input_dims):
+        raise ValueError("inputs and input_dims must have the same length.")
+    if sum(int(item) for item in input_dims) != int(linear.in_features):
+        raise ValueError("input_dims do not match the linear layer input width.")
+
+    output: Tensor | None = None
+    for index, (part, weight) in enumerate(zip(inputs, linear.weight.split(tuple(int(item) for item in input_dims), dim=1))):
+        projected = F.linear(part, weight, linear.bias if index == 0 else None)
+        output = projected if output is None else (output + projected)
+
+    if output is None:
+        raise ValueError("inputs must contain at least one tensor.")
+    return output
+
+
+def _apply_partitioned_mlp(
+    mlp: MLP,
+    inputs: Sequence[Tensor],
+    input_dims: Sequence[int],
+) -> Tensor:
+    """Equivalent to mlp(torch.cat(inputs, dim=-1)) without allocating the concat tensor."""
+
+    hidden = _apply_partitioned_linear(mlp.net[0], inputs, input_dims)
+    hidden = mlp.net[1](hidden)
+    return mlp.net[2](hidden)
 
 
 class ObservationGraphBuilder:
@@ -429,47 +481,55 @@ class GraphNetBlock(nn.Module):
             node_mask = state.node_mask
 
         batch_size, num_nodes = node_features.shape[:2]
-        global_context_for_edges = global_features[:, None, None, :].expand(batch_size, num_nodes, num_nodes, -1)
-        sender_features = node_features[:, :, None, :].expand(batch_size, num_nodes, num_nodes, -1)
-        receiver_features = node_features[:, None, :, :].expand(batch_size, num_nodes, num_nodes, -1)
-
-        edge_inputs = torch.cat(
-            [
+        updated_edges = _apply_partitioned_mlp(
+            self.edge_model,
+            (
                 edge_features,
-                sender_features,
-                receiver_features,
-                global_context_for_edges,
-            ],
-            dim=-1,
+                node_features[:, :, None, :],
+                node_features[:, None, :, :],
+                global_features[:, None, None, :],
+            ),
+            (
+                int(edge_features.size(-1)),
+                int(node_features.size(-1)),
+                int(node_features.size(-1)),
+                int(global_features.size(-1)),
+            ),
         )
-        updated_edges = self.edge_model(edge_inputs)
         updated_edges = updated_edges * edge_mask.unsqueeze(-1).to(dtype=updated_edges.dtype)
 
         aggregated_edge_messages = _masked_edge_sum_by_receiver(updated_edges, edge_mask)
-        global_context_for_nodes = global_features[:, None, :].expand(batch_size, num_nodes, -1)
-        node_inputs = torch.cat(
-            [
+        updated_nodes = _apply_partitioned_mlp(
+            self.node_model,
+            (
                 node_features,
                 aggregated_edge_messages,
-                global_context_for_nodes,
-            ],
-            dim=-1,
+                global_features[:, None, :],
+            ),
+            (
+                int(node_features.size(-1)),
+                int(aggregated_edge_messages.size(-1)),
+                int(global_features.size(-1)),
+            ),
         )
-        updated_nodes = self.node_model(node_inputs)
         updated_nodes = updated_nodes * node_mask.unsqueeze(-1).to(dtype=updated_nodes.dtype)
 
         node_count = node_mask.sum(dim=1).clamp_min(1).to(dtype=updated_nodes.dtype).unsqueeze(-1)
         aggregated_nodes = updated_nodes.sum(dim=1) / node_count
         aggregated_edges = _masked_global_edge_normalized_sum(updated_edges, edge_mask)
-        global_inputs = torch.cat(
-            [
+        updated_global = _apply_partitioned_mlp(
+            self.global_model,
+            (
                 global_features,
                 aggregated_nodes,
                 aggregated_edges,
-            ],
-            dim=-1,
+            ),
+            (
+                int(global_features.size(-1)),
+                int(aggregated_nodes.size(-1)),
+                int(aggregated_edges.size(-1)),
+            ),
         )
-        updated_global = self.global_model(global_inputs)
         if squeeze_batch:
             return GraphTensorState(
                 global_features=updated_global.squeeze(0),
@@ -593,76 +653,100 @@ def extract_ego_subgraph(backbone_output: BackboneOutput, center_index: int) -> 
 
 
 def extract_batched_ego_subgraph(backbone_output: BackboneOutput, center_index: int) -> BatchedEgoSubgraph:
-    if backbone_output.node_embeddings.ndim != 3:
-        raise ValueError("extract_batched_ego_subgraph expects a batched BackboneOutput.")
-    batch_size, num_nodes, hidden_dim = backbone_output.node_embeddings.shape
-    if center_index < 0 or center_index >= num_nodes:
-        raise IndexError("center_index is out of range.")
+    flattened = extract_batched_center_chunk_ego_subgraphs(backbone_output, [center_index])
+    return BatchedEgoSubgraph(
+        center_index=center_index,
+        center_local_indices=flattened.center_local_indices,
+        member_indices=flattened.member_indices,
+        local_node_features=flattened.local_node_features,
+        local_node_mask=flattened.local_node_mask,
+        local_edge_features=flattened.local_edge_features,
+        local_edge_mask=flattened.local_edge_mask,
+        local_global_features=flattened.local_global_features,
+        pool_value=flattened.pool_value,
+    )
 
-    member_mask = backbone_output.ego_mask[:, center_index, :]
-    if not torch.all(member_mask.any(dim=1)):
+
+def ensure_batched_backbone_output(backbone_output: BackboneOutput) -> BackboneOutput:
+    if backbone_output.node_embeddings.ndim == 3:
+        return backbone_output
+    if backbone_output.node_embeddings.ndim != 2:
+        raise ValueError("BackboneOutput node_embeddings must have rank 2 or 3.")
+    return BackboneOutput(
+        global_embedding=backbone_output.global_embedding.unsqueeze(0),
+        node_embeddings=backbone_output.node_embeddings.unsqueeze(0),
+        edge_embeddings=backbone_output.edge_embeddings.unsqueeze(0),
+        edge_mask=backbone_output.edge_mask.unsqueeze(0),
+        node_mask=backbone_output.node_mask.unsqueeze(0),
+        ego_mask=backbone_output.ego_mask.unsqueeze(0),
+        pool_values=backbone_output.pool_values.unsqueeze(0),
+    )
+
+
+def extract_batched_center_chunk_ego_subgraphs(
+    backbone_output: BackboneOutput,
+    center_indices: Sequence[int] | Tensor,
+) -> FlattenedBatchedEgoSubgraphs:
+    backbone_output = ensure_batched_backbone_output(backbone_output)
+    batch_size, num_nodes, hidden_dim = backbone_output.node_embeddings.shape
+    device = backbone_output.node_embeddings.device
+    center_indices_tensor = torch.as_tensor(center_indices, dtype=torch.int64, device=device)
+    if center_indices_tensor.ndim != 1 or center_indices_tensor.numel() == 0:
+        raise ValueError("center_indices must be a non-empty 1D tensor or sequence.")
+    if int(center_indices_tensor.min().item()) < 0 or int(center_indices_tensor.max().item()) >= num_nodes:
+        raise IndexError("center_indices contain an out-of-range value.")
+
+    num_centers = int(center_indices_tensor.numel())
+    member_mask = backbone_output.ego_mask[:, center_indices_tensor, :]
+    member_mask_flat = member_mask.reshape(batch_size * num_centers, num_nodes)
+    if not torch.all(member_mask_flat.any(dim=1)):
         raise RuntimeError("Each batched ego-subgraph must contain at least the center node.")
 
-    base_indices = torch.arange(num_nodes, device=backbone_output.node_embeddings.device).unsqueeze(0).expand(batch_size, -1)
-    masked_order = torch.where(member_mask, base_indices, base_indices + num_nodes)
+    base_indices = torch.arange(num_nodes, device=device).unsqueeze(0).expand(batch_size * num_centers, -1)
+    masked_order = torch.where(member_mask_flat, base_indices, base_indices + num_nodes)
     sorted_member_indices = masked_order.argsort(dim=1)
-    member_counts = member_mask.sum(dim=1)
+    member_counts = member_mask_flat.sum(dim=1)
     max_members = int(member_counts.max().item())
     member_indices = sorted_member_indices[:, :max_members]
-    local_node_mask = torch.gather(member_mask, 1, member_indices)
+    local_node_mask = torch.gather(member_mask_flat, 1, member_indices)
 
-    gather_nodes = member_indices.unsqueeze(-1).expand(batch_size, max_members, hidden_dim)
-    local_node_embeddings = torch.gather(backbone_output.node_embeddings, 1, gather_nodes)
+    expanded_node_embeddings = backbone_output.node_embeddings.unsqueeze(1).expand(batch_size, num_centers, num_nodes, hidden_dim)
+    expanded_node_embeddings = expanded_node_embeddings.reshape(batch_size * num_centers, num_nodes, hidden_dim)
+    gather_nodes = member_indices.unsqueeze(-1).expand(batch_size * num_centers, max_members, hidden_dim)
+    local_node_embeddings = torch.gather(expanded_node_embeddings, 1, gather_nodes)
 
-    gather_edge_rows = member_indices.unsqueeze(-1).unsqueeze(-1).expand(
-        batch_size,
-        max_members,
-        num_nodes,
-        hidden_dim,
-    )
-    selected_edge_rows = torch.gather(backbone_output.edge_embeddings, 1, gather_edge_rows)
-    gather_edge_cols = member_indices.unsqueeze(1).unsqueeze(-1).expand(
-        batch_size,
-        max_members,
-        max_members,
-        hidden_dim,
-    )
-    local_edge_features = torch.gather(selected_edge_rows, 2, gather_edge_cols)
+    batch_indices = torch.arange(batch_size, device=device, dtype=torch.int64).unsqueeze(1).expand(batch_size, num_centers).reshape(-1)
+    flat_center_indices = center_indices_tensor.unsqueeze(0).expand(batch_size, num_centers).reshape(-1)
+    row_indices = member_indices.unsqueeze(2).expand(batch_size * num_centers, max_members, max_members)
+    col_indices = member_indices.unsqueeze(1).expand(batch_size * num_centers, max_members, max_members)
+    local_edge_features = backbone_output.edge_embeddings[batch_indices[:, None, None], row_indices, col_indices]
+    local_edge_mask = backbone_output.edge_mask[batch_indices[:, None, None], row_indices, col_indices]
+    local_edge_mask = local_edge_mask & local_node_mask.unsqueeze(1) & local_node_mask.unsqueeze(2)
 
-    gather_edge_mask_rows = member_indices.unsqueeze(-1).expand(batch_size, max_members, num_nodes)
-    selected_edge_mask_rows = torch.gather(backbone_output.edge_mask, 1, gather_edge_mask_rows)
-    gather_edge_mask_cols = member_indices.unsqueeze(1).expand(batch_size, max_members, max_members)
-    local_edge_mask = torch.gather(selected_edge_mask_rows, 2, gather_edge_mask_cols)
-    local_edge_mask = (
-        local_edge_mask
-        & local_node_mask.unsqueeze(1)
-        & local_node_mask.unsqueeze(2)
-    )
-
-    center_local_matches = (member_indices == center_index) & local_node_mask
+    center_local_matches = (member_indices == flat_center_indices.unsqueeze(1)) & local_node_mask
     if not torch.all(center_local_matches.any(dim=1)):
         raise RuntimeError("Failed to identify the center node inside a batched ego-subgraph.")
     center_local_indices = center_local_matches.to(dtype=torch.int64).argmax(dim=1)
 
     center_indicator = torch.zeros(
-        (batch_size, max_members, 1),
+        (batch_size * num_centers, max_members, 1),
         dtype=local_node_embeddings.dtype,
-        device=local_node_embeddings.device,
+        device=device,
     )
     center_indicator[
-        torch.arange(batch_size, device=local_node_embeddings.device),
+        torch.arange(batch_size * num_centers, device=device),
         center_local_indices,
         0,
     ] = 1.0
     center_indicator = center_indicator * local_node_mask.unsqueeze(-1).to(dtype=local_node_embeddings.dtype)
     local_node_features = torch.cat([local_node_embeddings, center_indicator], dim=-1)
 
-    pool_value = backbone_output.pool_values[:, center_index]
+    pool_value = backbone_output.pool_values[batch_indices, flat_center_indices]
     ego_size = local_node_mask.sum(dim=1).to(dtype=local_node_embeddings.dtype).unsqueeze(-1)
-    center_nodes = backbone_output.node_embeddings[:, center_index, :]
+    center_nodes = backbone_output.node_embeddings[batch_indices, flat_center_indices]
     local_global_features = torch.cat(
         [
-            backbone_output.global_embedding,
+            backbone_output.global_embedding[batch_indices],
             center_nodes,
             pool_value.unsqueeze(-1),
             ego_size,
@@ -670,8 +754,9 @@ def extract_batched_ego_subgraph(backbone_output: BackboneOutput, center_index: 
         dim=-1,
     )
 
-    return BatchedEgoSubgraph(
-        center_index=center_index,
+    return FlattenedBatchedEgoSubgraphs(
+        batch_indices=batch_indices,
+        center_indices=flat_center_indices,
         center_local_indices=center_local_indices,
         member_indices=member_indices,
         local_node_features=local_node_features,
@@ -698,7 +783,10 @@ class EgoLocalGraphNet(nn.Module):
             edge_output_dim=local_hidden_dim,
         )
 
-    def forward(self, ego_subgraph: EgoSubgraph | BatchedEgoSubgraph) -> LocalGraphOutput:
+    def forward(
+        self,
+        ego_subgraph: EgoSubgraph | BatchedEgoSubgraph | FlattenedBatchedEgoSubgraphs,
+    ) -> LocalGraphOutput:
         state = GraphTensorState(
             global_features=ego_subgraph.local_global_features,
             node_features=ego_subgraph.local_node_features,
@@ -739,8 +827,11 @@ class AllocationHead(nn.Module):
         super().__init__()
         self.temperature = float(temperature)
 
+    def logits(self, scores: Tensor) -> Tensor:
+        return scores / self.temperature
+
     def forward(self, scores: Tensor, pool_value: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        logits = scores / self.temperature
+        logits = self.logits(scores)
         allocation = torch.softmax(logits, dim=-1)
         if pool_value.ndim > 0:
             transferred = allocation * pool_value.unsqueeze(-1)
@@ -809,9 +900,41 @@ class GNNAllocationPolicy(nn.Module):
     def encode_graph_batch(self, graph_input: GraphTensorInput) -> BackboneOutput:
         return self.backbone(graph_input)
 
-    def _forward_batched_graph_input(self, graph_input: GraphTensorInput) -> BatchedPolicyOutput:
-        backbone_output = self.encode_graph_batch(graph_input)
+    def _rollout_logits_from_batched_backbone_output(self, backbone_output: BackboneOutput) -> Tensor:
+        backbone_output = ensure_batched_backbone_output(backbone_output)
+        batch_size, num_nodes = backbone_output.node_embeddings.shape[:2]
+        dtype = backbone_output.node_embeddings.dtype
+        device = backbone_output.node_embeddings.device
+        masked_score_value = torch.finfo(dtype).min
+        score_matrix = torch.full((batch_size, num_nodes, num_nodes), masked_score_value, dtype=dtype, device=device)
+        ego_subgraph = extract_batched_center_chunk_ego_subgraphs(
+            backbone_output,
+            torch.arange(num_nodes, device=device, dtype=torch.int64),
+        )
+        local_output = self.local_graph_net(ego_subgraph)
+        flat_indices = torch.arange(ego_subgraph.member_indices.size(0), device=device)
+        center_embedding = local_output.node_embeddings[flat_indices, ego_subgraph.center_local_indices]
+        local_scores = self.score_readout(local_output.node_embeddings, center_embedding)
+        valid_local_nodes = ego_subgraph.local_node_mask & local_output.node_mask
+        local_scores = torch.where(
+            valid_local_nodes,
+            local_scores,
+            torch.full_like(local_scores, masked_score_value),
+        )
+        local_logits = self.allocation_head.logits(local_scores)
 
+        scatter_batch_indices = ego_subgraph.batch_indices.unsqueeze(1).expand_as(ego_subgraph.member_indices)
+        scatter_center_indices = ego_subgraph.center_indices.unsqueeze(1).expand_as(ego_subgraph.member_indices)
+        score_matrix[
+            scatter_batch_indices[valid_local_nodes],
+            scatter_center_indices[valid_local_nodes],
+            ego_subgraph.member_indices[valid_local_nodes],
+        ] = local_logits[valid_local_nodes]
+
+        return score_matrix
+
+    def _forward_batched_backbone_output(self, backbone_output: BackboneOutput) -> BatchedPolicyOutput:
+        backbone_output = ensure_batched_backbone_output(backbone_output)
         batch_size, num_nodes = backbone_output.node_embeddings.shape[:2]
         dtype = backbone_output.node_embeddings.dtype
         device = backbone_output.node_embeddings.device
@@ -819,41 +942,43 @@ class GNNAllocationPolicy(nn.Module):
         allocation_matrix = torch.zeros((batch_size, num_nodes, num_nodes), dtype=dtype, device=device)
         transferred_resources = torch.zeros_like(allocation_matrix)
         score_matrix = torch.full((batch_size, num_nodes, num_nodes), masked_score_value, dtype=dtype, device=device)
-        batch_indices = torch.arange(batch_size, device=device)
+        ego_subgraph = extract_batched_center_chunk_ego_subgraphs(
+            backbone_output,
+            torch.arange(num_nodes, device=device, dtype=torch.int64),
+        )
+        local_output = self.local_graph_net(ego_subgraph)
+        flat_indices = torch.arange(ego_subgraph.member_indices.size(0), device=device)
+        center_embedding = local_output.node_embeddings[flat_indices, ego_subgraph.center_local_indices]
+        local_scores = self.score_readout(local_output.node_embeddings, center_embedding)
+        valid_local_nodes = ego_subgraph.local_node_mask & local_output.node_mask
+        local_scores = torch.where(
+            valid_local_nodes,
+            local_scores,
+            torch.full_like(local_scores, masked_score_value),
+        )
+        local_logits, local_allocation, local_transferred = self.allocation_head(
+            local_scores,
+            ego_subgraph.pool_value,
+        )
 
-        for center_index in range(num_nodes):
-            ego_subgraph = extract_batched_ego_subgraph(backbone_output, center_index=center_index)
-            local_output = self.local_graph_net(ego_subgraph)
-            center_embedding = local_output.node_embeddings[batch_indices, ego_subgraph.center_local_indices]
-            local_scores = self.score_readout(local_output.node_embeddings, center_embedding)
-            valid_local_nodes = ego_subgraph.local_node_mask & local_output.node_mask
-            local_scores = torch.where(
-                valid_local_nodes,
-                local_scores,
-                torch.full_like(local_scores, masked_score_value),
-            )
-            local_logits, local_allocation, local_transferred = self.allocation_head(
-                local_scores,
-                ego_subgraph.pool_value,
-            )
-
-            scatter_batch_indices = batch_indices.unsqueeze(1).expand_as(ego_subgraph.member_indices)
-            valid_positions = valid_local_nodes
-            allocation_matrix[
-                scatter_batch_indices[valid_positions],
-                center_index,
-                ego_subgraph.member_indices[valid_positions],
-            ] = local_allocation[valid_positions]
-            transferred_resources[
-                scatter_batch_indices[valid_positions],
-                center_index,
-                ego_subgraph.member_indices[valid_positions],
-            ] = local_transferred[valid_positions]
-            score_matrix[
-                scatter_batch_indices[valid_positions],
-                center_index,
-                ego_subgraph.member_indices[valid_positions],
-            ] = local_logits[valid_positions]
+        scatter_batch_indices = ego_subgraph.batch_indices.unsqueeze(1).expand_as(ego_subgraph.member_indices)
+        scatter_center_indices = ego_subgraph.center_indices.unsqueeze(1).expand_as(ego_subgraph.member_indices)
+        valid_positions = valid_local_nodes
+        allocation_matrix[
+            scatter_batch_indices[valid_positions],
+            scatter_center_indices[valid_positions],
+            ego_subgraph.member_indices[valid_positions],
+        ] = local_allocation[valid_positions]
+        transferred_resources[
+            scatter_batch_indices[valid_positions],
+            scatter_center_indices[valid_positions],
+            ego_subgraph.member_indices[valid_positions],
+        ] = local_transferred[valid_positions]
+        score_matrix[
+            scatter_batch_indices[valid_positions],
+            scatter_center_indices[valid_positions],
+            ego_subgraph.member_indices[valid_positions],
+        ] = local_logits[valid_positions]
 
         value = self.critic(backbone_output.global_embedding)
         incoming_resources = transferred_resources.sum(dim=1)
@@ -865,6 +990,10 @@ class GNNAllocationPolicy(nn.Module):
             logits=score_matrix,
         )
 
+    def _forward_batched_graph_input(self, graph_input: GraphTensorInput) -> BatchedPolicyOutput:
+        backbone_output = self.encode_graph_batch(graph_input)
+        return self._forward_batched_backbone_output(backbone_output)
+
     def _forward_batch_same_size(self, observations: Sequence[Observation]) -> BatchedPolicyOutput:
         if not observations:
             raise ValueError("observations must contain at least one item.")
@@ -872,50 +1001,43 @@ class GNNAllocationPolicy(nn.Module):
         graph_input = self.build_graph_input_batch(observations)
         return self._forward_batched_graph_input(graph_input)
 
+    def rollout_logits_batch(self, observations: Sequence[Observation]) -> Tensor:
+        if not observations:
+            raise ValueError("observations must contain at least one item.")
+        graph_input = self.build_graph_input_batch(observations)
+        backbone_output = self.encode_graph_batch(graph_input)
+        return self._rollout_logits_from_batched_backbone_output(backbone_output)
+
+    def rollout_logits_tensor_batch(self, observations: Mapping[str, Tensor]) -> Tensor:
+        device = next(self.parameters()).device
+        graph_input = self.graph_builder.build_tensor_batch(observations, device=device)
+        backbone_output = self.encode_graph_batch(graph_input)
+        return self._rollout_logits_from_batched_backbone_output(backbone_output)
+
     def forward_tensor_batch(self, observations: Mapping[str, Tensor]) -> BatchedPolicyOutput:
         device = next(self.parameters()).device
         graph_input = self.graph_builder.build_tensor_batch(observations, device=device)
         return self._forward_batched_graph_input(graph_input)
 
+    def rollout_logits(self, observation: Observation) -> Tensor:
+        graph_input = self.build_graph_input(observation)
+        backbone_output = self.encode_graph(graph_input)
+        return self._rollout_logits_from_batched_backbone_output(backbone_output).squeeze(0)
+
     def forward(self, observation: Observation) -> PolicyOutput:
         graph_input = self.build_graph_input(observation)
         backbone_output = self.encode_graph(graph_input)
-
-        num_nodes = backbone_output.node_embeddings.size(0)
-        dtype = backbone_output.node_embeddings.dtype
-        device = backbone_output.node_embeddings.device
-        masked_score_value = torch.finfo(dtype).min
-
-        allocation_matrix = torch.zeros((num_nodes, num_nodes), dtype=dtype, device=device)
-        transferred_resources = torch.zeros_like(allocation_matrix)
-        score_matrix = torch.full((num_nodes, num_nodes), masked_score_value, dtype=dtype, device=device)
-
-        for center_index in range(num_nodes):
-            ego_subgraph = extract_ego_subgraph(backbone_output, center_index=center_index)
-            local_output = self.local_graph_net(ego_subgraph)
-            center_embedding = local_output.node_embeddings[ego_subgraph.center_local_index]
-            local_scores = self.score_readout(local_output.node_embeddings, center_embedding)
-            local_logits, local_allocation, local_transferred = self.allocation_head(
-                local_scores,
-                ego_subgraph.pool_value,
-            )
-
-            allocation_matrix[center_index, ego_subgraph.member_indices] = local_allocation
-            transferred_resources[center_index, ego_subgraph.member_indices] = local_transferred
-            score_matrix[center_index, ego_subgraph.member_indices] = local_logits
-
-        value = self.critic(backbone_output.global_embedding)
-        incoming_resources = transferred_resources.sum(dim=0)
-        zero_scalar = value.new_zeros(())
+        batched_output = self._forward_batched_backbone_output(backbone_output)
+        zero_scalar = batched_output.value[0].new_zeros(())
 
         return PolicyOutput(
-            allocation_matrix=allocation_matrix,
-            transferred_resources=transferred_resources,
-            incoming_resources=incoming_resources,
-            value=value,
+            allocation_matrix=batched_output.allocation_matrix[0],
+            transferred_resources=batched_output.transferred_resources[0],
+            incoming_resources=batched_output.incoming_resources[0],
+            value=batched_output.value[0],
             log_prob=zero_scalar,
             entropy=zero_scalar,
-            logits=score_matrix,
+            logits=batched_output.logits[0] if batched_output.logits is not None else None,
             concentration=None,
             global_embedding=backbone_output.global_embedding,
             node_embeddings=backbone_output.node_embeddings,

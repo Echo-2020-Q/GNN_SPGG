@@ -29,7 +29,7 @@ from Project1.policies.rule_based import (
 )
 
 from .config import DomainRandomizationConfig, GraphTD3Config, WorkerConfig
-from .data import REPLAY_OBSERVATION_DTYPES, TensorActionRecord, TensorReplayBatch, TensorTransition, stack_tensor_transitions
+from .data import REPLAY_OBSERVATION_DTYPES, TensorActionRecord, TensorReplayActionRecord, TensorReplayBatch, TensorTransition, stack_tensor_transitions
 from .exploration import LogitSpaceExplorer
 
 
@@ -66,6 +66,17 @@ def _serialize_inference_observation(observation: Mapping[str, Any]) -> dict[str
     return payload
 
 
+def _slice_action_record(action: TensorActionRecord, index: int) -> TensorActionRecord:
+    return TensorActionRecord(
+        logits=action.logits[index],
+        allocation=action.allocation[index],
+        transfers=action.transfers[index],
+        incoming=action.incoming[index],
+        ego_mask=action.ego_mask[index],
+        pool_values=action.pool_values[index],
+    )
+
+
 class RolloutInferenceClient:
     def __init__(
         self,
@@ -80,10 +91,16 @@ class RolloutInferenceClient:
         self._worker_id = worker_id
 
     def infer_logits(self, observation: Mapping[str, Any]) -> tuple[torch.Tensor, int]:
+        logits_batch, batch_size = self.infer_logits_batch([observation])
+        return logits_batch[0], batch_size
+
+    def infer_logits_batch(self, observations: list[Mapping[str, Any]]) -> tuple[torch.Tensor, int]:
+        if not observations:
+            raise ValueError("observations must contain at least one item.")
         self._connection.send(
             {
-                "command": "infer_logits",
-                "observation": _serialize_inference_observation(observation),
+                "command": "infer_logits_batch",
+                "observations": [_serialize_inference_observation(observation) for observation in observations],
             }
         )
         if not self._connection.poll(self._timeout_seconds):
@@ -179,12 +196,7 @@ def _serialize_replay_batch_to_shared_memory(batch: TensorReplayBatch) -> tuple[
         {
             "obs": {key: _store_tensor(value) for key, value in batch.obs.items()},
             "action": {
-                "logits": _store_tensor(batch.action.logits),
                 "allocation": _store_tensor(batch.action.allocation),
-                "transfers": _store_tensor(batch.action.transfers),
-                "incoming": _store_tensor(batch.action.incoming),
-                "ego_mask": _store_tensor(batch.action.ego_mask),
-                "pool_values": _store_tensor(batch.action.pool_values),
             },
             "reward": _store_tensor(batch.reward),
             "next_obs": {key: _store_tensor(value) for key, value in batch.next_obs.items()},
@@ -207,13 +219,8 @@ def _deserialize_replay_batch_from_shared_memory(
     try:
         batch = TensorReplayBatch(
             obs={key: _load_tensor(value) for key, value in dict(payload["obs"]).items()},
-            action=TensorActionRecord(
-                logits=_load_tensor(payload["action"]["logits"]),
+            action=TensorReplayActionRecord(
                 allocation=_load_tensor(payload["action"]["allocation"]),
-                transfers=_load_tensor(payload["action"]["transfers"]),
-                incoming=_load_tensor(payload["action"]["incoming"]),
-                ego_mask=_load_tensor(payload["action"]["ego_mask"]),
-                pool_values=_load_tensor(payload["action"]["pool_values"]),
             ),
             reward=_load_tensor(payload["reward"]),
             next_obs={key: _load_tensor(value) for key, value in dict(payload["next_obs"]).items()},
@@ -353,16 +360,17 @@ class RolloutWorker:
         self.device = torch.device(device)
         self.inference_client = inference_client
         self.rng = np.random.default_rng(config.seed)
+        self.num_envs_per_worker = int(config.num_envs_per_worker)
         self.total_env_steps = 0
         self.actor_version = 0
-        self.env: SPGGEnv | None = None
-        self.env_metadata: dict[str, Any] = {}
-        self.observation: dict[str, np.ndarray] | None = None
+        self.envs: list[SPGGEnv | None] = [None for _ in range(self.num_envs_per_worker)]
+        self.env_metadatas: list[dict[str, Any]] = [{} for _ in range(self.num_envs_per_worker)]
+        self.observations: list[dict[str, np.ndarray] | None] = [None for _ in range(self.num_envs_per_worker)]
         self.uniform_policy = UniformAllocationPolicy()
         self.proportional_policy = ProportionalContributionPolicy()
         self.constant_mix_policy = ConstantMixAllocationPolicy(train_config.warmup_constant_mix_omega)
         self.pool_power_mix_policy = PoolPowerMixAllocationPolicy(train_config.warmup_pool_power_k)
-        self.current_warmup_behavior_source: str | None = None
+        self.current_warmup_behavior_sources: list[str | None] = [None for _ in range(self.num_envs_per_worker)]
 
     def sync_actor(self, actor_state_dict: dict[str, torch.Tensor], version: int) -> None:
         self.actor.load_state_dict(_deserialize_module_state(actor_state_dict))
@@ -372,10 +380,10 @@ class RolloutWorker:
     def set_env_factory(self, env_factory: RandomizedEnvFactory, reset_environment: bool = True) -> None:
         self.env_factory = env_factory
         if reset_environment:
-            self.env = None
-            self.env_metadata = {}
-            self.observation = None
-            self.current_warmup_behavior_source = None
+            self.envs = [None for _ in range(self.num_envs_per_worker)]
+            self.env_metadatas = [{} for _ in range(self.num_envs_per_worker)]
+            self.observations = [None for _ in range(self.num_envs_per_worker)]
+            self.current_warmup_behavior_sources = [None for _ in range(self.num_envs_per_worker)]
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -383,20 +391,20 @@ class RolloutWorker:
                 "worker_id": int(self.config.worker_id),
                 "seed": int(self.config.seed),
                 "rollout_steps_per_sync": int(self.config.rollout_steps_per_sync),
+                "num_envs_per_worker": int(self.config.num_envs_per_worker),
                 "noise_scale_multiplier": float(self.config.noise_scale_multiplier),
             },
             "rng_state": self.rng.bit_generator.state,
             "total_env_steps": int(self.total_env_steps),
             "actor_version": int(self.actor_version),
             "actor_state_dict": _serialize_module_state(_copy_module_state_to_cpu(self.actor)),
-            "env_metadata": dict(self.env_metadata),
-            "observation": (
-                {key: np.asarray(value).copy() for key, value in self.observation.items()}
-                if self.observation is not None
-                else None
-            ),
-            "env_state": self.env.state_dict() if self.env is not None else None,
-            "current_warmup_behavior_source": self.current_warmup_behavior_source,
+            "env_metadata_list": [dict(item) for item in self.env_metadatas],
+            "observation_list": [
+                ({key: np.asarray(value).copy() for key, value in observation.items()} if observation is not None else None)
+                for observation in self.observations
+            ],
+            "env_state_list": [env.state_dict() if env is not None else None for env in self.envs],
+            "current_warmup_behavior_source_list": list(self.current_warmup_behavior_sources),
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -406,20 +414,41 @@ class RolloutWorker:
         self.actor_version = int(state_dict["actor_version"])
         self.actor.load_state_dict(_deserialize_module_state(dict(state_dict["actor_state_dict"])))
         self.actor.eval()
-        self.env_metadata = dict(state_dict.get("env_metadata", {}))
-        observation = state_dict.get("observation")
-        self.observation = (
-            {key: np.asarray(value).copy() for key, value in observation.items()}
-            if observation is not None
-            else None
-        )
-        env_state = state_dict.get("env_state")
-        if env_state is None:
-            self.env = None
-        else:
-            self.env = SPGGEnv(self.env_factory.base_config, self.env_factory.base_graph)
-            self.env.load_state_dict(env_state)
-        self.current_warmup_behavior_source = state_dict.get("current_warmup_behavior_source")
+        env_metadata_list = state_dict.get("env_metadata_list")
+        if env_metadata_list is None:
+            env_metadata_list = [dict(state_dict.get("env_metadata", {}))]
+        observation_list = state_dict.get("observation_list")
+        if observation_list is None:
+            observation_list = [state_dict.get("observation")]
+        env_state_list = state_dict.get("env_state_list")
+        if env_state_list is None:
+            env_state_list = [state_dict.get("env_state")]
+        current_warmup_behavior_source_list = state_dict.get("current_warmup_behavior_source_list")
+        if current_warmup_behavior_source_list is None:
+            current_warmup_behavior_source_list = [state_dict.get("current_warmup_behavior_source")]
+
+        if len(env_state_list) != self.num_envs_per_worker:
+            raise ValueError(
+                "Checkpoint env count {0} does not match worker num_envs_per_worker {1}.".format(
+                    len(env_state_list),
+                    self.num_envs_per_worker,
+                )
+            )
+
+        self.env_metadatas = [dict(item) for item in env_metadata_list]
+        self.observations = [
+            ({key: np.asarray(value).copy() for key, value in observation.items()} if observation is not None else None)
+            for observation in observation_list
+        ]
+        self.envs = []
+        for env_state in env_state_list:
+            if env_state is None:
+                self.envs.append(None)
+            else:
+                env = SPGGEnv(self.env_factory.base_config, self.env_factory.base_graph)
+                env.load_state_dict(env_state)
+                self.envs.append(env)
+        self.current_warmup_behavior_sources = list(current_warmup_behavior_source_list)
 
     def collect(self, num_steps: int, global_warmup_steps: int = 0) -> RolloutResult:
         collect_start = perf_counter()
@@ -438,71 +467,113 @@ class RolloutWorker:
         inference_wait_seconds = 0.0
         local_policy_forward_seconds = 0.0
         inference_batch_sizes: list[int] = []
+        collected_steps = 0
 
-        for step_index in range(num_steps):
-            self._ensure_environment()
-            assert self.observation is not None
+        while collected_steps < num_steps:
+            batch_slots = list(range(min(self.num_envs_per_worker, num_steps - collected_steps)))
+            for slot_index in batch_slots:
+                self._ensure_environment(slot_index)
 
-            is_warmup = step_index < warmup_budget
-            behavior_source = "actor_logits"
+            actions_by_slot: dict[int, TensorActionRecord] = {}
+            actor_slots: list[int] = []
+            actor_observations: list[dict[str, np.ndarray]] = []
+            actor_behavior_sources: list[str] = []
+            actor_global_step_offsets: list[int] = []
 
-            if is_warmup:
-                behavior_source = self._resolve_warmup_behavior_source()
-                action = self._sample_warmup_action(behavior_source)
-            else:
+            for batch_offset, slot_index in enumerate(batch_slots):
+                observation = self.observations[slot_index]
+                assert observation is not None
+                is_warmup = (collected_steps + batch_offset) < warmup_budget
+                if is_warmup:
+                    behavior_source = self._resolve_warmup_behavior_source(slot_index)
+                    actions_by_slot[slot_index] = self._sample_warmup_action(observation, behavior_source)
+                    behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
+                    continue
+                actor_slots.append(slot_index)
+                actor_observations.append(observation)
+                actor_behavior_sources.append("actor_logits")
+                actor_global_step_offsets.append(batch_offset)
+
+            if actor_slots:
                 if self.inference_client is not None:
                     inference_wait_start = perf_counter()
-                    logits, inference_batch_size = self.inference_client.infer_logits(self.observation)
+                    logits_batch, inference_batch_size = self.inference_client.infer_logits_batch(actor_observations)
                     inference_wait_seconds += perf_counter() - inference_wait_start
                     inference_batch_sizes.append(int(inference_batch_size))
                 else:
                     policy_forward_start = perf_counter()
                     with torch.inference_mode():
-                        policy_output = self.actor.deterministic_action(self.observation)
+                        logits_batch = self.actor.rollout_logits_batch(actor_observations)
                     local_policy_forward_seconds += perf_counter() - policy_forward_start
-                    if policy_output.logits is None:
-                        raise ValueError("policy_output.logits is required for rollout exploration.")
-                    logits = policy_output.logits
-                    inference_batch_sizes.append(1)
-                noise_std = self.explorer.current_noise_std(
-                    base_std=self.train_config.rollout_logit_noise_std,
-                    step=self.total_env_steps,
-                    decay=self.train_config.rollout_noise_decay,
-                    multiplier=self.config.noise_scale_multiplier,
+                    inference_batch_sizes.append(len(actor_slots))
+
+                ego_mask_batch = torch.stack(
+                    [
+                        torch.as_tensor(self.observations[slot_index]["local_mask"], dtype=torch.bool, device=self.device)
+                        for slot_index in actor_slots
+                    ],
+                    dim=0,
                 )
-                action = self.explorer.apply_to_logits(
-                    logits=logits,
-                    ego_mask=torch.as_tensor(self.observation["local_mask"], dtype=torch.bool, device=self.device),
-                    pool_values=torch.as_tensor(self.observation["pool_grown"], dtype=torch.float32, device=self.device),
-                    noise_std=noise_std,
+                pool_values_batch = torch.stack(
+                    [
+                        torch.as_tensor(self.observations[slot_index]["pool_grown"], dtype=torch.float32, device=self.device)
+                        for slot_index in actor_slots
+                    ],
+                    dim=0,
+                )
+                noise_std_batch = [
+                    self.explorer.current_noise_std(
+                        base_std=self.train_config.rollout_logit_noise_std,
+                        step=self.total_env_steps + actor_global_step_offsets[actor_batch_index],
+                        decay=self.train_config.rollout_noise_decay,
+                        multiplier=self.config.noise_scale_multiplier,
+                    )
+                    for actor_batch_index in range(len(actor_slots))
+                ]
+                batched_action = self.explorer.apply_to_logits(
+                    logits=logits_batch,
+                    ego_mask=ego_mask_batch,
+                    pool_values=pool_values_batch,
+                    noise_std=noise_std_batch,
                     noise_clip=self.train_config.rollout_logit_noise_clip,
                 )
+                for actor_batch_index, slot_index in enumerate(actor_slots):
+                    actions_by_slot[slot_index] = _slice_action_record(batched_action, actor_batch_index)
+                    behavior_source = actor_behavior_sources[actor_batch_index]
+                    behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
 
-            behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
-            env_step_start = perf_counter()
-            next_observation, reward, done, info = self.env.step(action.allocation.detach().cpu().numpy())
-            env_step_seconds += perf_counter() - env_step_start
-            transition = TensorTransition.from_step(
-                obs=self.observation,
-                action=action,
-                reward=float(reward),
-                next_obs=next_observation,
-                done=bool(done),
-            )
-            transitions.append(transition)
+            for slot_index in batch_slots:
+                observation = self.observations[slot_index]
+                env = self.envs[slot_index]
+                action = actions_by_slot[slot_index]
+                assert observation is not None
+                assert env is not None
 
-            rewards.append(float(reward))
-            cooperation_rates.append(float(info.get("actual_cooperation_rate", np.asarray(next_observation["x_actual"]).mean())))
-            mean_resources.append(float(np.asarray(next_observation["resources"]).mean()))
-            gini_values.append(float(info.get("gini", np.asarray(next_observation["gini"]).item())))
-            mean_payoffs.append(float(np.asarray(info.get("payoff", np.zeros_like(next_observation["resources"]))).mean()))
-            mean_pool_growns.append(float(np.asarray(next_observation["pool_grown"]).mean()))
-            mean_pool_raws.append(float(np.asarray(next_observation["pool_raw"]).mean()))
-            self.total_env_steps += 1
-            self.observation = next_observation
-            if done:
-                completed_episodes += 1
-                self._reset_environment()
+                env_step_start = perf_counter()
+                next_observation, reward, done, info = env.step(action.allocation.detach().cpu().numpy())
+                env_step_seconds += perf_counter() - env_step_start
+                transition = TensorTransition.from_step(
+                    obs=observation,
+                    action=action,
+                    reward=float(reward),
+                    next_obs=next_observation,
+                    done=bool(done),
+                )
+                transitions.append(transition)
+
+                rewards.append(float(reward))
+                cooperation_rates.append(float(info.get("actual_cooperation_rate", np.asarray(next_observation["x_actual"]).mean())))
+                mean_resources.append(float(np.asarray(next_observation["resources"]).mean()))
+                gini_values.append(float(info.get("gini", np.asarray(next_observation["gini"]).item())))
+                mean_payoffs.append(float(np.asarray(info.get("payoff", np.zeros_like(next_observation["resources"]))).mean()))
+                mean_pool_growns.append(float(np.asarray(next_observation["pool_grown"]).mean()))
+                mean_pool_raws.append(float(np.asarray(next_observation["pool_raw"]).mean()))
+                self.total_env_steps += 1
+                collected_steps += 1
+                self.observations[slot_index] = next_observation
+                if done:
+                    completed_episodes += 1
+                    self._reset_environment(slot_index)
 
         metrics = {
             "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
@@ -526,24 +597,26 @@ class RolloutWorker:
         replay_batch = stack_tensor_transitions(transitions)
         return RolloutResult(replay_batch=replay_batch, metrics=metrics)
 
-    def _ensure_environment(self) -> None:
-        if self.env is None or self.observation is None:
-            self._reset_environment()
+    def _ensure_environment(self, slot_index: int) -> None:
+        if self.envs[slot_index] is None or self.observations[slot_index] is None:
+            self._reset_environment(slot_index)
 
-    def _reset_environment(self) -> None:
-        self.env, self.env_metadata = self.env_factory.sample_environment(self.rng)
+    def _reset_environment(self, slot_index: int) -> None:
+        env, env_metadata = self.env_factory.sample_environment(self.rng)
         reset_seed = int(self.rng.integers(0, 2**31 - 1))
-        self.observation = self.env.reset(seed=reset_seed)
-        self.current_warmup_behavior_source = None
+        self.envs[slot_index] = env
+        self.env_metadatas[slot_index] = env_metadata
+        self.observations[slot_index] = env.reset(seed=reset_seed)
+        self.current_warmup_behavior_sources[slot_index] = None
         if self.train_config.warmup_selection_granularity == "per_episode":
-            self.current_warmup_behavior_source = self._select_warmup_behavior_source()
+            self.current_warmup_behavior_sources[slot_index] = self._select_warmup_behavior_source()
 
-    def _resolve_warmup_behavior_source(self) -> str:
+    def _resolve_warmup_behavior_source(self, slot_index: int) -> str:
         if self.train_config.warmup_selection_granularity == "per_step":
             return self._select_warmup_behavior_source()
-        if self.current_warmup_behavior_source is None:
-            self.current_warmup_behavior_source = self._select_warmup_behavior_source()
-        return self.current_warmup_behavior_source
+        if self.current_warmup_behavior_sources[slot_index] is None:
+            self.current_warmup_behavior_sources[slot_index] = self._select_warmup_behavior_source()
+        return str(self.current_warmup_behavior_sources[slot_index])
 
     def _select_warmup_behavior_source(self) -> str:
         if self.train_config.warmup_behavior_mode == "random_only":
@@ -567,32 +640,31 @@ class RolloutWorker:
         weight_array = weight_array / weight_array.sum()
         return str(self.rng.choice(candidates, p=weight_array))
 
-    def _sample_warmup_action(self, behavior_source: str):
-        assert self.observation is not None
+    def _sample_warmup_action(self, observation: Mapping[str, Any], behavior_source: str):
 
         if behavior_source == "random_logits":
             return self.explorer.sample_random_logits_action(
-                ego_mask=self.observation["local_mask"],
-                pool_values=self.observation["pool_grown"],
+                ego_mask=observation["local_mask"],
+                pool_values=observation["pool_grown"],
                 rng=self.rng,
                 device=self.device,
             )
 
         if behavior_source == "uniform":
-            heuristic_allocation = self.uniform_policy.allocate(self.observation)
+            heuristic_allocation = self.uniform_policy.allocate(observation)
         elif behavior_source == "proportional":
-            heuristic_allocation = self.proportional_policy.allocate(self.observation)
+            heuristic_allocation = self.proportional_policy.allocate(observation)
         elif behavior_source == "constant_mix":
-            heuristic_allocation = self.constant_mix_policy.allocate(self.observation)
+            heuristic_allocation = self.constant_mix_policy.allocate(observation)
         elif behavior_source == "pool_power_mix":
-            heuristic_allocation = self.pool_power_mix_policy.allocate(self.observation)
+            heuristic_allocation = self.pool_power_mix_policy.allocate(observation)
         else:
             raise ValueError("Unsupported warm-up behavior source: {0}".format(behavior_source))
 
         return self.explorer.action_from_allocation(
             allocation=heuristic_allocation,
-            ego_mask=self.observation["local_mask"],
-            pool_values=self.observation["pool_grown"],
+            ego_mask=observation["local_mask"],
+            pool_values=observation["pool_grown"],
             noise_std=self.train_config.warmup_logit_noise_std,
             noise_clip=self.train_config.warmup_logit_noise_clip,
             device=self.device,
@@ -623,32 +695,46 @@ def _parallel_rollout_inference_server_main(
         except (BrokenPipeError, EOFError, OSError):
             pass
 
-    def _process_pending_requests(pending_requests: list[tuple[Any, dict[str, np.ndarray]]]) -> None:
+    def _process_pending_requests(pending_requests: list[tuple[Any, list[dict[str, np.ndarray]]]]) -> None:
         if not pending_requests:
             return
-        grouped_requests: dict[int, list[tuple[Any, dict[str, np.ndarray]]]] = {}
-        for connection, observation in pending_requests:
-            num_nodes = int(np.asarray(observation["local_mask"]).shape[0])
-            grouped_requests.setdefault(num_nodes, []).append((connection, observation))
+        grouped_requests: dict[int, dict[str, Any]] = {}
+        for connection, observations in pending_requests:
+            if not observations:
+                _send_error(connection, ValueError("Inference request observations must contain at least one item."))
+                continue
+            num_nodes = int(np.asarray(observations[0]["local_mask"]).shape[0])
+            if any(int(np.asarray(observation["local_mask"]).shape[0]) != num_nodes for observation in observations):
+                _send_error(connection, ValueError("Inference request observations must all have the same node count."))
+                continue
+            group = grouped_requests.setdefault(
+                num_nodes,
+                {
+                    "observations": [],
+                    "requests": [],
+                },
+            )
+            start_index = len(group["observations"])
+            group["observations"].extend(observations)
+            end_index = len(group["observations"])
+            group["requests"].append((connection, start_index, end_index))
 
         try:
             with torch.inference_mode():
                 for group in grouped_requests.values():
-                    observations = [observation for _, observation in group]
+                    observations = list(group["observations"])
                     if len(observations) == 1:
-                        outputs = [actor.deterministic_action(observations[0])]
+                        logits_batch = actor.rollout_logits(observations[0]).unsqueeze(0)
                     else:
-                        outputs = actor.deterministic_action_batch(observations)
+                        logits_batch = actor.rollout_logits_batch(observations)
                     batch_size = len(observations)
-                    for (connection, _), output in zip(group, outputs):
-                        if output.logits is None:
-                            raise ValueError("policy_output.logits is required for centralized rollout inference.")
+                    for connection, start_index, end_index in group["requests"]:
                         try:
                             connection.send(
                                 {
                                     "status": "ok",
                                     "payload": {
-                                        "logits": output.logits.detach().cpu().numpy().copy(),
+                                        "logits": logits_batch[start_index:end_index].detach().cpu().numpy().copy(),
                                         "batch_size": int(batch_size),
                                     },
                                 }
@@ -662,7 +748,7 @@ def _parallel_rollout_inference_server_main(
     try:
         while True:
             ready_connections = list(wait(all_connections))
-            pending_requests: list[tuple[Any, dict[str, np.ndarray]]] = []
+            pending_requests: list[tuple[Any, list[dict[str, np.ndarray]]]] = []
             should_close = False
 
             while True:
@@ -673,7 +759,10 @@ def _parallel_rollout_inference_server_main(
                         continue
                     command = str(message["command"])
                     if command == "infer_logits":
-                        pending_requests.append((connection, dict(message["observation"])))
+                        pending_requests.append((connection, [dict(message["observation"])]))
+                        continue
+                    if command == "infer_logits_batch":
+                        pending_requests.append((connection, [dict(item) for item in message["observations"]]))
                         continue
                     if command == "sync_actor":
                         try:

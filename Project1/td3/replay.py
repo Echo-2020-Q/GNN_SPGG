@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .data import TensorActionRecord, TensorReplayBatch, TensorTransition, Transition
+from .data import TensorReplayActionRecord, TensorReplayBatch, TensorTransition, Transition
 
 
 class ReplayBuffer:
@@ -39,12 +39,7 @@ class ReplayBuffer:
             for key, value in transition.next_obs.items()
         }
         self._action_buffers = {
-            "logits": torch.empty((self.capacity, *tuple(transition.action.logits.shape)), dtype=transition.action.logits.dtype, device="cpu"),
             "allocation": torch.empty((self.capacity, *tuple(transition.action.allocation.shape)), dtype=transition.action.allocation.dtype, device="cpu"),
-            "transfers": torch.empty((self.capacity, *tuple(transition.action.transfers.shape)), dtype=transition.action.transfers.dtype, device="cpu"),
-            "incoming": torch.empty((self.capacity, *tuple(transition.action.incoming.shape)), dtype=transition.action.incoming.dtype, device="cpu"),
-            "ego_mask": torch.empty((self.capacity, *tuple(transition.action.ego_mask.shape)), dtype=transition.action.ego_mask.dtype, device="cpu"),
-            "pool_values": torch.empty((self.capacity, *tuple(transition.action.pool_values.shape)), dtype=transition.action.pool_values.dtype, device="cpu"),
         }
         self._reward_buffer = torch.empty(self.capacity, dtype=transition.reward.dtype, device="cpu")
         self._done_buffer = torch.empty(self.capacity, dtype=transition.done.dtype, device="cpu")
@@ -59,12 +54,7 @@ class ReplayBuffer:
             for key, value in batch.next_obs.items()
         }
         self._action_buffers = {
-            "logits": torch.empty((self.capacity, *tuple(batch.action.logits.shape[1:])), dtype=batch.action.logits.dtype, device="cpu"),
             "allocation": torch.empty((self.capacity, *tuple(batch.action.allocation.shape[1:])), dtype=batch.action.allocation.dtype, device="cpu"),
-            "transfers": torch.empty((self.capacity, *tuple(batch.action.transfers.shape[1:])), dtype=batch.action.transfers.dtype, device="cpu"),
-            "incoming": torch.empty((self.capacity, *tuple(batch.action.incoming.shape[1:])), dtype=batch.action.incoming.dtype, device="cpu"),
-            "ego_mask": torch.empty((self.capacity, *tuple(batch.action.ego_mask.shape[1:])), dtype=batch.action.ego_mask.dtype, device="cpu"),
-            "pool_values": torch.empty((self.capacity, *tuple(batch.action.pool_values.shape[1:])), dtype=batch.action.pool_values.dtype, device="cpu"),
         }
         self._reward_buffer = torch.empty(self.capacity, dtype=batch.reward.dtype, device="cpu")
         self._done_buffer = torch.empty(self.capacity, dtype=batch.done.dtype, device="cpu")
@@ -93,12 +83,7 @@ class ReplayBuffer:
                 raise ValueError("Next-observation field '{0}' is incompatible with replay buffer schema.".format(key))
 
         action_fields = {
-            "logits": transition.action.logits,
             "allocation": transition.action.allocation,
-            "transfers": transition.action.transfers,
-            "incoming": transition.action.incoming,
-            "ego_mask": transition.action.ego_mask,
-            "pool_values": transition.action.pool_values,
         }
         for key, value in action_fields.items():
             buffer = self._action_buffers[key]
@@ -111,12 +96,7 @@ class ReplayBuffer:
         for key, value in transition.next_obs.items():
             self._next_obs_buffers[key][index].copy_(value)
 
-        self._action_buffers["logits"][index].copy_(transition.action.logits)
         self._action_buffers["allocation"][index].copy_(transition.action.allocation)
-        self._action_buffers["transfers"][index].copy_(transition.action.transfers)
-        self._action_buffers["incoming"][index].copy_(transition.action.incoming)
-        self._action_buffers["ego_mask"][index].copy_(transition.action.ego_mask)
-        self._action_buffers["pool_values"][index].copy_(transition.action.pool_values)
         assert self._reward_buffer is not None
         assert self._done_buffer is not None
         self._reward_buffer[index] = transition.reward
@@ -139,12 +119,7 @@ class ReplayBuffer:
                 raise ValueError("Next-observation batch field '{0}' is incompatible with replay buffer schema.".format(key))
 
         action_fields = {
-            "logits": batch.action.logits,
             "allocation": batch.action.allocation,
-            "transfers": batch.action.transfers,
-            "incoming": batch.action.incoming,
-            "ego_mask": batch.action.ego_mask,
-            "pool_values": batch.action.pool_values,
         }
         for key, value in action_fields.items():
             buffer = self._action_buffers[key]
@@ -157,12 +132,7 @@ class ReplayBuffer:
         for key, value in batch.next_obs.items():
             self._next_obs_buffers[key].index_copy_(0, indices, value)
 
-        self._action_buffers["logits"].index_copy_(0, indices, batch.action.logits)
         self._action_buffers["allocation"].index_copy_(0, indices, batch.action.allocation)
-        self._action_buffers["transfers"].index_copy_(0, indices, batch.action.transfers)
-        self._action_buffers["incoming"].index_copy_(0, indices, batch.action.incoming)
-        self._action_buffers["ego_mask"].index_copy_(0, indices, batch.action.ego_mask)
-        self._action_buffers["pool_values"].index_copy_(0, indices, batch.action.pool_values)
         assert self._reward_buffer is not None
         assert self._done_buffer is not None
         self._reward_buffer.index_copy_(0, indices, batch.reward)
@@ -171,12 +141,7 @@ class ReplayBuffer:
     @staticmethod
     def _batch_is_cpu(batch: TensorReplayBatch) -> bool:
         tensors = list(batch.obs.values()) + [
-            batch.action.logits,
             batch.action.allocation,
-            batch.action.transfers,
-            batch.action.incoming,
-            batch.action.ego_mask,
-            batch.action.pool_values,
             batch.reward,
             batch.done,
         ] + list(batch.next_obs.values())
@@ -225,13 +190,8 @@ class ReplayBuffer:
             )
             obs = {key: buffer.index_select(0, indices) for key, buffer in self._obs_buffers.items()}
             next_obs = {key: buffer.index_select(0, indices) for key, buffer in self._next_obs_buffers.items()}
-            action = TensorActionRecord(
-                logits=self._action_buffers["logits"].index_select(0, indices),
+            action = TensorReplayActionRecord(
                 allocation=self._action_buffers["allocation"].index_select(0, indices),
-                transfers=self._action_buffers["transfers"].index_select(0, indices),
-                incoming=self._action_buffers["incoming"].index_select(0, indices),
-                ego_mask=self._action_buffers["ego_mask"].index_select(0, indices),
-                pool_values=self._action_buffers["pool_values"].index_select(0, indices),
             )
             assert self._reward_buffer is not None
             assert self._done_buffer is not None

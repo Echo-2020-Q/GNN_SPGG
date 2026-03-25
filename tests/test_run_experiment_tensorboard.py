@@ -36,6 +36,8 @@ class RunExperimentTensorboardTests(unittest.TestCase):
         spec["training"]["rollout_inference_mode"] = "centralized"
         spec["training"]["rollout_inference_batch_timeout_ms"] = 3.5
         spec["training"]["rollout_num_threads"] = 1
+        spec["training"]["num_envs_per_worker"] = 4
+        spec["training"]["overlap_rollout_and_update"] = False
 
         trainer_config = build_trainer_config(spec)
 
@@ -43,6 +45,8 @@ class RunExperimentTensorboardTests(unittest.TestCase):
         self.assertEqual(trainer_config.rollout_inference_mode, "centralized")
         self.assertEqual(trainer_config.rollout_inference_batch_timeout_ms, 3.5)
         self.assertEqual(trainer_config.rollout_num_threads, 1)
+        self.assertEqual(trainer_config.num_envs_per_worker, 4)
+        self.assertFalse(trainer_config.overlap_rollout_and_update)
 
     def test_update_metrics_use_global_env_steps_as_tensorboard_step(self) -> None:
         writer = _FakeSummaryWriter()
@@ -86,4 +90,8 @@ class RunExperimentTensorboardTests(unittest.TestCase):
         self.assertEqual(
             _tensorboard_tag_for_metric("profile_rollout_collect_seconds"),
             "profile/rollout_collect_seconds",
+        )
+        self.assertEqual(
+            _tensorboard_tag_for_metric("profile_rollout_overlap_seconds"),
+            "profile/rollout_overlap_seconds",
         )

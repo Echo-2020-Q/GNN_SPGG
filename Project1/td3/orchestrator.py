@@ -116,6 +116,7 @@ class GraphTD3Trainer:
                 worker_id=worker_id,
                 seed=(config.seed or 0) + worker_id,
                 rollout_steps_per_sync=config.steps_per_update,
+                num_envs_per_worker=config.num_envs_per_worker,
             )
             worker_device = _resolve_rollout_device_for_worker(config.rollout_device, worker_id)
             if config.num_workers > 1:
@@ -155,6 +156,7 @@ class GraphTD3Trainer:
         self.completed_updates = 0
         self.global_env_steps = 0
         self.history: list[dict[str, float]] = []
+        self._rollout_collect_inflight = False
 
     def close(self) -> None:
         for worker in self.workers:
@@ -316,39 +318,18 @@ class GraphTD3Trainer:
         return allocations
 
     def _collect_rollouts(self) -> list[RolloutResult]:
+        if self.config.num_workers > 1:
+            self._start_rollout_collection()
+            return self._finish_rollout_collection()
+
         warmup_allocations = self._global_warmup_allocations()
-        rollout_results: list[RolloutResult] = []
-
+        rollout_results = [
+            self.workers[0].collect(
+                num_steps=int(self.workers[0].config.rollout_steps_per_sync),
+                global_warmup_steps=int(warmup_allocations[0]) if warmup_allocations else 0,
+            )
+        ]
         try:
-            if self.config.num_workers > 1:
-                for worker, warmup_steps in zip(self.workers, warmup_allocations):
-                    worker.start_collect(
-                        num_steps=int(worker.config.rollout_steps_per_sync),
-                        global_warmup_steps=int(warmup_steps),
-                    )
-                pending_workers = {worker.connection: worker for worker in self.workers}
-                while pending_workers:
-                    ready_connections = wait(
-                        list(pending_workers.keys()),
-                        timeout=float(self.config.worker_rpc_timeout_seconds),
-                    )
-                    if not ready_connections:
-                        raise TimeoutError(
-                            "Timed out waiting for rollout workers: {0}".format(
-                                [worker.config.worker_id for worker in pending_workers.values()]
-                            )
-                        )
-                    for ready_connection in ready_connections:
-                        worker = pending_workers.pop(ready_connection)
-                        rollout_results.append(worker.finish_collect_ready())
-            else:
-                rollout_results = [
-                    self.workers[0].collect(
-                        num_steps=int(self.workers[0].config.rollout_steps_per_sync),
-                        global_warmup_steps=int(warmup_allocations[0]) if warmup_allocations else 0,
-                    )
-                ]
-
             for result in rollout_results:
                 self.replay_buffer.extend(result.replay_batch)
                 self.global_env_steps += len(result.replay_batch)
@@ -356,6 +337,63 @@ class GraphTD3Trainer:
         finally:
             for result in rollout_results:
                 result.release_shared_memory()
+
+    def _start_rollout_collection(self) -> None:
+        if self.config.num_workers <= 1:
+            raise RuntimeError("Asynchronous rollout collection requires num_workers > 1.")
+        if self._rollout_collect_inflight:
+            raise RuntimeError("Rollout collection is already in flight.")
+
+        warmup_allocations = self._global_warmup_allocations()
+        for worker, warmup_steps in zip(self.workers, warmup_allocations):
+            worker.start_collect(
+                num_steps=int(worker.config.rollout_steps_per_sync),
+                global_warmup_steps=int(warmup_steps),
+            )
+        self._rollout_collect_inflight = True
+
+    def _finish_rollout_collection(self) -> list[RolloutResult]:
+        if self.config.num_workers <= 1:
+            raise RuntimeError("_finish_rollout_collection is only valid for num_workers > 1.")
+        if not self._rollout_collect_inflight:
+            raise RuntimeError("No rollout collection is currently in flight.")
+
+        rollout_results: list[RolloutResult] = []
+        try:
+            pending_workers = {worker.connection: worker for worker in self.workers}
+            while pending_workers:
+                ready_connections = wait(
+                    list(pending_workers.keys()),
+                    timeout=float(self.config.worker_rpc_timeout_seconds),
+                )
+                if not ready_connections:
+                    raise TimeoutError(
+                        "Timed out waiting for rollout workers: {0}".format(
+                            [worker.config.worker_id for worker in pending_workers.values()]
+                        )
+                    )
+                for ready_connection in ready_connections:
+                    worker = pending_workers.pop(ready_connection)
+                    rollout_results.append(worker.finish_collect_ready())
+
+            for result in rollout_results:
+                self.replay_buffer.extend(result.replay_batch)
+                self.global_env_steps += len(result.replay_batch)
+            return rollout_results
+        finally:
+            self._rollout_collect_inflight = False
+            for result in rollout_results:
+                result.release_shared_memory()
+
+    def _sync_rollout_workers_if_needed(self, update: int) -> None:
+        if update == 1 or ((update - 1) % self.config.worker_sync_interval == 0):
+            actor_state_dict, actor_version = self.learner.publish_actor_state()
+            self._sync_rollout_inference_servers(actor_state_dict)
+            for worker in self.workers:
+                worker.sync_actor(actor_state_dict, version=actor_version)
+
+    def _should_overlap_rollout_and_update(self) -> bool:
+        return bool(self.config.overlap_rollout_and_update) and self.config.num_workers > 1
 
     def train(
         self,
@@ -366,17 +404,59 @@ class GraphTD3Trainer:
         if self.completed_updates >= total_updates:
             return [dict(item) for item in self.history]
 
-        for update in range(self.completed_updates + 1, total_updates + 1):
-            self._apply_curriculum_stage(update)
-            if update == 1 or ((update - 1) % self.config.worker_sync_interval == 0):
-                actor_state_dict, actor_version = self.learner.publish_actor_state()
-                self._sync_rollout_inference_servers(actor_state_dict)
-                for worker in self.workers:
-                    worker.sync_actor(actor_state_dict, version=actor_version)
+        overlap_rollout_and_update = self._should_overlap_rollout_and_update()
+        pending_collect_started_at: float | None = None
+        pending_collect_update: int | None = None
 
-            rollout_collect_start = perf_counter()
-            rollout_results = self._collect_rollouts()
-            rollout_collect_seconds = float(perf_counter() - rollout_collect_start)
+        for update in range(self.completed_updates + 1, total_updates + 1):
+            learner_metrics = {
+                "critic1_loss": 0.0,
+                "critic2_loss": 0.0,
+                "critic_loss": 0.0,
+                "actor_loss": 0.0,
+                "actor_q_loss": 0.0,
+                "actor_entropy": 0.0,
+                "actor_logit_l2": 0.0,
+                "actor_reg_loss": 0.0,
+                "loss": 0.0,
+                "replay_size": float(len(self.replay_buffer)),
+                "actor_lr": float(self.learner.actor_optimizer.param_groups[0]["lr"]),
+                "critic_lr": float(self.learner.critic_optimizer.param_groups[0]["lr"]),
+            }
+            learner_update_seconds = 0.0
+            rollout_finish_wait_seconds = 0.0
+            rollout_overlap_seconds = 0.0
+
+            if overlap_rollout_and_update and pending_collect_update == update:
+                learner_update_start = perf_counter()
+                if update % self.config.train_every == 0:
+                    for _ in range(self.config.gradient_steps_per_update):
+                        learner_metrics = self.learner.train_step()
+                learner_update_seconds = float(perf_counter() - learner_update_start)
+
+                rollout_wait_start = perf_counter()
+                rollout_results = self._finish_rollout_collection()
+                rollout_finish_wait_seconds = float(perf_counter() - rollout_wait_start)
+                if pending_collect_started_at is None:
+                    raise RuntimeError("Missing rollout collect start time for update {0}.".format(update))
+                rollout_collect_seconds = float(perf_counter() - pending_collect_started_at)
+                rollout_overlap_seconds = max(0.0, rollout_collect_seconds - rollout_finish_wait_seconds)
+                pending_collect_update = None
+                pending_collect_started_at = None
+            else:
+                self._apply_curriculum_stage(update)
+                self._sync_rollout_workers_if_needed(update)
+
+                rollout_collect_start = perf_counter()
+                rollout_results = self._collect_rollouts()
+                rollout_collect_seconds = float(perf_counter() - rollout_collect_start)
+
+                learner_update_start = perf_counter()
+                if update % self.config.train_every == 0:
+                    for _ in range(self.config.gradient_steps_per_update):
+                        learner_metrics = self.learner.train_step()
+                learner_update_seconds = float(perf_counter() - learner_update_start)
+
             rollout_metrics = [result.metrics for result in rollout_results]
             mean_rollout_reward = float(np.mean([item["mean_reward"] for item in rollout_metrics])) if rollout_metrics else 0.0
             mean_rollout_cooperation = float(np.mean([item["mean_actual_cooperation_rate"] for item in rollout_metrics])) if rollout_metrics else 0.0
@@ -401,26 +481,6 @@ class GraphTD3Trainer:
             for item in rollout_metrics:
                 behavior_counts.update(item.get("behavior_source_counts", {}))
 
-            learner_metrics = {
-                "critic1_loss": 0.0,
-                "critic2_loss": 0.0,
-                "critic_loss": 0.0,
-                "actor_loss": 0.0,
-                "actor_q_loss": 0.0,
-                "actor_entropy": 0.0,
-                "actor_logit_l2": 0.0,
-                "actor_reg_loss": 0.0,
-                "loss": 0.0,
-                "replay_size": float(len(self.replay_buffer)),
-                "actor_lr": float(self.learner.actor_optimizer.param_groups[0]["lr"]),
-                "critic_lr": float(self.learner.critic_optimizer.param_groups[0]["lr"]),
-            }
-            learner_update_start = perf_counter()
-            if update % self.config.train_every == 0:
-                for _ in range(self.config.gradient_steps_per_update):
-                    learner_metrics = self.learner.train_step()
-            learner_update_seconds = float(perf_counter() - learner_update_start)
-
             metrics = {
                 "update": float(update),
                 "loss": float(learner_metrics["loss"]),
@@ -435,7 +495,7 @@ class GraphTD3Trainer:
                 "actor_entropy": float(learner_metrics["actor_entropy"]),
                 "actor_logit_l2": float(learner_metrics["actor_logit_l2"]),
                 "actor_reg_loss": float(learner_metrics["actor_reg_loss"]),
-                "replay_size": float(learner_metrics["replay_size"]),
+                "replay_size": float(len(self.replay_buffer)),
                 "mean_rollout_reward": mean_rollout_reward,
                 "actor_lr": float(learner_metrics["actor_lr"]),
                 "critic_lr": float(learner_metrics["critic_lr"]),
@@ -451,6 +511,8 @@ class GraphTD3Trainer:
                 "profile_rollout_env_step_seconds": mean_rollout_env_step_seconds,
                 "profile_rollout_inference_wait_seconds": mean_rollout_inference_wait_seconds,
                 "profile_rollout_local_policy_forward_seconds": mean_rollout_local_policy_forward_seconds,
+                "profile_rollout_finish_wait_seconds": rollout_finish_wait_seconds,
+                "profile_rollout_overlap_seconds": rollout_overlap_seconds,
                 "profile_rollout_steps_per_second": rollout_steps_per_second,
                 "profile_rollout_inference_batch_size_mean": mean_rollout_inference_batch_size,
                 "profile_rollout_inference_batch_size_max": max_rollout_inference_batch_size,
@@ -487,6 +549,14 @@ class GraphTD3Trainer:
             self.completed_updates = update
             if on_update is not None:
                 on_update(dict(metrics))
+
+            if overlap_rollout_and_update and update < total_updates:
+                next_update = update + 1
+                self._apply_curriculum_stage(next_update)
+                self._sync_rollout_workers_if_needed(next_update)
+                pending_collect_started_at = perf_counter()
+                self._start_rollout_collection()
+                pending_collect_update = next_update
 
         return [dict(item) for item in self.history]
 

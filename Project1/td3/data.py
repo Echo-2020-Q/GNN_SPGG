@@ -89,6 +89,21 @@ class TensorActionRecord:
 
 
 @dataclass
+class TensorReplayActionRecord:
+    allocation: Tensor
+
+    def clone(self) -> "TensorReplayActionRecord":
+        return TensorReplayActionRecord(
+            allocation=self.allocation.detach().cpu().clone(),
+        )
+
+    def to(self, device: torch.device | str) -> "TensorReplayActionRecord":
+        return TensorReplayActionRecord(
+            allocation=self.allocation.to(device=device),
+        )
+
+
+@dataclass
 class ActionRecord:
     logits: np.ndarray
     allocation: np.ndarray
@@ -143,7 +158,7 @@ class Transition:
 @dataclass(frozen=True)
 class TensorTransition:
     obs: TensorObservation
-    action: TensorActionRecord
+    action: TensorReplayActionRecord
     reward: Tensor
     next_obs: TensorObservation
     done: Tensor
@@ -152,14 +167,20 @@ class TensorTransition:
     def from_step(
         cls,
         obs: Mapping[str, Any],
-        action: TensorActionRecord,
+        action: TensorActionRecord | TensorReplayActionRecord,
         reward: float,
         next_obs: Mapping[str, Any],
         done: bool,
     ) -> "TensorTransition":
+        if isinstance(action, TensorActionRecord):
+            replay_action = TensorReplayActionRecord(
+                allocation=action.allocation.detach().cpu().clone(),
+            )
+        else:
+            replay_action = action.clone()
         return cls(
             obs=observation_to_replay_tensors(obs),
-            action=action.clone(),
+            action=replay_action,
             reward=torch.tensor(float(reward), dtype=torch.float32, device="cpu"),
             next_obs=observation_to_replay_tensors(next_obs),
             done=torch.tensor(float(done), dtype=torch.float32, device="cpu"),
@@ -188,7 +209,7 @@ class TensorTransition:
 @dataclass(frozen=True)
 class TensorReplayBatch:
     obs: TensorObservation
-    action: TensorActionRecord
+    action: TensorReplayActionRecord
     reward: Tensor
     next_obs: TensorObservation
     done: Tensor
@@ -228,13 +249,8 @@ def stack_tensor_transitions(transitions: Sequence[TensorTransition]) -> TensorR
         key: torch.stack([transition.next_obs[key] for transition in transitions], dim=0)
         for key in first_transition.next_obs
     }
-    action = TensorActionRecord(
-        logits=torch.stack([transition.action.logits for transition in transitions], dim=0),
+    action = TensorReplayActionRecord(
         allocation=torch.stack([transition.action.allocation for transition in transitions], dim=0),
-        transfers=torch.stack([transition.action.transfers for transition in transitions], dim=0),
-        incoming=torch.stack([transition.action.incoming for transition in transitions], dim=0),
-        ego_mask=torch.stack([transition.action.ego_mask for transition in transitions], dim=0),
-        pool_values=torch.stack([transition.action.pool_values for transition in transitions], dim=0),
     )
     reward = torch.stack([transition.reward for transition in transitions], dim=0)
     done = torch.stack([transition.done for transition in transitions], dim=0)
