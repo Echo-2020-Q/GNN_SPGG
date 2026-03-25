@@ -97,7 +97,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "spgg_CNN_demo1_4workers_2GPU_3_25",
+    "experiment_name": "spgg_CNN_demo1_4workers_1GPU_3_25",
 
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
