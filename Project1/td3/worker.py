@@ -116,12 +116,48 @@ def _normalize_serialized_inference_batch(observations_batch: Mapping[str, Any])
     return payload
 
 
+def _serialized_inference_batch_metadata(observations_batch: Mapping[str, Any]) -> tuple[int, int]:
+    batch_size: int | None = None
+    num_nodes: int | None = None
+    for key in REPLAY_OBSERVATION_DTYPES:
+        if key not in observations_batch:
+            raise KeyError("Inference batch is missing field '{0}'.".format(key))
+        array = np.asarray(observations_batch[key])
+        if array.ndim < 1:
+            raise ValueError("Inference batch field '{0}' must include a batch dimension.".format(key))
+        if batch_size is None:
+            batch_size = int(array.shape[0])
+        elif int(array.shape[0]) != batch_size:
+            raise ValueError("Inference batch fields must share the same batch dimension.")
+        if key == "local_mask":
+            if array.ndim != 3 or array.shape[1] != array.shape[2]:
+                raise ValueError("Inference batch field 'local_mask' must have shape [batch, num_nodes, num_nodes].")
+            num_nodes = int(array.shape[1])
+        elif num_nodes is not None and array.ndim >= 2 and int(array.shape[1]) != num_nodes:
+            raise ValueError(
+                "Inference batch field '{0}' must share the same num_nodes dimension as local_mask.".format(key)
+            )
+    assert batch_size is not None
+    assert num_nodes is not None
+    return batch_size, num_nodes
+
+
 def _concat_serialized_inference_batches(batches: list[Mapping[str, Any]]) -> dict[str, np.ndarray]:
     if not batches:
         raise ValueError("batches must contain at least one item.")
-    normalized_batches = [_normalize_serialized_inference_batch(batch) for batch in batches]
+    reference_batch_size, reference_num_nodes = _serialized_inference_batch_metadata(batches[0])
+    normalized_batches: list[Mapping[str, Any]] = [batches[0]]
+    for batch in batches[1:]:
+        batch_size, num_nodes = _serialized_inference_batch_metadata(batch)
+        if num_nodes != reference_num_nodes:
+            raise ValueError("Inference batches must share the same num_nodes before concatenation.")
+        if batch_size <= 0:
+            raise ValueError("Inference batches must contain at least one item.")
+        normalized_batches.append(batch)
+    if reference_batch_size <= 0:
+        raise ValueError("Inference batches must contain at least one item.")
     return {
-        key: np.ascontiguousarray(np.concatenate([batch[key] for batch in normalized_batches], axis=0))
+        key: np.ascontiguousarray(np.concatenate([np.asarray(batch[key]) for batch in normalized_batches], axis=0))
         for key in REPLAY_OBSERVATION_DTYPES
     }
 
@@ -158,8 +194,9 @@ class RolloutInferenceClient:
         return self.infer_logits_tensor_batch(_serialize_inference_observation_batch(observations))
 
     def infer_logits_tensor_batch(self, observations_batch: Mapping[str, Any]) -> tuple[torch.Tensor, int]:
-        payload_batch = _normalize_serialized_inference_batch(observations_batch)
-        if int(payload_batch["local_mask"].shape[0]) <= 0:
+        payload_batch = dict(observations_batch)
+        batch_size, _ = _serialized_inference_batch_metadata(payload_batch)
+        if batch_size <= 0:
             raise ValueError("observations_batch must contain at least one item.")
         self._connection.send(
             {
@@ -801,12 +838,10 @@ def _parallel_rollout_inference_server_main(
         grouped_requests: dict[int, dict[str, Any]] = {}
         for connection, observations_batch in pending_requests:
             try:
-                normalized_batch = _normalize_serialized_inference_batch(observations_batch)
+                batch_size, num_nodes = _serialized_inference_batch_metadata(observations_batch)
             except Exception as exc:
                 _send_error(connection, exc)
                 continue
-            batch_size = int(normalized_batch["local_mask"].shape[0])
-            num_nodes = int(normalized_batch["local_mask"].shape[1])
             group = grouped_requests.setdefault(
                 num_nodes,
                 {
@@ -815,7 +850,7 @@ def _parallel_rollout_inference_server_main(
                 },
             )
             start_index = sum(int(batch["local_mask"].shape[0]) for batch in group["observation_batches"])
-            group["observation_batches"].append(normalized_batch)
+            group["observation_batches"].append(observations_batch)
             end_index = start_index + batch_size
             group["requests"].append((connection, start_index, end_index))
 

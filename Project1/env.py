@@ -291,9 +291,20 @@ def make_barabasi_albert_graph(
 
 def gini_coefficient(values: np.ndarray, epsilon: float = 1e-8) -> float:
     values = np.asarray(values, dtype=np.float64)
-    absolute_differences = np.abs(values[:, None] - values[None, :]).sum()
-    denominator = (2.0 * values.size * values.sum()) + epsilon
-    return float(absolute_differences / denominator)
+    if values.ndim != 1:
+        values = values.reshape(-1)
+    if values.size == 0:
+        return 0.0
+
+    total = float(values.sum())
+    if total <= 0.0:
+        return 0.0
+
+    sorted_values = np.sort(values)
+    rank = np.arange(1, sorted_values.size + 1, dtype=np.float64)
+    numerator = float(np.dot((2.0 * rank) - sorted_values.size - 1.0, sorted_values))
+    denominator = (sorted_values.size * total) + (0.5 * float(epsilon))
+    return float(numerator / denominator)
 
 
 class SPGGEnv:
@@ -310,6 +321,7 @@ class SPGGEnv:
             else self.graph_mean_degree
         )
         self.resource_norm_reference = self._compute_resource_norm_reference()
+        self._refresh_static_caches()
         self.rng = np.random.default_rng()
 
         self._step_count = 0
@@ -360,7 +372,15 @@ class SPGGEnv:
         done = self._step_count >= self.config.episode_length
 
         next_observation = self._precompute_observation(next_nominal, next_resources)
-        reward = self._planner_reward(payoff, next_observation["x_actual"], next_resources)
+        next_gini = float(np.asarray(next_observation["gini"]).item())
+        next_actual_cooperation = float(next_observation["x_actual"].mean())
+        current_actual_cooperation = float(observation["x_actual"].mean())
+        reward = self._planner_reward(
+            payoff,
+            next_observation["x_actual"],
+            next_resources,
+            next_resource_gini=next_gini,
+        )
 
         info = {
             "allocation_matrix": allocation.copy(),
@@ -368,16 +388,16 @@ class SPGGEnv:
             "income": income.copy(),
             "consumption": consumption.copy(),
             "payoff": payoff.copy(),
-            "gini": gini_coefficient(next_resources, self.config.reward.epsilon),
-            "actual_cooperation_rate": float(next_observation["x_actual"].mean()),
-            "actual_cooperation_rate_current": float(observation["x_actual"].mean()),
+            "gini": next_gini,
+            "actual_cooperation_rate": next_actual_cooperation,
+            "actual_cooperation_rate_current": current_actual_cooperation,
             "nominal_strategies_next": next_nominal.copy(),
             "resources_next": next_resources.copy(),
             "reward_components": {
                 "mean_consumption": float(consumption.mean()),
                 "mean_payoff": float(payoff.mean()),
-                "actual_cooperation_rate_next": float(next_observation["x_actual"].mean()),
-                "gini_next_resources": gini_coefficient(next_resources, self.config.reward.epsilon),
+                "actual_cooperation_rate_next": next_actual_cooperation,
+                "gini_next_resources": next_gini,
             },
         }
 
@@ -424,6 +444,7 @@ class SPGGEnv:
             else self.graph_mean_degree
         )
         self.resource_norm_reference = self._compute_resource_norm_reference()
+        self._refresh_static_caches()
         self.rng = np.random.default_rng()
         self.rng.bit_generator.state = state_dict["rng_state"]
         self._step_count = int(state_dict["step_count"])
@@ -479,19 +500,18 @@ class SPGGEnv:
         return strategies.astype(np.int8, copy=True)
 
     def _precompute_observation(self, nominal_strategies: np.ndarray, resources: np.ndarray) -> Observation:
-        thresholds = self.graph.degrees.astype(np.float64) + 1.0
-        actual_strategies = nominal_strategies.astype(np.float64) * (resources >= thresholds).astype(np.float64)
+        actual_strategies = nominal_strategies.astype(np.float64, copy=False) * (
+            resources >= self._thresholds_float64
+        ).astype(np.float64, copy=False)
 
-        investment_base = thresholds + self.config.alpha * (resources - thresholds)
+        investment_base = self._thresholds_float64 + self.config.alpha * (resources - self._thresholds_float64)
         investment = actual_strategies * np.minimum(resources, np.maximum(0.0, investment_base))
-        unit_investment = investment / thresholds
+        unit_investment = investment / self._thresholds_float64
 
-        pool_raw = self.graph.local_mask.astype(np.float64) @ unit_investment
+        pool_raw = self._local_mask_float64 @ unit_investment
         pool_grown = np.minimum((1.0 + self.config.r) * pool_raw, self.config.p_max)
         pool_raw_norm = np.minimum(pool_raw, self.config.p_max) / self.config.p_max
         resource_norm = resources / self.resource_norm_reference
-        degree_reference = max(self.target_mean_degree, 1e-8)
-        degree_norm = (self.graph.degrees.astype(np.float64) - degree_reference) / degree_reference
         strategy_norm = np.divide(
             investment,
             resources,
@@ -508,14 +528,14 @@ class SPGGEnv:
             "unit_investment": unit_investment.astype(np.float64, copy=True),
             "pool_raw": pool_raw.astype(np.float64, copy=True),
             "pool_grown": pool_grown.astype(np.float64, copy=True),
-            "degrees": self.graph.degrees.astype(np.int64, copy=True),
+            "degrees": self._degrees_int64.copy(),
             "pool_raw_norm": pool_raw_norm.astype(np.float64, copy=True),
             "resource_norm": resource_norm.astype(np.float64, copy=True),
-            "degree_norm": degree_norm.astype(np.float64, copy=True),
+            "degree_norm": self._degree_norm_float64.copy(),
             "strategy_norm": strategy_norm.astype(np.float64, copy=True),
             "gini": np.asarray(resource_gini, dtype=np.float64),
-            "p_max": np.asarray(self.config.p_max, dtype=np.float64),
-            "local_mask": self.graph.local_mask.copy(),
+            "p_max": self._p_max_scalar.copy(),
+            "local_mask": self._local_mask_bool.copy(),
         }
 
     def _validate_allocation(self, allocation_matrix: np.ndarray | Sequence[Sequence[float]]) -> np.ndarray:
@@ -560,10 +580,13 @@ class SPGGEnv:
         )
 
     def _compute_fixed_consumption_component(self) -> np.ndarray:
+        return self._fixed_consumption_component_float64
+
+    def _compute_fixed_consumption_component_array(self) -> np.ndarray:
         if self.config.resource_consumption_fixed_mode == "constant":
             return np.full(self.num_nodes, self.config.resource_consumption_fixed, dtype=np.float64)
         if self.config.resource_consumption_fixed_mode == "degree_scaled":
-            return self.config.resource_consumption_degree_multiplier * self.graph.degrees.astype(np.float64)
+            return self.config.resource_consumption_degree_multiplier * self._degrees_float64
         raise RuntimeError(
             "Unsupported resource_consumption_fixed_mode: {0}".format(self.config.resource_consumption_fixed_mode)
         )
@@ -682,13 +705,33 @@ class SPGGEnv:
         payoff: np.ndarray,
         next_actual_strategies: np.ndarray,
         next_resources: np.ndarray,
+        next_resource_gini: float | None = None,
     ) -> float:
         reward_config = self.config.reward
+        gini_penalty = 0.0
+        if reward_config.lambda_gini != 0.0:
+            resource_gini = (
+                float(next_resource_gini)
+                if next_resource_gini is not None
+                else gini_coefficient(next_resources, reward_config.epsilon)
+            )
+            gini_penalty = reward_config.lambda_gini * resource_gini
         return float(
             reward_config.lambda_payoff * payoff.mean()
             + reward_config.lambda_cooperation * next_actual_strategies.mean()
-            - reward_config.lambda_gini * gini_coefficient(next_resources, reward_config.epsilon)
+            - gini_penalty
         )
+
+    def _refresh_static_caches(self) -> None:
+        self._degrees_int64 = self.graph.degrees.astype(np.int64, copy=True)
+        self._degrees_float64 = self.graph.degrees.astype(np.float64, copy=True)
+        self._thresholds_float64 = self._degrees_float64 + 1.0
+        self._local_mask_bool = self.graph.local_mask.copy()
+        self._local_mask_float64 = self._local_mask_bool.astype(np.float64, copy=True)
+        degree_reference = max(self.target_mean_degree, 1e-8)
+        self._degree_norm_float64 = (self._degrees_float64 - degree_reference) / degree_reference
+        self._fixed_consumption_component_float64 = self._compute_fixed_consumption_component_array()
+        self._p_max_scalar = np.asarray(self.config.p_max, dtype=np.float64)
 
     @staticmethod
     def _copy_observation(observation: Observation) -> Observation:
