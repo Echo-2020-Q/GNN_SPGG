@@ -515,7 +515,7 @@ BASE_EXPERIMENT = {
 
         # 并行 worker RPC 的超时时间（秒）。
         # 包括 actor 参数同步、collect 回传、state_dict/load_state_dict 等控制消息。
-        "worker_rpc_timeout_seconds": 1200.0,
+        "worker_rpc_timeout_seconds": 12000.0,
 
         # rollout actor 的推理设备。
         # - "cpu"     ：保持当前最稳的 CPU rollout 路径
