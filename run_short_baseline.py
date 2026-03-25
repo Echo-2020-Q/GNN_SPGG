@@ -77,7 +77,7 @@ def _parse_args() -> argparse.Namespace:
         default="outputs/perf_baseline",
         help="Isolated output root for the short baseline run.",
     )
-    parser.add_argument("--total-updates", type=int, default=8, help="Total training updates to run.")
+    parser.add_argument("--total-updates", type=int, default=4, help="Total training updates to run.")
     parser.add_argument(
         "--warmup-updates",
         type=int,
