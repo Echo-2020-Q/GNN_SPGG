@@ -466,6 +466,8 @@ class RolloutWorker:
         env_step_seconds = 0.0
         inference_wait_seconds = 0.0
         local_policy_forward_seconds = 0.0
+        action_to_numpy_seconds = 0.0
+        transition_encode_seconds = 0.0
         inference_batch_sizes: list[int] = []
         collected_steps = 0
 
@@ -550,8 +552,13 @@ class RolloutWorker:
                 assert env is not None
 
                 env_step_start = perf_counter()
-                next_observation, reward, done, info = env.step(action.allocation.detach().cpu().numpy())
+                action_to_numpy_start = perf_counter()
+                allocation_numpy = action.allocation.detach().cpu().numpy()
+                action_to_numpy_seconds += perf_counter() - action_to_numpy_start
+                next_observation, reward, done, info = env.step(allocation_numpy)
                 env_step_seconds += perf_counter() - env_step_start
+
+                transition_encode_start = perf_counter()
                 transition = TensorTransition.from_step(
                     obs=observation,
                     action=action,
@@ -559,6 +566,7 @@ class RolloutWorker:
                     next_obs=next_observation,
                     done=bool(done),
                 )
+                transition_encode_seconds += perf_counter() - transition_encode_start
                 transitions.append(transition)
 
                 rewards.append(float(reward))
@@ -590,11 +598,15 @@ class RolloutWorker:
             "env_step_seconds": float(env_step_seconds),
             "inference_wait_seconds": float(inference_wait_seconds),
             "local_policy_forward_seconds": float(local_policy_forward_seconds),
+            "action_to_numpy_seconds": float(action_to_numpy_seconds),
+            "transition_encode_seconds": float(transition_encode_seconds),
             "inference_batch_size_mean": float(np.mean(inference_batch_sizes)) if inference_batch_sizes else 0.0,
             "inference_batch_size_max": float(max(inference_batch_sizes)) if inference_batch_sizes else 0.0,
             "behavior_source_counts": behavior_source_counts,
         }
+        replay_stack_start = perf_counter()
         replay_batch = stack_tensor_transitions(transitions)
+        metrics["stack_transitions_seconds"] = float(perf_counter() - replay_stack_start)
         return RolloutResult(replay_batch=replay_batch, metrics=metrics)
 
     def _ensure_environment(self, slot_index: int) -> None:
@@ -963,11 +975,14 @@ def _parallel_rollout_worker_main(
                     connection.send({"status": "ok", "payload": None})
                     continue
                 if command == "collect":
-                    serialized_result, shared_memory_handles = _serialize_rollout_result(
-                        worker.collect(
-                            num_steps=int(message["num_steps"]),
-                            global_warmup_steps=int(message.get("global_warmup_steps", 0)),
-                        )
+                    collect_result = worker.collect(
+                        num_steps=int(message["num_steps"]),
+                        global_warmup_steps=int(message.get("global_warmup_steps", 0)),
+                    )
+                    shared_memory_serialize_start = perf_counter()
+                    serialized_result, shared_memory_handles = _serialize_rollout_result(collect_result)
+                    serialized_result["metrics"]["shared_memory_serialize_seconds"] = float(
+                        perf_counter() - shared_memory_serialize_start
                     )
                     try:
                         connection.send({"status": "ok", "payload": serialized_result})
@@ -1106,7 +1121,10 @@ class ParallelRolloutWorker:
             raise RuntimeError("No in-flight collect request for worker {0}.".format(self.config.worker_id))
         try:
             payload = self._recv_response()
-            return _deserialize_rollout_result(payload)
+            deserialize_start = perf_counter()
+            result = _deserialize_rollout_result(payload)
+            result.metrics["shared_memory_deserialize_seconds"] = float(perf_counter() - deserialize_start)
+            return result
         finally:
             self._collect_inflight = False
 
@@ -1115,7 +1133,10 @@ class ParallelRolloutWorker:
             raise RuntimeError("No in-flight collect request for worker {0}.".format(self.config.worker_id))
         try:
             payload = self._recv_response(ready=True)
-            return _deserialize_rollout_result(payload)
+            deserialize_start = perf_counter()
+            result = _deserialize_rollout_result(payload)
+            result.metrics["shared_memory_deserialize_seconds"] = float(perf_counter() - deserialize_start)
+            return result
         finally:
             self._collect_inflight = False
 

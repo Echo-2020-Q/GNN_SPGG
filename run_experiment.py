@@ -815,7 +815,7 @@ BASE_EXPERIMENT = {
         "console_progress_logs": True,
 
         # 控制台进度日志的 update 间隔。
-        "console_progress_interval": 5,
+        "console_progress_interval": 1,
 
         # 是否在控制台输出低频的最近训练统计块。
         # 开启后，会按最近若干个 update 的窗口均值打印 loss / reward / lr / 行为占比等。
@@ -2134,9 +2134,26 @@ def _format_console_recent_stats_lines(
         ("profile_rollout_env_step_seconds", "env_step_s"),
         ("profile_rollout_inference_wait_seconds", "inference_wait_s"),
         ("profile_rollout_local_policy_forward_seconds", "local_forward_s"),
+        ("profile_rollout_action_to_numpy_seconds", "action_to_numpy_s"),
+        ("profile_rollout_transition_encode_seconds", "transition_encode_s"),
+        ("profile_rollout_stack_transitions_seconds", "stack_transitions_s"),
+        ("profile_rollout_shared_memory_serialize_seconds", "shm_serialize_s"),
+        ("profile_rollout_shared_memory_deserialize_seconds", "shm_deserialize_s"),
         ("profile_rollout_finish_wait_seconds", "rollout_wait_s"),
         ("profile_rollout_overlap_seconds", "overlap_s"),
+        ("profile_actor_sync_seconds", "actor_sync_s"),
+        ("profile_actor_publish_seconds", "actor_publish_s"),
+        ("profile_actor_sync_inference_server_seconds", "actor_sync_server_s"),
+        ("profile_actor_sync_worker_rpc_seconds", "actor_sync_worker_s"),
+        ("profile_replay_extend_seconds", "replay_extend_s"),
+        ("profile_replay_sample_seconds", "replay_sample_s"),
+        ("profile_batch_to_device_seconds", "to_device_s"),
+        ("profile_critic_update_seconds", "critic_update_s"),
+        ("profile_actor_update_seconds", "actor_update_s"),
+        ("profile_target_soft_update_seconds", "target_update_s"),
         ("profile_learner_update_seconds", "learner_update_s"),
+        ("profile_eval_seconds", "eval_s"),
+        ("profile_on_update_seconds", "callback_s"),
         ("profile_rollout_inference_batch_size_mean", "infer_batch_mean"),
         ("profile_rollout_inference_batch_size_max", "infer_batch_max"),
         ("behavior_frac_uniform", "uniform"),

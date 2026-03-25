@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from time import perf_counter
 from typing import Any, Mapping
 
 import torch
@@ -270,12 +271,30 @@ class GraphTD3Learner:
                 "replay_size": float(len(self.replay_buffer)),
                 "actor_lr": self._current_actor_lr(),
                 "critic_lr": self._current_critic_lr(),
+                "profile_replay_sample_seconds": 0.0,
+                "profile_batch_to_device_seconds": 0.0,
+                "profile_critic_update_seconds": 0.0,
+                "profile_actor_update_seconds": 0.0,
+                "profile_target_soft_update_seconds": 0.0,
             }
 
         actor_lr = self._current_actor_lr()
         critic_lr = self._current_critic_lr()
-        batch = self.replay_buffer.sample(self.config.batch_size, device=self.device)
+        replay_sample_start = perf_counter()
+        cpu_batch = self.replay_buffer.sample(self.config.batch_size, device=None)
+        replay_sample_seconds = float(perf_counter() - replay_sample_start)
+
+        batch_to_device_seconds = 0.0
+        if self.device.type == "cpu":
+            batch = cpu_batch
+        else:
+            batch_to_device_start = perf_counter()
+            batch = cpu_batch.to(self.device)
+            batch_to_device_seconds = float(perf_counter() - batch_to_device_start)
+
+        critic_update_start = perf_counter()
         critic_metrics = self.update_critics(batch)
+        critic_update_seconds = float(perf_counter() - critic_update_start)
 
         actor_metrics: dict[str, float] = {
             "actor_loss": self.last_actor_loss,
@@ -284,9 +303,16 @@ class GraphTD3Learner:
             "actor_logit_l2": self.last_actor_logit_l2,
             "actor_reg_loss": self.last_actor_reg_loss,
         }
+        actor_update_seconds = 0.0
+        target_soft_update_seconds = 0.0
         if self.update_step_count % self.config.policy_delay == 0:
+            actor_update_start = perf_counter()
             actor_metrics = self.update_actor(batch)
+            actor_update_seconds = float(perf_counter() - actor_update_start)
+
+            target_soft_update_start = perf_counter()
             self.soft_update_targets()
+            target_soft_update_seconds = float(perf_counter() - target_soft_update_start)
             self.actor_version += 1
 
         self.update_step_count += 1
@@ -298,6 +324,11 @@ class GraphTD3Learner:
             "replay_size": float(len(self.replay_buffer)),
             "actor_lr": actor_lr,
             "critic_lr": critic_lr,
+            "profile_replay_sample_seconds": replay_sample_seconds,
+            "profile_batch_to_device_seconds": batch_to_device_seconds,
+            "profile_critic_update_seconds": critic_update_seconds,
+            "profile_actor_update_seconds": actor_update_seconds,
+            "profile_target_soft_update_seconds": target_soft_update_seconds,
         }
 
     def update_critics(self, batch: TensorReplayBatch) -> dict[str, float]:

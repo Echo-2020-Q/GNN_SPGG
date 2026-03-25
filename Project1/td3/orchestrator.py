@@ -157,6 +157,7 @@ class GraphTD3Trainer:
         self.global_env_steps = 0
         self.history: list[dict[str, float]] = []
         self._rollout_collect_inflight = False
+        self._last_replay_extend_seconds = 0.0
 
     def close(self) -> None:
         for worker in self.workers:
@@ -330,9 +331,11 @@ class GraphTD3Trainer:
             )
         ]
         try:
+            replay_extend_start = perf_counter()
             for result in rollout_results:
                 self.replay_buffer.extend(result.replay_batch)
                 self.global_env_steps += len(result.replay_batch)
+            self._last_replay_extend_seconds = float(perf_counter() - replay_extend_start)
             return rollout_results
         finally:
             for result in rollout_results:
@@ -376,21 +379,49 @@ class GraphTD3Trainer:
                     worker = pending_workers.pop(ready_connection)
                     rollout_results.append(worker.finish_collect_ready())
 
+            replay_extend_start = perf_counter()
             for result in rollout_results:
                 self.replay_buffer.extend(result.replay_batch)
                 self.global_env_steps += len(result.replay_batch)
+            self._last_replay_extend_seconds = float(perf_counter() - replay_extend_start)
             return rollout_results
         finally:
             self._rollout_collect_inflight = False
             for result in rollout_results:
                 result.release_shared_memory()
 
-    def _sync_rollout_workers_if_needed(self, update: int) -> None:
+    @staticmethod
+    def _empty_rollout_sync_profile() -> dict[str, float]:
+        return {
+            "profile_actor_sync_seconds": 0.0,
+            "profile_actor_publish_seconds": 0.0,
+            "profile_actor_sync_inference_server_seconds": 0.0,
+            "profile_actor_sync_worker_rpc_seconds": 0.0,
+        }
+
+    def _sync_rollout_workers_if_needed(self, update: int) -> dict[str, float]:
+        sync_metrics = self._empty_rollout_sync_profile()
         if update == 1 or ((update - 1) % self.config.worker_sync_interval == 0):
+            publish_start = perf_counter()
             actor_state_dict, actor_version = self.learner.publish_actor_state()
+            sync_metrics["profile_actor_publish_seconds"] = float(perf_counter() - publish_start)
+
+            inference_server_sync_start = perf_counter()
             self._sync_rollout_inference_servers(actor_state_dict)
+            sync_metrics["profile_actor_sync_inference_server_seconds"] = float(
+                perf_counter() - inference_server_sync_start
+            )
+
+            worker_sync_start = perf_counter()
             for worker in self.workers:
                 worker.sync_actor(actor_state_dict, version=actor_version)
+            sync_metrics["profile_actor_sync_worker_rpc_seconds"] = float(perf_counter() - worker_sync_start)
+            sync_metrics["profile_actor_sync_seconds"] = (
+                sync_metrics["profile_actor_publish_seconds"]
+                + sync_metrics["profile_actor_sync_inference_server_seconds"]
+                + sync_metrics["profile_actor_sync_worker_rpc_seconds"]
+            )
+        return sync_metrics
 
     def _should_overlap_rollout_and_update(self) -> bool:
         return bool(self.config.overlap_rollout_and_update) and self.config.num_workers > 1
@@ -407,6 +438,7 @@ class GraphTD3Trainer:
         overlap_rollout_and_update = self._should_overlap_rollout_and_update()
         pending_collect_started_at: float | None = None
         pending_collect_update: int | None = None
+        pending_sync_metrics = self._empty_rollout_sync_profile()
 
         for update in range(self.completed_updates + 1, total_updates + 1):
             learner_metrics = {
@@ -426,8 +458,10 @@ class GraphTD3Trainer:
             learner_update_seconds = 0.0
             rollout_finish_wait_seconds = 0.0
             rollout_overlap_seconds = 0.0
+            rollout_sync_metrics = self._empty_rollout_sync_profile()
 
             if overlap_rollout_and_update and pending_collect_update == update:
+                rollout_sync_metrics = dict(pending_sync_metrics)
                 learner_update_start = perf_counter()
                 if update % self.config.train_every == 0:
                     for _ in range(self.config.gradient_steps_per_update):
@@ -443,9 +477,10 @@ class GraphTD3Trainer:
                 rollout_overlap_seconds = max(0.0, rollout_collect_seconds - rollout_finish_wait_seconds)
                 pending_collect_update = None
                 pending_collect_started_at = None
+                pending_sync_metrics = self._empty_rollout_sync_profile()
             else:
                 self._apply_curriculum_stage(update)
-                self._sync_rollout_workers_if_needed(update)
+                rollout_sync_metrics = self._sync_rollout_workers_if_needed(update)
 
                 rollout_collect_start = perf_counter()
                 rollout_results = self._collect_rollouts()
@@ -469,6 +504,11 @@ class GraphTD3Trainer:
             mean_rollout_env_step_seconds = float(np.mean([item.get("env_step_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
             mean_rollout_inference_wait_seconds = float(np.mean([item.get("inference_wait_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
             mean_rollout_local_policy_forward_seconds = float(np.mean([item.get("local_policy_forward_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_action_to_numpy_seconds = float(np.mean([item.get("action_to_numpy_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_transition_encode_seconds = float(np.mean([item.get("transition_encode_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_stack_transitions_seconds = float(np.mean([item.get("stack_transitions_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_shared_memory_serialize_seconds = float(np.mean([item.get("shared_memory_serialize_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_rollout_shared_memory_deserialize_seconds = float(np.mean([item.get("shared_memory_deserialize_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
             mean_rollout_inference_batch_size = float(np.mean([item.get("inference_batch_size_mean", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
             max_rollout_inference_batch_size = float(max((item.get("inference_batch_size_max", 0.0) for item in rollout_metrics), default=0.0))
             total_rollout_steps_collected = float(sum(item.get("steps_collected", 0.0) for item in rollout_metrics))
@@ -481,6 +521,7 @@ class GraphTD3Trainer:
             for item in rollout_metrics:
                 behavior_counts.update(item.get("behavior_source_counts", {}))
 
+            evaluation_seconds = 0.0
             metrics = {
                 "update": float(update),
                 "loss": float(learner_metrics["loss"]),
@@ -511,13 +552,28 @@ class GraphTD3Trainer:
                 "profile_rollout_env_step_seconds": mean_rollout_env_step_seconds,
                 "profile_rollout_inference_wait_seconds": mean_rollout_inference_wait_seconds,
                 "profile_rollout_local_policy_forward_seconds": mean_rollout_local_policy_forward_seconds,
+                "profile_rollout_action_to_numpy_seconds": mean_rollout_action_to_numpy_seconds,
+                "profile_rollout_transition_encode_seconds": mean_rollout_transition_encode_seconds,
+                "profile_rollout_stack_transitions_seconds": mean_rollout_stack_transitions_seconds,
+                "profile_rollout_shared_memory_serialize_seconds": mean_rollout_shared_memory_serialize_seconds,
+                "profile_rollout_shared_memory_deserialize_seconds": mean_rollout_shared_memory_deserialize_seconds,
                 "profile_rollout_finish_wait_seconds": rollout_finish_wait_seconds,
                 "profile_rollout_overlap_seconds": rollout_overlap_seconds,
+                "profile_replay_extend_seconds": float(self._last_replay_extend_seconds),
                 "profile_rollout_steps_per_second": rollout_steps_per_second,
                 "profile_rollout_inference_batch_size_mean": mean_rollout_inference_batch_size,
                 "profile_rollout_inference_batch_size_max": max_rollout_inference_batch_size,
                 "profile_learner_update_seconds": learner_update_seconds,
+                "profile_replay_sample_seconds": float(learner_metrics.get("profile_replay_sample_seconds", 0.0)),
+                "profile_batch_to_device_seconds": float(learner_metrics.get("profile_batch_to_device_seconds", 0.0)),
+                "profile_critic_update_seconds": float(learner_metrics.get("profile_critic_update_seconds", 0.0)),
+                "profile_actor_update_seconds": float(learner_metrics.get("profile_actor_update_seconds", 0.0)),
+                "profile_target_soft_update_seconds": float(
+                    learner_metrics.get("profile_target_soft_update_seconds", 0.0)
+                ),
+                "profile_eval_seconds": evaluation_seconds,
                 "global_env_steps": float(self.global_env_steps),
+                **rollout_sync_metrics,
             }
             total_behavior_samples = float(sum(behavior_counts.values()))
             for source in (
@@ -534,7 +590,10 @@ class GraphTD3Trainer:
                 metrics["behavior_frac_{0}".format(source)] = ratio
 
             if update % self.config.eval_interval == 0 or update == total_updates:
+                evaluation_start = perf_counter()
                 evaluation = self.evaluate(self.config.eval_episodes)
+                evaluation_seconds = float(perf_counter() - evaluation_start)
+                metrics["profile_eval_seconds"] = evaluation_seconds
                 metrics["eval_return_mean"] = evaluation["return_mean"]
                 metrics["eval_cooperation_mean"] = evaluation["cooperation_mean"]
                 metrics["eval_gini_mean"] = evaluation["gini_mean"]
@@ -547,13 +606,17 @@ class GraphTD3Trainer:
 
             self.history.append(metrics)
             self.completed_updates = update
+            on_update_seconds = 0.0
             if on_update is not None:
+                on_update_start = perf_counter()
                 on_update(dict(metrics))
+                on_update_seconds = float(perf_counter() - on_update_start)
+            self.history[-1]["profile_on_update_seconds"] = on_update_seconds
 
             if overlap_rollout_and_update and update < total_updates:
                 next_update = update + 1
                 self._apply_curriculum_stage(next_update)
-                self._sync_rollout_workers_if_needed(next_update)
+                pending_sync_metrics = self._sync_rollout_workers_if_needed(next_update)
                 pending_collect_started_at = perf_counter()
                 self._start_rollout_collection()
                 pending_collect_update = next_update
