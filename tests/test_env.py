@@ -88,9 +88,11 @@ class SPGGEnvTests(unittest.TestCase):
         observation = env.reset(initial_resources=[3.0, 1.0], initial_strategies=[1, 1], seed=0)
         np.testing.assert_allclose(observation["x_actual"], np.array([1.0, 0.0]))
         np.testing.assert_allclose(observation["local_actual_cooperators"], np.array([1.0, 1.0]))
-        np.testing.assert_allclose(observation["p_max"], np.array([5.0, 5.0]))
+        np.testing.assert_allclose(observation["p_max"], np.array([20.0, 20.0]))
+        np.testing.assert_allclose(observation["pool_theoretical_max"], np.array([20.0, 20.0]))
         np.testing.assert_allclose(observation["pool_capacity"], np.array([5.0, 5.0]))
         np.testing.assert_allclose(observation["pool_grown"], np.array([5.0, 5.0]))
+        np.testing.assert_allclose(observation["pool_raw_norm"], np.array([0.05, 0.05]))
 
     def test_dynamic_pool_capacity_scales_with_group_size_and_density(self) -> None:
         env = SPGGEnv(
@@ -109,7 +111,27 @@ class SPGGEnvTests(unittest.TestCase):
         observation = env.reset(initial_resources=[4.0, 5.0, 4.0], initial_strategies=[1, 1, 1], seed=0)
         np.testing.assert_allclose(observation["local_actual_cooperators"], np.array([2.0, 3.0, 2.0]))
         np.testing.assert_allclose(observation["p_max"], np.array([6.0, 9.0, 6.0]))
+        np.testing.assert_allclose(observation["pool_theoretical_max"], np.array([6.0, 9.0, 6.0]))
         np.testing.assert_allclose(observation["pool_capacity"], np.array([6.0, 9.0, 6.0]))
+
+    def test_dynamic_pool_raw_norm_can_exceed_one(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=1.0,
+                r=0.0,
+                p_mode="dynamic",
+                p_max=999.0,
+                p_c=1.0,
+                beta=0.0,
+                episode_length=1,
+            ),
+            {0: [1], 1: [0]},
+        )
+
+        observation = env.reset(initial_resources=[10.0, 10.0], initial_strategies=[1, 1], seed=0)
+        np.testing.assert_allclose(observation["pool_theoretical_max"], np.array([2.0, 2.0]))
+        np.testing.assert_allclose(observation["pool_raw"], np.array([10.0, 10.0]))
+        np.testing.assert_allclose(observation["pool_raw_norm"], np.array([5.0, 5.0]))
 
     def test_fixed_resource_consumption_reduces_resources_but_not_payoff(self) -> None:
         env = SPGGEnv(

@@ -522,13 +522,14 @@ class SPGGEnv:
 
         pool_raw = self._local_mask_float64 @ unit_investment
         local_actual_cooperators = self._local_mask_float64 @ actual_strategies
+        pool_theoretical_max = self._compute_pool_theoretical_max()
         pool_capacity = self._compute_pool_capacity(local_actual_cooperators)
         pool_grown = np.minimum((1.0 + self.config.r) * pool_raw, pool_capacity)
         pool_raw_norm = np.divide(
-            np.minimum(pool_raw, pool_capacity),
-            pool_capacity,
+            pool_raw,
+            pool_theoretical_max,
             out=np.zeros_like(pool_raw, dtype=np.float64),
-            where=pool_capacity > 1e-8,
+            where=pool_theoretical_max > 1e-8,
         )
         resource_norm = resources / self.resource_norm_reference
         strategy_norm = np.divide(
@@ -548,6 +549,7 @@ class SPGGEnv:
             "pool_raw": pool_raw.astype(np.float64, copy=True),
             "pool_grown": pool_grown.astype(np.float64, copy=True),
             "pool_capacity": pool_capacity.astype(np.float64, copy=True),
+            "pool_theoretical_max": pool_theoretical_max.astype(np.float64, copy=True),
             "local_actual_cooperators": local_actual_cooperators.astype(np.float64, copy=True),
             "degrees": self._degrees_int64.copy(),
             "pool_raw_norm": pool_raw_norm.astype(np.float64, copy=True),
@@ -555,7 +557,7 @@ class SPGGEnv:
             "degree_norm": self._degree_norm_float64.copy(),
             "strategy_norm": strategy_norm.astype(np.float64, copy=True),
             "gini": np.asarray(resource_gini, dtype=np.float64),
-            "p_max": pool_capacity.astype(np.float64, copy=True),
+            "p_max": pool_theoretical_max.astype(np.float64, copy=True),
             "local_mask": self._local_mask_bool.copy(),
         }
 
@@ -619,7 +621,7 @@ class SPGGEnv:
             return capacity_reference
 
         theoretical_max = (
-            capacity_reference - ((1.0 - self.config.alpha) * (self.graph_mean_degree + 1.0))
+            (1 - self.config.resource_consumption_rate) * capacity_reference - ((1.0 - self.config.alpha) * (self.graph_mean_degree + 1.0))
         ) / denominator
         if theoretical_max <= 1e-8:
             return capacity_reference
@@ -630,6 +632,13 @@ class SPGGEnv:
             return self._constant_pool_capacity_float64.copy()
         if self.config.p_mode == "dynamic":
             return self.config.p_c * np.square(local_actual_cooperators) / self._thresholds_float64
+        raise RuntimeError("Unsupported p_mode: {0}".format(self.config.p_mode))
+
+    def _compute_pool_theoretical_max(self) -> np.ndarray:
+        if self.config.p_mode == "constant":
+            return self._constant_pool_capacity_float64.copy()
+        if self.config.p_mode == "dynamic":
+            return self.config.p_c * self._thresholds_float64
         raise RuntimeError("Unsupported p_mode: {0}".format(self.config.p_mode))
 
     def _compute_pool_capacity_upper_bound(self) -> float:
