@@ -408,6 +408,7 @@ class SPGGEnv:
                 "mean_consumption": float(consumption.mean()),
                 "mean_payoff": float(payoff.mean()),
                 "actual_cooperation_rate_next": next_actual_cooperation,
+                "mean_resource_next": float(next_resources.mean()),
                 "total_resource_next": float(next_resources.sum()),
                 "gini_next_resources": next_gini,
             },
@@ -755,7 +756,7 @@ class SPGGEnv:
         gini_penalty = 0.0
         total_resource_bonus = 0.0
         if reward_config.lambda_total_resource != 0.0:
-            total_resource_bonus = reward_config.lambda_total_resource * float(next_resources.sum())
+            total_resource_bonus = reward_config.lambda_total_resource * float(next_resources.mean())
         if reward_config.lambda_gini != 0.0:
             resource_gini = (
                 float(next_resource_gini)

@@ -97,7 +97,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "spgg_CNN_12workers_1GPU_3_25_10",
+    "experiment_name": "spgg_CNN_12workers_PoolDynamic",
 
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -174,7 +174,7 @@ BASE_EXPERIMENT = {
         # r：资源池放大参数。
         # 对应：
         #   G_i,t = min((1 + r) * P_i,t, P_max)
-        "r": 2,
+        "r": 0.75,
 
         # 公共池容量上限模式：
         # - "constant" ：固定常数上限，使用 p_max
@@ -264,22 +264,24 @@ BASE_EXPERIMENT = {
         # reward =
         #   lambda_payoff * mean(payoff)
         #   + lambda_cooperation * mean(next_actual_cooperation)
-        #   + lambda_total_resource * sum(next_resources)
+        #   + lambda_total_resource * mean(next_resources)
         #   - lambda_gini * gini(next_resources)
         # 当前这组默认系数下，实际 reward = mean(payoff)。
+        #   # 为了方便正则化，我们将这些标量奖励规范化，每项为10，规范化的分母为对应项的理论稳态最大值，
 
         # 平均净收益项的权重。
-        "lambda_payoff": 1.0,
+        "lambda_payoff": 0.0,
 
         # 下一时刻实际合作比例项的权重。
         "lambda_cooperation": 0.0,
 
-        # 下一时刻全局总资源项的权重。
-        # 单步使用 sum(next_resources)；跨时间平均后对应评估里的 R_total_mean 口径。
-        "lambda_total_resource": 0.0,
+        # 下一时刻全局平均资源项的权重。
+        # 单步使用 mean(next_resources)；跨时间平均后对应评估里的 mean_resource 口径。
+        #Pc=50，Pmax=250,α=0.5，τ=0.1，\bar_{d}=4, R_M=370.83
+        "lambda_total_resource": 10/371.0,
 
         # Gini 不平等惩罚项的权重。
-        "lambda_gini": 0.0,
+        "lambda_gini": 10/1,
 
         # Gini 分母的极小修正项，通常不需要改。
         "epsilon": 1e-8,
@@ -947,8 +949,8 @@ BATCH_EXPERIMENTS = [
 # 参数扫描配置：启用后会忽略上面的 BATCH_EXPERIMENTS，自动生成扫描实验
 # =============================================================================
 SCAN_EXPERIMENT = {
-    "enabled": True,
-    "name": "3_30_dynamics_scan",#扫描实验的名字，会在output_root_dir下面生成一个同名子目录
+    "enabled": False, #是否启用参数扫描实验，启用后会忽略上面的 BATCH_EXPERIMENTS，自动生成扫描实验
+    "name": "3_30_dynamics_scan", #扫描实验的名字，会在output_root_dir下面生成一个同名子目录
     "output_root_dir": "outputs/Pool_dynamic_scan",#"outputs/scan",
     "parallel": True,
     "max_workers": 32,#自己的电脑为16核

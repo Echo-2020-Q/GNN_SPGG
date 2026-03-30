@@ -155,7 +155,7 @@ class SPGGEnvTests(unittest.TestCase):
         np.testing.assert_allclose(info["payoff"], np.array([0.0, 0.0]))
         np.testing.assert_allclose(next_observation["resources"], np.array([2.0, 2.0]))
 
-    def test_reward_can_include_total_resource_term(self) -> None:
+    def test_reward_can_include_mean_resource_term(self) -> None:
         env = SPGGEnv(
             SPGGConfig(
                 alpha=0.0,
@@ -176,7 +176,8 @@ class SPGGEnvTests(unittest.TestCase):
         observation = env.reset(initial_resources=[3.0, 3.0], initial_strategies=[1, 1], seed=0)
         _, reward, done, info = env.step(UniformAllocationPolicy().allocate(observation))
         self.assertTrue(done)
-        self.assertAlmostEqual(reward, 3.0)
+        self.assertAlmostEqual(reward, 1.5)
+        self.assertAlmostEqual(info["reward_components"]["mean_resource_next"], 3.0)
         self.assertAlmostEqual(info["reward_components"]["total_resource_next"], 6.0)
 
     def test_proportional_resource_consumption_is_capped_by_available_resources(self) -> None:
