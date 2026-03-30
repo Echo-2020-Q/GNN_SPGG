@@ -959,7 +959,7 @@ SCAN_EXPERIMENT = {
     "resource_consumption_modes": ["piecewise_linear"],#["fixed", "proportional", "piecewise_linear"],
     "resource_consumption_fixed_modes": ["constant", "degree_scaled"],
     "strategy_update_rules": ["q_learning", "fermi"],
-    "run_mode": ["proportional,uniform"],#["proportional", "uniform"],
+    "run_mode": ["proportional", "uniform"],#["proportional", "uniform"],
 }
 
 def deep_update(base: Dict[str, Any], overrides: Mapping[str, Any]) -> Dict[str, Any]:
