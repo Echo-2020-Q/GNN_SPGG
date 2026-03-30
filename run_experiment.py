@@ -2014,8 +2014,8 @@ def _format_training_update_summary(item: Mapping[str, float]) -> str:
     return summary_text
 
 
-def _console_info(message: str) -> str:
-    return "[INFO {0}] train {1}".format(datetime.now().strftime("%H:%M:%S"), message)
+def _console_info(message: str, phase: str = "train") -> str:
+    return "[INFO {0}] {1} {2}".format(datetime.now().strftime("%H:%M:%S"), phase, message)
 
 
 def _format_duration(seconds: float) -> str:
@@ -2110,6 +2110,57 @@ def _format_console_progress_lines(
                 "Estimated time left: unavailable. Time passed: {0}".format(
                     _format_duration(elapsed)
                 )
+            )
+        )
+    return lines
+
+
+def _format_rule_based_progress_lines(
+    episode_index: int,
+    total_episodes: int,
+    start_time: float,
+) -> List[str]:
+    now = time.time()
+    elapsed = max(now - start_time, 0.0)
+    if total_episodes > 0:
+        progress_ratio = min(max(float(episode_index) / float(total_episodes), 0.0), 1.0)
+    else:
+        progress_ratio = 1.0
+
+    if 0.0 < progress_ratio < 1.0:
+        estimated_total = elapsed / progress_ratio
+        eta = max(estimated_total - elapsed, 0.0)
+    elif progress_ratio >= 1.0:
+        eta = 0.0
+    else:
+        eta = float("inf")
+
+    lines = [
+        _console_info(
+            "episode: {0} / {1}".format(
+                episode_index,
+                total_episodes,
+            ),
+            phase="rollout",
+        )
+    ]
+    if np.isfinite(eta):
+        lines.append(
+            _console_info(
+                "Estimated time left: {0}. Time passed: {1}".format(
+                    _format_duration(eta),
+                    _format_duration(elapsed),
+                ),
+                phase="rollout",
+            )
+        )
+    else:
+        lines.append(
+            _console_info(
+                "Estimated time left: unavailable. Time passed: {0}".format(
+                    _format_duration(elapsed)
+                ),
+                phase="rollout",
             )
         )
     return lines
@@ -2458,6 +2509,10 @@ def run_rule_based_mode(
     env = SPGGEnv(env_config, graph)
     run_mode = spec["run_mode"]
     rollout = spec["rollout"]
+    tensorboard = spec.get("tensorboard", {})
+    console_progress_logs = bool(tensorboard.get("console_progress_logs", True))
+    console_progress_interval = int(tensorboard.get("console_progress_interval", 1))
+    total_episodes = int(rollout["episodes"])
 
     if run_mode == "uniform":
         policy = UniformAllocationPolicy()
@@ -2468,8 +2523,9 @@ def run_rule_based_mode(
 
     episode_summaries: List[Dict[str, float]] = []
     episode_returns: List[float] = []
+    rollout_start_time = time.time()
 
-    for episode_index in range(1, rollout["episodes"] + 1):
+    for episode_index in range(1, total_episodes + 1):
         observation = env.reset(seed=spec["seed"] + episode_index - 1)
         done = False
         episode_return = 0.0
@@ -2498,6 +2554,18 @@ def run_rule_based_mode(
                 summary["final_gini"],
             )
         )
+        should_log_progress = console_progress_logs and (
+            episode_index == 1
+            or episode_index == total_episodes
+            or episode_index % max(console_progress_interval, 1) == 0
+        )
+        if should_log_progress:
+            for line in _format_rule_based_progress_lines(
+                episode_index=episode_index,
+                total_episodes=total_episodes,
+                start_time=rollout_start_time,
+            ):
+                print(line)
 
         save_visualizations_for_history(
             spec=spec,
