@@ -1167,6 +1167,10 @@ def build_scan_experiment_specs() -> List[Dict[str, Any]]:
                                 "strategy_update_rule": strategy_update_rule,
                                 "r": float(r_value),
                             }
+                            spec["_runtime"] = {
+                                "quiet_console": True,
+                                "scan_mode": True,
+                            }
                             specs.append(spec)
 
     return specs
@@ -2018,6 +2022,11 @@ def _console_info(message: str, phase: str = "train") -> str:
     return "[INFO {0}] {1} {2}".format(datetime.now().strftime("%H:%M:%S"), phase, message)
 
 
+def _runtime_quiet_console(spec: Mapping[str, Any]) -> bool:
+    runtime_flags = spec.get("_runtime", {})
+    return bool(runtime_flags.get("quiet_console", False))
+
+
 def _format_duration(seconds: float) -> str:
     total_seconds = max(int(round(float(seconds))), 0)
     hours, remainder = divmod(total_seconds, 3600)
@@ -2161,6 +2170,54 @@ def _format_rule_based_progress_lines(
                     _format_duration(elapsed)
                 ),
                 phase="rollout",
+            )
+        )
+    return lines
+
+
+def _format_scan_progress_lines(
+    completed_count: int,
+    total_count: int,
+    start_time: float,
+    latest_experiment_name: Optional[str] = None,
+) -> List[str]:
+    now = time.time()
+    elapsed = max(now - start_time, 0.0)
+    if total_count > 0:
+        progress_ratio = min(max(float(completed_count) / float(total_count), 0.0), 1.0)
+    else:
+        progress_ratio = 1.0
+
+    if 0.0 < progress_ratio < 1.0:
+        estimated_total = elapsed / progress_ratio
+        eta = max(estimated_total - elapsed, 0.0)
+    elif progress_ratio >= 1.0:
+        eta = 0.0
+    else:
+        eta = float("inf")
+
+    progress_message = "experiments: {0} / {1}".format(completed_count, total_count)
+    if latest_experiment_name:
+        progress_message += " | latest: {0}".format(latest_experiment_name)
+
+    lines = [_console_info(progress_message, phase="scan")]
+    if np.isfinite(eta):
+        lines.append(
+            _console_info(
+                "Estimated time left: {0}. Time passed: {1}".format(
+                    _format_duration(eta),
+                    _format_duration(elapsed),
+                ),
+                phase="scan",
+            )
+        )
+    else:
+        lines.append(
+            _console_info(
+                "Estimated time left: unavailable. Time passed: {0}".format(
+                    _format_duration(elapsed)
+                ),
+                phase="scan",
             )
         )
     return lines
@@ -2509,6 +2566,7 @@ def run_rule_based_mode(
     env = SPGGEnv(env_config, graph)
     run_mode = spec["run_mode"]
     rollout = spec["rollout"]
+    quiet_console = _runtime_quiet_console(spec)
     tensorboard = spec.get("tensorboard", {})
     console_progress_logs = bool(tensorboard.get("console_progress_logs", True))
     console_progress_interval = int(tensorboard.get("console_progress_interval", 1))
@@ -2546,26 +2604,27 @@ def run_rule_based_mode(
         episode_summaries.append(summary)
         episode_returns.append(episode_return)
 
-        print(
-            "[Episode {0:03d}] return={1:.6f}, final_actual_cooperation={2:.6f}, final_gini={3:.6f}".format(
-                episode_index,
-                episode_return,
-                summary["final_actual_cooperation"],
-                summary["final_gini"],
+        if not quiet_console:
+            print(
+                "[Episode {0:03d}] return={1:.6f}, final_actual_cooperation={2:.6f}, final_gini={3:.6f}".format(
+                    episode_index,
+                    episode_return,
+                    summary["final_actual_cooperation"],
+                    summary["final_gini"],
+                )
             )
-        )
-        should_log_progress = console_progress_logs and (
-            episode_index == 1
-            or episode_index == total_episodes
-            or episode_index % max(console_progress_interval, 1) == 0
-        )
-        if should_log_progress:
-            for line in _format_rule_based_progress_lines(
-                episode_index=episode_index,
-                total_episodes=total_episodes,
-                start_time=rollout_start_time,
-            ):
-                print(line)
+            should_log_progress = console_progress_logs and (
+                episode_index == 1
+                or episode_index == total_episodes
+                or episode_index % max(console_progress_interval, 1) == 0
+            )
+            if should_log_progress:
+                for line in _format_rule_based_progress_lines(
+                    episode_index=episode_index,
+                    total_episodes=total_episodes,
+                    start_time=rollout_start_time,
+                ):
+                    print(line)
 
         save_visualizations_for_history(
             spec=spec,
@@ -2946,7 +3005,8 @@ def save_results_json(
     }
     output_path = output_dir / "results.json"
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("Results saved to: {0}".format(output_path))
+    if not _runtime_quiet_console(spec):
+        print("Results saved to: {0}".format(output_path))
 
 
 def print_final_summary(results: Mapping[str, Any]) -> None:
@@ -2970,10 +3030,12 @@ def run_one_experiment(spec: Mapping[str, Any]) -> Dict[str, Any]:
     graph = build_graph(spec)
     env_config = build_env_config(spec, graph)
     output_dir = build_output_dir(spec)
+    quiet_console = _runtime_quiet_console(spec)
     with experiment_console_log_context(spec, output_dir) as console_log_path:
-        if console_log_path is not None:
+        if console_log_path is not None and not quiet_console:
             print("Console Log: {0}".format(console_log_path))
-        print_header(spec, graph, env_config)
+        if not quiet_console:
+            print_header(spec, graph, env_config)
 
         if spec["run_mode"] in {"uniform", "proportional"}:
             results = run_rule_based_mode(spec, graph, env_config, output_dir)
@@ -2982,7 +3044,8 @@ def run_one_experiment(spec: Mapping[str, Any]) -> Dict[str, Any]:
         else:
             raise ValueError("Unsupported run_mode: {0}".format(spec["run_mode"]))
 
-        print_final_summary(results)
+        if not quiet_console:
+            print_final_summary(results)
         save_results_json(spec, graph, env_config, results, output_dir)
         return results
 
@@ -3109,6 +3172,7 @@ def run_scan_experiments() -> None:
     if not output_root.is_absolute():
         output_root = PROJECT_ROOT / output_root
     output_root.mkdir(parents=True, exist_ok=True)
+    scan_start_time = time.time()
 
     manifest = {
         "scan_config": deepcopy(SCAN_EXPERIMENT),
@@ -3119,6 +3183,7 @@ def run_scan_experiments() -> None:
     manifest_path = output_root / "scan_manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print("Scan manifest saved to: {0}".format(manifest_path))
+    print(_console_info("total experiments: {0}".format(len(specs)), phase="scan"))
 
     scan_records: List[Dict[str, Any]] = []
     if SCAN_EXPERIMENT["parallel"]:
@@ -3126,7 +3191,7 @@ def run_scan_experiments() -> None:
         cpu_count = os.cpu_count() or 1
         max_workers = cpu_count if requested_workers in (None, 0) else int(requested_workers)
         max_workers = max(1, min(max_workers, len(specs)))
-        print("Running scan in parallel with {0} worker processes.".format(max_workers))
+        print(_console_info("running in parallel with {0} worker processes".format(max_workers), phase="scan"))
 
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             future_to_meta = {
@@ -3135,22 +3200,25 @@ def run_scan_experiments() -> None:
             }
             for completed_count, future in enumerate(as_completed(future_to_meta), start=1):
                 index, experiment_name = future_to_meta[future]
-                print(
-                    "[Scan completed {0}/{1}] #{2} {3}".format(
-                        completed_count,
-                        len(specs),
-                        index,
-                        experiment_name,
-                    )
-                )
                 scan_records.append(future.result())
+                for line in _format_scan_progress_lines(
+                    completed_count=completed_count,
+                    total_count=len(specs),
+                    start_time=scan_start_time,
+                    latest_experiment_name="#{0} {1}".format(index, experiment_name),
+                ):
+                    print(line)
     else:
         for index, spec in enumerate(specs, start=1):
-            print("\n" + "#" * 80)
-            print("Scan experiment {0}/{1}".format(index, len(specs)))
-            print("#" * 80)
             results = run_one_experiment(spec)
             scan_records.append(_scan_record_from_results(spec, results))
+            for line in _format_scan_progress_lines(
+                completed_count=index,
+                total_count=len(specs),
+                start_time=scan_start_time,
+                latest_experiment_name="#{0} {1}".format(index, spec["experiment_name"]),
+            ):
+                print(line)
 
     scan_records.sort(
         key=lambda item: (
