@@ -246,7 +246,7 @@ BASE_EXPERIMENT = {
 
         # 每个 episode 的时间步上限。
         # 到达这个步数后，本 episode 结束。
-        "episode_length": 1000, #150 10000
+        "episode_length": 200, #150 10000
 
         # 所有节点统一的初始资源。
         "initial_resource": 20.0,#10
@@ -322,16 +322,17 @@ BASE_EXPERIMENT = {
     # 训练参数
     # ---------------------------
     "training": {
-        # 训练总环境步数。
-        # 这是推荐直接调的“全局总步数”入口，单位与 warmup / eval_interval 保持一致。
+        # 训练总环境步数（不含 warm-up）。
+        # 这是推荐直接调的“训练阶段全局总步数”入口，单位与 warmup / eval_interval 保持一致。
         # 程序内部会按：
-        #   total_updates = ceil(total_env_steps / (num_workers * effective_steps_per_update))
+        #   total_updates = ceil((warmup_env_steps + total_env_steps) / (num_workers * effective_steps_per_update))
         # 自动换算成 update 次数。
         "total_env_steps": 15_000_000,#episode需要用总的steps除以episode_length=150
 
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
-        "warmup_env_steps": 9000,
+        # 它不计入上面的 total_env_steps，会额外附加在训练前面。
+        "warmup_env_steps": 50_000,
 
         # 每隔多少个全局环境步做一次评估。
         # 程序内部会自动换算成 update 间隔。
@@ -342,7 +343,7 @@ BASE_EXPERIMENT = {
 
         # 每个 worker 在每次训练迭代中收集多少个环境步。
         # 这是“每个 worker 每个 update”的采样粒度，不是全局总步数。
-        "steps_per_update": 750,  # episode_length=150
+        "steps_per_update": 800,  # episode_length=150
 
         # 是否强制把每次训练迭代的采样长度设为一个完整 episode。
         # 为 True 时，会忽略上面的 steps_per_update，改为使用 dynamics.episode_length。
@@ -694,7 +695,7 @@ BASE_EXPERIMENT = {
         "stages": [
             {
                 "label": "regular_only",
-                "portion": 0.40,
+                "portion": 0.30,
                 "train_network_types": ["regular"],
                 "train_network_type_weights": [1.0],
                 "eval_network_types": ["regular"],
@@ -708,7 +709,7 @@ BASE_EXPERIMENT = {
             },
             {
                 "label": "all_topologies",
-                "portion": 0.30,
+                "portion": 0.40,
                 "train_network_types": ["regular", "scale_free", "erdos_renyi", "small_world"],
                 "train_network_type_weights": [0.4, 0.3, 0.15, 0.15],
                 "eval_network_types": ["regular", "scale_free", "erdos_renyi", "small_world"],
@@ -1322,24 +1323,6 @@ def _resolve_training_schedule(spec: Mapping[str, Any]) -> Dict[str, Any]:
     num_workers = int(training["num_workers"])
     global_env_steps_per_update = effective_steps_per_update * num_workers
 
-    total_env_steps_config = training.get("total_env_steps")
-    if total_env_steps_config is not None:
-        total_env_steps_requested = int(total_env_steps_config)
-        if total_env_steps_requested <= 0:
-            raise ValueError("training.total_env_steps must be positive when provided.")
-        total_updates = max(1, int(ceil(total_env_steps_requested / float(global_env_steps_per_update))))
-        total_updates_source = "training.total_env_steps"
-    else:
-        total_updates_raw = training.get("total_updates")
-        if total_updates_raw is None:
-            raise ValueError("Either training.total_env_steps or training.total_updates must be provided.")
-        total_updates = int(total_updates_raw)
-        if total_updates <= 0:
-            raise ValueError("training.total_updates must be positive when provided.")
-        total_env_steps_requested = total_updates * global_env_steps_per_update
-        total_updates_source = "training.total_updates"
-    total_env_steps_effective = total_updates * global_env_steps_per_update
-
     warmup_env_steps_config = training.get("warmup_env_steps")
     if warmup_env_steps_config is not None:
         warmup_env_steps = int(warmup_env_steps_config)
@@ -1354,6 +1337,29 @@ def _resolve_training_schedule(spec: Mapping[str, Any]) -> Dict[str, Any]:
         if warmup_env_steps < 0:
             raise ValueError("training.warmup_steps must be non-negative when provided.")
         warmup_steps_source = "training.warmup_steps"
+
+    total_env_steps_config = training.get("total_env_steps")
+    if total_env_steps_config is not None:
+        total_env_steps_requested = int(total_env_steps_config)
+        if total_env_steps_requested <= 0:
+            raise ValueError("training.total_env_steps must be positive when provided.")
+        total_rollout_env_steps_requested = total_env_steps_requested + warmup_env_steps
+        total_updates = max(1, int(ceil(total_rollout_env_steps_requested / float(global_env_steps_per_update))))
+        total_updates_source = "training.total_env_steps"
+        total_rollout_env_steps_effective = total_updates * global_env_steps_per_update
+        total_env_steps_effective = max(total_rollout_env_steps_effective - warmup_env_steps, 0)
+    else:
+        total_updates_raw = training.get("total_updates")
+        if total_updates_raw is None:
+            raise ValueError("Either training.total_env_steps or training.total_updates must be provided.")
+        total_updates = int(total_updates_raw)
+        if total_updates <= 0:
+            raise ValueError("training.total_updates must be positive when provided.")
+        total_rollout_env_steps_requested = total_updates * global_env_steps_per_update
+        total_rollout_env_steps_effective = total_rollout_env_steps_requested
+        total_env_steps_requested = max(total_rollout_env_steps_requested - warmup_env_steps, 0)
+        total_env_steps_effective = max(total_rollout_env_steps_effective - warmup_env_steps, 0)
+        total_updates_source = "training.total_updates"
 
     eval_interval_env_steps_config = training.get("eval_interval_env_steps")
     if eval_interval_env_steps_config is not None:
@@ -1378,6 +1384,8 @@ def _resolve_training_schedule(spec: Mapping[str, Any]) -> Dict[str, Any]:
         "total_updates": total_updates,
         "total_env_steps_requested": total_env_steps_requested,
         "total_env_steps_effective": total_env_steps_effective,
+        "total_rollout_env_steps_requested": total_rollout_env_steps_requested,
+        "total_rollout_env_steps_effective": total_rollout_env_steps_effective,
         "total_updates_source": total_updates_source,
         "warmup_env_steps": warmup_env_steps,
         "warmup_steps_source": warmup_steps_source,
@@ -2426,6 +2434,7 @@ def _log_tensorboard_static_metadata(
         ),
         "static/training/global_env_steps_per_update": float(training_schedule["global_env_steps_per_update"]),
         "static/training/total_env_steps": float(training_schedule["total_env_steps_effective"]),
+        "static/training/total_rollout_env_steps": float(training_schedule["total_rollout_env_steps_effective"]),
         "static/training/warmup_env_steps": float(training_schedule["warmup_env_steps"]),
         "static/training/eval_interval_env_steps": float(training_schedule["eval_interval_env_steps"]),
         "static/training/num_workers": float(spec["training"]["num_workers"]),
@@ -2745,14 +2754,15 @@ def run_gnn_training_mode(
             else str(rollout_device)
         )
         print(
-            "Train CFG : steps_per_update={0}, source={1}, total_env_steps={2} ({3}), total_updates={4}, warmup_env_steps={5} ({6})".format(
+            "Train CFG : steps_per_update={0}, source={1}, total_env_steps={2} ({3}, excludes warmup), warmup_env_steps={4} ({5}), total_rollout_env_steps={6}, total_updates={7}".format(
                 trainer_config.steps_per_update,
                 steps_source,
                 training_schedule["total_env_steps_effective"],
                 training_schedule["total_updates_source"],
-                trainer_config.total_updates,
                 training_schedule["warmup_env_steps"],
                 training_schedule["warmup_steps_source"],
+                training_schedule["total_rollout_env_steps_effective"],
+                trainer_config.total_updates,
             )
         )
         print(
@@ -2814,7 +2824,9 @@ def run_gnn_training_mode(
         training_start_time = time.time()
         effective_steps_per_update = int(trainer_config.steps_per_update) * int(trainer_config.num_workers)
         total_env_steps = int(training_schedule["total_env_steps_effective"])
+        warmup_env_steps = int(training_schedule["warmup_env_steps"])
         recent_metrics: deque[dict[str, float]] = deque(maxlen=max(console_recent_window_updates, 1))
+        resumed_global_env_steps = int(getattr(trainer, "global_env_steps", 0))
 
         def _current_stage_label(metrics: Mapping[str, float]) -> Optional[str]:
             if "curriculum_stage" not in metrics:
@@ -2842,6 +2854,7 @@ def run_gnn_training_mode(
             checkpoint_payload = _load_checkpoint_payload(checkpoint_path)
             resumed_checkpoint_mode = trainer.load_checkpoint(checkpoint_payload)
             resumed_update = int(trainer.completed_updates)
+            resumed_global_env_steps = int(trainer.global_env_steps)
             best_eval_return = float(checkpoint_payload.get("best_eval_return_so_far", float("-inf")))
             print(
                 "Resume    : checkpoint={0}, resume_update={1}, checkpoint_mode={2}".format(
@@ -2910,7 +2923,8 @@ def run_gnn_training_mode(
                     curriculum_stages=curriculum_stages,
                     stage_log_state=tensorboard_stage_log_state,
                 )
-            env_steps = int(metrics.get("global_env_steps", update * effective_steps_per_update))
+            global_env_steps = int(metrics.get("global_env_steps", update * effective_steps_per_update))
+            env_steps = max(global_env_steps - warmup_env_steps, 0)
             should_log_progress = console_progress_logs and (
                 update == resumed_update + 1
                 or update == int(trainer_config.total_updates)
@@ -2922,8 +2936,9 @@ def run_gnn_training_mode(
                 or update % max(console_log_interval, 1) == 0
             )
             if should_log_progress:
-                session_env_steps = max(update - resumed_update, 0) * effective_steps_per_update
-                session_total_env_steps = max(int(trainer_config.total_updates) - resumed_update, 0) * effective_steps_per_update
+                resumed_training_env_steps = max(resumed_global_env_steps - warmup_env_steps, 0)
+                session_env_steps = max(env_steps - resumed_training_env_steps, 0)
+                session_total_env_steps = max(total_env_steps - resumed_training_env_steps, 0)
                 for line in _format_console_progress_lines(
                     update=update,
                     total_updates=int(trainer_config.total_updates),
