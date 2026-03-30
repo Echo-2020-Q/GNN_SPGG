@@ -176,8 +176,22 @@ BASE_EXPERIMENT = {
         #   G_i,t = min((1 + r) * P_i,t, P_max)
         "r": 2,
 
+        # 公共池容量上限模式：
+        # - "constant" ：固定常数上限，使用 p_max
+        # - "dynamic"  ：动态上限，使用
+        #                P_max,i,t = p_c * N_c,i,t * rho_c,i,t
+        #                          = p_c * N_c,i,t^2 / (d_i + 1)
+        "p_mode": "dynamic" ,
+
         # P_max：资源池增长后的饱和上限。
+        # 仅当 p_mode == "constant" 时使用。
         "p_max": 100.0,#40
+
+        # 动态公共池容量系数 p_c。
+        # 仅当 p_mode == "dynamic" 时使用。
+        # 例如在规则四邻居图中，若希望全合作时动态容量上限约等于 100，
+        # 可取 p_c = 20，因为此时 d_i + 1 = 5，故 P_max = 20 * 5 = 100。
+        "p_c": 20.0,
 
         # 资源自然消耗模式：
         # - "fixed"            ：每轮固定消耗
@@ -232,7 +246,7 @@ BASE_EXPERIMENT = {
 
         # 每个 episode 的时间步上限。
         # 到达这个步数后，本 episode 结束。
-        "episode_length": 150, #150 10000
+        "episode_length": 1000, #150 10000
 
         # 所有节点统一的初始资源。
         "initial_resource": 20.0,#10
@@ -250,6 +264,7 @@ BASE_EXPERIMENT = {
         # reward =
         #   lambda_payoff * mean(payoff)
         #   + lambda_cooperation * mean(next_actual_cooperation)
+        #   + lambda_total_resource * sum(next_resources)
         #   - lambda_gini * gini(next_resources)
         # 当前这组默认系数下，实际 reward = mean(payoff)。
 
@@ -258,6 +273,10 @@ BASE_EXPERIMENT = {
 
         # 下一时刻实际合作比例项的权重。
         "lambda_cooperation": 0.0,
+
+        # 下一时刻全局总资源项的权重。
+        # 单步使用 sum(next_resources)；跨时间平均后对应评估里的 R_total_mean 口径。
+        "lambda_total_resource": 0.0,
 
         # Gini 不平等惩罚项的权重。
         "lambda_gini": 0.0,
@@ -717,7 +736,7 @@ BASE_EXPERIMENT = {
 
         # 是否生成宏观时间序列图。
         # 开启后，每个选中的 episode 都会保存一张统计量随时间变化的折线图。
-        "enable_macro_timeseries": False,
+        "enable_macro_timeseries": True,
 
         # 想要可视化哪些 episode。
         # 用 1-based 编号，例如 [1, 3] 表示只可视化第 1 和第 3 个 episode。
@@ -834,7 +853,7 @@ BASE_EXPERIMENT = {
     "output": {
         # 所有输出结果的根目录。
         # 每个实验会在下面单独建一个子目录。
-        "root_dir": "outputs/GNN_SPGG",#"outputs",
+        "root_dir": "outputs/Pool_dynamic",#"outputs",
 
         # 是否保存结果 JSON。
         "save_results_json": True,
@@ -928,19 +947,19 @@ BATCH_EXPERIMENTS = [
 # 参数扫描配置：启用后会忽略上面的 BATCH_EXPERIMENTS，自动生成扫描实验
 # =============================================================================
 SCAN_EXPERIMENT = {
-    "enabled": False,
-    "name": "3_18_num_nodes_r_network_consumption_strategy_scan_proportional",
-    "output_root_dir": "outputs/10000frame_r_network_consumption_strategy_scan_0.01_0.1tau",
+    "enabled": True,
+    "name": "3_30_dynamics_scan",#扫描实验的名字，会在output_root_dir下面生成一个同名子目录
+    "output_root_dir": "outputs/Pool_dynamic_scan",#"outputs/scan",
     "parallel": True,
     "max_workers": 32,#自己的电脑为16核
-    "r_values": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5],
-    "resource_consumption_rate": [0.01, 0.05,0.1],
-    "num_nodes": [100,1000,2500],
+    "r_values": [0.25, 0.75, 1.25, 1.75, 2.25],
+    "resource_consumption_rate": [0.05],
+    "num_nodes": [50],
     "network_types": ["regular", "erdos_renyi", "small_world", "scale_free"],
     "resource_consumption_modes": ["piecewise_linear"],#["fixed", "proportional", "piecewise_linear"],
     "resource_consumption_fixed_modes": ["constant", "degree_scaled"],
     "strategy_update_rules": ["q_learning", "fermi"],
-    "run_mode": ["proportional"],
+    "run_mode": ["proportional,uniform"],#["proportional", "uniform"],
 }
 
 def deep_update(base: Dict[str, Any], overrides: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1239,7 +1258,9 @@ def build_env_config(spec: Mapping[str, Any], graph: Mapping[int, Sequence[int]]
     return SPGGConfig(
         alpha=dynamics["alpha"],
         r=dynamics["r"],
+        p_mode=dynamics.get("p_mode", "constant"),
         p_max=dynamics["p_max"],
+        p_c=dynamics.get("p_c", 1.0),
         resource_consumption_mode=dynamics.get("resource_consumption_mode", "fixed"),
         resource_consumption_fixed_mode=dynamics.get("resource_consumption_fixed_mode", "constant"),
         resource_consumption_fixed=dynamics.get("resource_consumption_fixed", 0.0),
@@ -1259,6 +1280,7 @@ def build_env_config(spec: Mapping[str, Any], graph: Mapping[int, Sequence[int]]
         reward=RewardConfig(
             lambda_payoff=reward["lambda_payoff"],
             lambda_cooperation=reward["lambda_cooperation"],
+            lambda_total_resource=reward.get("lambda_total_resource", 0.0),
             lambda_gini=reward["lambda_gini"],
             epsilon=reward["epsilon"],
         ),
@@ -1719,14 +1741,21 @@ def print_header(spec: Mapping[str, Any], graph: Mapping[int, Sequence[int]], en
             summary["degree_mean"],
         )
     )
-    print(
-        "Dynamics  : alpha={0}, r={1}, p_max={2}, episode_length={3}".format(
+    if env_config.p_mode == "dynamic":
+        dynamics_summary = "Dynamics  : alpha={0}, r={1}, p_mode=dynamic, p_c={2}, episode_length={3}".format(
+            env_config.alpha,
+            env_config.r,
+            env_config.p_c,
+            env_config.episode_length,
+        )
+    else:
+        dynamics_summary = "Dynamics  : alpha={0}, r={1}, p_mode=constant, p_max={2}, episode_length={3}".format(
             env_config.alpha,
             env_config.r,
             env_config.p_max,
             env_config.episode_length,
         )
-    )
+    print(dynamics_summary)
     if env_config.resource_consumption_mode == "fixed":
         if env_config.resource_consumption_fixed_mode == "degree_scaled":
             print(
@@ -1782,9 +1811,10 @@ def print_header(spec: Mapping[str, Any], graph: Mapping[int, Sequence[int]], en
     else:
         print("Strategy  : rule=imitate_best")
     print(
-        "Reward    : lambda_payoff={0}, lambda_cooperation={1}, lambda_gini={2}".format(
+        "Reward    : lambda_payoff={0}, lambda_cooperation={1}, lambda_total_resource={2}, lambda_gini={3}".format(
             env_config.reward.lambda_payoff,
             env_config.reward.lambda_cooperation,
+            env_config.reward.lambda_total_resource,
             env_config.reward.lambda_gini,
         )
     )
@@ -2265,10 +2295,13 @@ def _log_tensorboard_static_metadata(
         "static/graph/degree_mean": float(summary["degree_mean"]),
         "static/dynamics/alpha": float(env_config.alpha),
         "static/dynamics/r": float(env_config.r),
+        "static/dynamics/p_mode_is_dynamic": float(env_config.p_mode == "dynamic"),
         "static/dynamics/p_max": float(env_config.p_max),
+        "static/dynamics/p_c": float(env_config.p_c),
         "static/dynamics/episode_length": float(env_config.episode_length),
         "static/reward/lambda_payoff": float(env_config.reward.lambda_payoff),
         "static/reward/lambda_cooperation": float(env_config.reward.lambda_cooperation),
+        "static/reward/lambda_total_resource": float(env_config.reward.lambda_total_resource),
         "static/reward/lambda_gini": float(env_config.reward.lambda_gini),
         "static/gnn/hidden_dim": float(spec["gnn"]["hidden_dim"]),
         "static/gnn/local_hidden_dim": float(spec["gnn"].get("local_hidden_dim") or spec["gnn"]["hidden_dim"]),

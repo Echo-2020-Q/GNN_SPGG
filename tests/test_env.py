@@ -69,6 +69,47 @@ class SPGGEnvTests(unittest.TestCase):
         observation = env.reset(initial_resources=[3.0, 3.0], initial_strategies=[1, 1], seed=0)
         np.testing.assert_allclose(observation["pool_raw"], np.array([2.0, 2.0]))
         np.testing.assert_allclose(observation["pool_grown"], np.array([3.0, 3.0]))
+        np.testing.assert_allclose(observation["p_max"], np.array([3.0, 3.0]))
+
+    def test_dynamic_pool_capacity_uses_actual_cooperators(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=10.0,
+                p_mode="dynamic",
+                p_max=999.0,
+                p_c=10.0,
+                beta=0.0,
+                episode_length=1,
+            ),
+            {0: [1], 1: [0]},
+        )
+
+        observation = env.reset(initial_resources=[3.0, 1.0], initial_strategies=[1, 1], seed=0)
+        np.testing.assert_allclose(observation["x_actual"], np.array([1.0, 0.0]))
+        np.testing.assert_allclose(observation["local_actual_cooperators"], np.array([1.0, 1.0]))
+        np.testing.assert_allclose(observation["p_max"], np.array([5.0, 5.0]))
+        np.testing.assert_allclose(observation["pool_capacity"], np.array([5.0, 5.0]))
+        np.testing.assert_allclose(observation["pool_grown"], np.array([5.0, 5.0]))
+
+    def test_dynamic_pool_capacity_scales_with_group_size_and_density(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=1.0,
+                p_mode="dynamic",
+                p_max=999.0,
+                p_c=3.0,
+                beta=0.0,
+                episode_length=1,
+            ),
+            {0: [1], 1: [0, 2], 2: [1]},
+        )
+
+        observation = env.reset(initial_resources=[4.0, 5.0, 4.0], initial_strategies=[1, 1, 1], seed=0)
+        np.testing.assert_allclose(observation["local_actual_cooperators"], np.array([2.0, 3.0, 2.0]))
+        np.testing.assert_allclose(observation["p_max"], np.array([6.0, 9.0, 6.0]))
+        np.testing.assert_allclose(observation["pool_capacity"], np.array([6.0, 9.0, 6.0]))
 
     def test_fixed_resource_consumption_reduces_resources_but_not_payoff(self) -> None:
         env = SPGGEnv(
@@ -91,6 +132,30 @@ class SPGGEnvTests(unittest.TestCase):
         np.testing.assert_allclose(info["consumption"], np.array([1.0, 1.0]))
         np.testing.assert_allclose(info["payoff"], np.array([0.0, 0.0]))
         np.testing.assert_allclose(next_observation["resources"], np.array([2.0, 2.0]))
+
+    def test_reward_can_include_total_resource_term(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.0,
+                p_max=10.0,
+                beta=0.0,
+                episode_length=1,
+                reward=RewardConfig(
+                    lambda_payoff=0.0,
+                    lambda_cooperation=0.0,
+                    lambda_total_resource=0.5,
+                    lambda_gini=0.0,
+                ),
+            ),
+            {0: [1], 1: [0]},
+        )
+
+        observation = env.reset(initial_resources=[3.0, 3.0], initial_strategies=[1, 1], seed=0)
+        _, reward, done, info = env.step(UniformAllocationPolicy().allocate(observation))
+        self.assertTrue(done)
+        self.assertAlmostEqual(reward, 3.0)
+        self.assertAlmostEqual(info["reward_components"]["total_resource_next"], 6.0)
 
     def test_proportional_resource_consumption_is_capped_by_available_resources(self) -> None:
         env = SPGGEnv(
@@ -293,7 +358,7 @@ class SPGGEnvTests(unittest.TestCase):
             [],
         )
         env.reset(initial_resources=[0.0], initial_strategies=[1], seed=0)
-        env._q_values = np.zeros((1, 2, 2), dtype=np.float64)
+        env._q_values = np.array([[[1.0, 0.0], [0.0, 0.0]]], dtype=np.float64)
         env._q_learning_previous_actions = np.array([1], dtype=np.int8)
 
         next_nominal = env._q_learning_2x2_update(

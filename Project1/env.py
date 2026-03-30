@@ -18,6 +18,7 @@ Observation = Dict[str, np.ndarray]
 class RewardConfig:
     lambda_payoff: float = 1.0
     lambda_cooperation: float = 0.0
+    lambda_total_resource: float = 0.0
     lambda_gini: float = 0.0
     epsilon: float = 1e-8
 
@@ -26,7 +27,9 @@ class RewardConfig:
 class SPGGConfig:
     alpha: float = 0.0
     r: float = 1.0
+    p_mode: str = "constant"
     p_max: float = 10.0
+    p_c: float = 1.0
     resource_consumption_mode: str = "fixed"
     resource_consumption_fixed_mode: str = "constant"
     resource_consumption_fixed: float = 0.0
@@ -47,8 +50,16 @@ class SPGGConfig:
     reward: RewardConfig = field(default_factory=RewardConfig)
 
     def __post_init__(self) -> None:
-        if self.p_max <= 0.0:
-            raise ValueError("p_max must be positive.")
+        if self.p_mode not in {"constant", "dynamic", "p_dynamic"}:
+            raise ValueError("p_mode must be one of {'constant', 'dynamic', 'p_dynamic'}.")
+        if self.p_mode == "p_dynamic":
+            self.p_mode = "dynamic"
+        if self.p_mode == "constant" and self.p_max <= 0.0:
+            raise ValueError("p_max must be positive when p_mode == 'constant'.")
+        if self.p_mode != "constant" and self.p_max < 0.0:
+            raise ValueError("p_max must be non-negative when p_mode != 'constant'.")
+        if self.p_c < 0.0:
+            raise ValueError("p_c must be non-negative.")
         if self.resource_consumption_mode not in {"fixed", "proportional", "piecewise_linear"}:
             raise ValueError(
                 "resource_consumption_mode must be one of {'fixed', 'proportional', 'piecewise_linear'}."
@@ -397,6 +408,7 @@ class SPGGEnv:
                 "mean_consumption": float(consumption.mean()),
                 "mean_payoff": float(payoff.mean()),
                 "actual_cooperation_rate_next": next_actual_cooperation,
+                "total_resource_next": float(next_resources.sum()),
                 "gini_next_resources": next_gini,
             },
         }
@@ -509,8 +521,15 @@ class SPGGEnv:
         unit_investment = investment / self._thresholds_float64
 
         pool_raw = self._local_mask_float64 @ unit_investment
-        pool_grown = np.minimum((1.0 + self.config.r) * pool_raw, self.config.p_max)
-        pool_raw_norm = np.minimum(pool_raw, self.config.p_max) / self.config.p_max
+        local_actual_cooperators = self._local_mask_float64 @ actual_strategies
+        pool_capacity = self._compute_pool_capacity(local_actual_cooperators)
+        pool_grown = np.minimum((1.0 + self.config.r) * pool_raw, pool_capacity)
+        pool_raw_norm = np.divide(
+            np.minimum(pool_raw, pool_capacity),
+            pool_capacity,
+            out=np.zeros_like(pool_raw, dtype=np.float64),
+            where=pool_capacity > 1e-8,
+        )
         resource_norm = resources / self.resource_norm_reference
         strategy_norm = np.divide(
             investment,
@@ -528,13 +547,15 @@ class SPGGEnv:
             "unit_investment": unit_investment.astype(np.float64, copy=True),
             "pool_raw": pool_raw.astype(np.float64, copy=True),
             "pool_grown": pool_grown.astype(np.float64, copy=True),
+            "pool_capacity": pool_capacity.astype(np.float64, copy=True),
+            "local_actual_cooperators": local_actual_cooperators.astype(np.float64, copy=True),
             "degrees": self._degrees_int64.copy(),
             "pool_raw_norm": pool_raw_norm.astype(np.float64, copy=True),
             "resource_norm": resource_norm.astype(np.float64, copy=True),
             "degree_norm": self._degree_norm_float64.copy(),
             "strategy_norm": strategy_norm.astype(np.float64, copy=True),
             "gini": np.asarray(resource_gini, dtype=np.float64),
-            "p_max": self._p_max_scalar.copy(),
+            "p_max": pool_capacity.astype(np.float64, copy=True),
             "local_mask": self._local_mask_bool.copy(),
         }
 
@@ -592,16 +613,30 @@ class SPGGEnv:
         )
 
     def _compute_resource_norm_reference(self) -> float:
+        capacity_reference = self._compute_pool_capacity_upper_bound()
         denominator = self.config.alpha + self.config.resource_consumption_rate
         if denominator <= 1e-8:
-            return max(self.config.p_max, 1e-8)
+            return capacity_reference
 
         theoretical_max = (
-            self.config.p_max - ((1.0 - self.config.alpha) * (self.graph_mean_degree + 1.0))
+            capacity_reference - ((1.0 - self.config.alpha) * (self.graph_mean_degree + 1.0))
         ) / denominator
         if theoretical_max <= 1e-8:
-            return max(self.config.p_max, 1e-8)
+            return capacity_reference
         return float(theoretical_max)
+
+    def _compute_pool_capacity(self, local_actual_cooperators: np.ndarray) -> np.ndarray:
+        if self.config.p_mode == "constant":
+            return self._constant_pool_capacity_float64.copy()
+        if self.config.p_mode == "dynamic":
+            return self.config.p_c * np.square(local_actual_cooperators) / self._thresholds_float64
+        raise RuntimeError("Unsupported p_mode: {0}".format(self.config.p_mode))
+
+    def _compute_pool_capacity_upper_bound(self) -> float:
+        if self.config.p_mode == "constant":
+            return max(self.config.p_max, 1e-8)
+        max_group_size = float(np.max(self.graph.degrees) + 1.0) if self.num_nodes > 0 else 1.0
+        return max(self.config.p_c * max_group_size, 1e-8)
 
     def _synchronous_fermi_update(self, nominal_strategies: np.ndarray, payoff: np.ndarray) -> np.ndarray:
         next_nominal = nominal_strategies.astype(np.int8, copy=True)
@@ -709,6 +744,9 @@ class SPGGEnv:
     ) -> float:
         reward_config = self.config.reward
         gini_penalty = 0.0
+        total_resource_bonus = 0.0
+        if reward_config.lambda_total_resource != 0.0:
+            total_resource_bonus = reward_config.lambda_total_resource * float(next_resources.sum())
         if reward_config.lambda_gini != 0.0:
             resource_gini = (
                 float(next_resource_gini)
@@ -719,6 +757,7 @@ class SPGGEnv:
         return float(
             reward_config.lambda_payoff * payoff.mean()
             + reward_config.lambda_cooperation * next_actual_strategies.mean()
+            + total_resource_bonus
             - gini_penalty
         )
 
@@ -731,7 +770,7 @@ class SPGGEnv:
         degree_reference = max(self.target_mean_degree, 1e-8)
         self._degree_norm_float64 = (self._degrees_float64 - degree_reference) / degree_reference
         self._fixed_consumption_component_float64 = self._compute_fixed_consumption_component_array()
-        self._p_max_scalar = np.asarray(self.config.p_max, dtype=np.float64)
+        self._constant_pool_capacity_float64 = np.full(self.num_nodes, self.config.p_max, dtype=np.float64)
 
     @staticmethod
     def _copy_observation(observation: Observation) -> Observation:

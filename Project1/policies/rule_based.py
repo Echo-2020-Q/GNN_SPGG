@@ -72,7 +72,7 @@ class ConstantMixAllocationPolicy:
 
 
 class PoolPowerMixAllocationPolicy:
-    """Blend uniform and proportional allocation with omega_i = (clip(pool_raw_i, 0, p_max) / p_max)^k."""
+    """Blend uniform and proportional allocation with per-pool omega_i based on pool capacity."""
 
     def __init__(self, power_k: float = 19.0):
         if power_k < 0.0:
@@ -83,13 +83,23 @@ class PoolPowerMixAllocationPolicy:
         local_mask = np.asarray(observation["local_mask"], dtype=bool)
         unit_investment = np.asarray(observation["unit_investment"], dtype=np.float64)
         pool_raw = np.asarray(observation["pool_raw"], dtype=np.float64)
-        p_max = float(np.asarray(observation["p_max"], dtype=np.float64))
-        if p_max <= 0.0:
-            raise ValueError("observation['p_max'] must be positive.")
+        p_max = np.asarray(observation["p_max"], dtype=np.float64)
+        if p_max.ndim == 0:
+            p_max = np.full_like(pool_raw, float(p_max), dtype=np.float64)
+        if p_max.shape != pool_raw.shape:
+            raise ValueError("observation['p_max'] must be a scalar or have the same shape as pool_raw.")
+        if np.any(p_max < 0.0):
+            raise ValueError("observation['p_max'] must be non-negative.")
 
         uniform = _uniform_allocation(local_mask)
         proportional = _proportional_allocation(local_mask, unit_investment)
-        omega = np.power(np.clip(pool_raw, 0.0, p_max) / p_max, self.power_k)
+        pool_fill_ratio = np.divide(
+            np.clip(pool_raw, 0.0, p_max),
+            p_max,
+            out=np.zeros_like(pool_raw, dtype=np.float64),
+            where=p_max > 1e-8,
+        )
+        omega = np.power(pool_fill_ratio, self.power_k)
         return (omega[:, None] * uniform) + ((1.0 - omega)[:, None] * proportional)
 
     def __call__(self, observation: Observation) -> np.ndarray:
