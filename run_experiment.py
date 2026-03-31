@@ -272,6 +272,7 @@ BASE_EXPERIMENT = {
         #   lambda_payoff * mean(payoff)
         #   + lambda_cooperation * mean(next_actual_cooperation)
         #   + lambda_total_resource * mean(next_resources)
+        #   - lambda_collapse * mean(next_resources < degree + 1)
         #   - lambda_gini * gini(next_resources)
         # 当前这组默认系数下，实际 reward = mean(payoff)。
         #   # 为了方便正则化，我们将这些标量奖励规范化，每项为10，规范化的分母为对应项的理论稳态最大值，
@@ -286,6 +287,10 @@ BASE_EXPERIMENT = {
         # 单步使用 mean(next_resources)；跨时间平均后对应评估里的 mean_resource 口径。
         #Pc=50，Pmax=250,α=0.5，τ=0.1，\bar_{d}=4, R_M=370.83
         "lambda_total_resource": 15/371.0,
+
+        # 下一时刻“低资源/塌缩个体比例”惩罚项的权重。
+        # 口径：mean(next_resources < degree + 1)。
+        "lambda_collapse": 0.0,
 
         # Gini 不平等惩罚项的权重。
         "lambda_gini": 5.0,
@@ -339,6 +344,7 @@ BASE_EXPERIMENT = {
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
         # 它不计入上面的 total_env_steps，会额外附加在训练前面。
+        # 设为 0 时，不仅没有 warm-up 行为采样，Actor 的 BC 约束也会一起关闭。
         "warmup_env_steps": 307_200,
 
         # 每隔多少个全局环境步做一次评估。
@@ -672,6 +678,11 @@ BASE_EXPERIMENT = {
         # 是否使用自定义评估环境族。
         # 关闭时，训练过程中的周期评估使用当前 spec 对应的固定 eval_env。
         "use_custom_env_families": True,
+
+        # 训练结束后，是否先自动加载 checkpoints/best_eval.pt，
+        # 再执行 post_training_evaluation。
+        # 关闭时，post_training_evaluation 使用训练结束时内存中的最终模型。
+        "use_best_checkpoint_for_post_training_eval": True,
 
         # 每个条目定义一个评估环境族。
         # 对随机图模型，同一条目下不同评估 episode 会用不同图 seed 重新采样图，
@@ -1417,6 +1428,7 @@ def build_env_config(spec: Mapping[str, Any], graph: Mapping[int, Sequence[int]]
             lambda_payoff=reward["lambda_payoff"],
             lambda_cooperation=reward["lambda_cooperation"],
             lambda_total_resource=reward.get("lambda_total_resource", 0.0),
+            lambda_collapse=reward.get("lambda_collapse", 0.0),
             lambda_gini=reward["lambda_gini"],
             epsilon=reward["epsilon"],
         ),
@@ -1960,10 +1972,11 @@ def print_header(spec: Mapping[str, Any], graph: Mapping[int, Sequence[int]], en
     else:
         print("Strategy  : rule=imitate_best")
     print(
-        "Reward    : lambda_payoff={0}, lambda_cooperation={1}, lambda_total_resource={2}, lambda_gini={3}".format(
+        "Reward    : lambda_payoff={0}, lambda_cooperation={1}, lambda_total_resource={2}, lambda_collapse={3}, lambda_gini={4}".format(
             env_config.reward.lambda_payoff,
             env_config.reward.lambda_cooperation,
             env_config.reward.lambda_total_resource,
+            env_config.reward.lambda_collapse,
             env_config.reward.lambda_gini,
         )
     )
@@ -2559,6 +2572,7 @@ def _log_tensorboard_static_metadata(
         "static/reward/lambda_payoff": float(env_config.reward.lambda_payoff),
         "static/reward/lambda_cooperation": float(env_config.reward.lambda_cooperation),
         "static/reward/lambda_total_resource": float(env_config.reward.lambda_total_resource),
+        "static/reward/lambda_collapse": float(env_config.reward.lambda_collapse),
         "static/reward/lambda_gini": float(env_config.reward.lambda_gini),
         "static/gnn/hidden_dim": float(spec["gnn"]["hidden_dim"]),
         "static/gnn/local_hidden_dim": float(spec["gnn"].get("local_hidden_dim") or spec["gnn"]["hidden_dim"]),
@@ -2869,6 +2883,7 @@ def run_gnn_training_mode(
     trainer_config = build_trainer_config(spec)
     training_schedule = _resolve_training_schedule(spec)
     randomization_config = build_domain_randomization_config(spec)
+    evaluation = spec.get("evaluation", {})
     eval_env_factories = build_evaluation_env_factories(spec)
     curriculum_stages = build_training_curriculum(spec)
     training = spec["training"]
@@ -3117,6 +3132,30 @@ def run_gnn_training_mode(
                 metrics=final_metrics,
             )
 
+        post_training_eval_model_source = "final_policy"
+        post_training_eval_checkpoint = None
+        if bool(evaluation.get("use_best_checkpoint_for_post_training_eval", False)):
+            if not save_best_checkpoint:
+                raise ValueError(
+                    "evaluation.use_best_checkpoint_for_post_training_eval=True requires "
+                    "training.save_best_checkpoint=True."
+                )
+            best_checkpoint_path = checkpoint_dir / "best_eval.pt"
+            if not best_checkpoint_path.exists():
+                raise FileNotFoundError(
+                    "Best checkpoint not found for post-training evaluation: {0}".format(best_checkpoint_path)
+                )
+            best_checkpoint_payload = _load_checkpoint_payload(best_checkpoint_path)
+            loaded_checkpoint_mode = trainer.load_checkpoint(best_checkpoint_payload)
+            post_training_eval_model_source = "best_eval_checkpoint"
+            post_training_eval_checkpoint = str(best_checkpoint_path)
+            print(
+                "Post-Eval : loaded best checkpoint={0}, checkpoint_mode={1}".format(
+                    best_checkpoint_path,
+                    loaded_checkpoint_mode,
+                )
+            )
+
         evaluation_summaries = run_trained_policy_evaluation(
             spec=spec,
             graph=graph,
@@ -3139,6 +3178,8 @@ def run_gnn_training_mode(
             "network_type": spec["network"]["type"],
             "trainer_config": asdict(trainer_config),
             "history": history,
+            "post_training_eval_model_source": post_training_eval_model_source,
+            "post_training_eval_checkpoint": post_training_eval_checkpoint,
             "post_training_evaluation": evaluation_summaries,
             "final_metrics": history[-1] if history else {},
         }

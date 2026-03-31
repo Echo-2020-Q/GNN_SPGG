@@ -19,6 +19,7 @@ class RewardConfig:
     lambda_payoff: float = 1.0
     lambda_cooperation: float = 0.0
     lambda_total_resource: float = 0.0
+    lambda_collapse: float = 0.0
     lambda_gini: float = 0.0
     epsilon: float = 1e-8
 
@@ -386,11 +387,13 @@ class SPGGEnv:
         next_gini = float(np.asarray(next_observation["gini"]).item())
         next_actual_cooperation = float(next_observation["x_actual"].mean())
         current_actual_cooperation = float(observation["x_actual"].mean())
+        next_collapse_ratio = self._collapse_ratio(next_resources)
         reward = self._planner_reward(
             payoff,
             next_observation["x_actual"],
             next_resources,
             next_resource_gini=next_gini,
+            next_collapse_ratio=next_collapse_ratio,
         )
 
         info = {
@@ -410,6 +413,8 @@ class SPGGEnv:
                 "actual_cooperation_rate_next": next_actual_cooperation,
                 "mean_resource_next": float(next_resources.mean()),
                 "total_resource_next": float(next_resources.sum()),
+                "collapse_ratio_next": next_collapse_ratio,
+                "collapse_penalty": float(self.config.reward.lambda_collapse * next_collapse_ratio),
                 "gini_next_resources": next_gini,
             },
         }
@@ -751,12 +756,21 @@ class SPGGEnv:
         next_actual_strategies: np.ndarray,
         next_resources: np.ndarray,
         next_resource_gini: float | None = None,
+        next_collapse_ratio: float | None = None,
     ) -> float:
         reward_config = self.config.reward
         gini_penalty = 0.0
         total_resource_bonus = 0.0
+        collapse_penalty = 0.0
         if reward_config.lambda_total_resource != 0.0:
             total_resource_bonus = reward_config.lambda_total_resource * float(next_resources.mean())
+        if reward_config.lambda_collapse != 0.0:
+            collapse_ratio = (
+                float(next_collapse_ratio)
+                if next_collapse_ratio is not None
+                else self._collapse_ratio(next_resources)
+            )
+            collapse_penalty = reward_config.lambda_collapse * collapse_ratio
         if reward_config.lambda_gini != 0.0:
             resource_gini = (
                 float(next_resource_gini)
@@ -768,8 +782,12 @@ class SPGGEnv:
             reward_config.lambda_payoff * payoff.mean()
             + reward_config.lambda_cooperation * next_actual_strategies.mean()
             + total_resource_bonus
+            - collapse_penalty
             - gini_penalty
         )
+
+    def _collapse_ratio(self, resources: np.ndarray) -> float:
+        return float((np.asarray(resources, dtype=np.float64) < self._thresholds_float64).mean())
 
     def _refresh_static_caches(self) -> None:
         self._degrees_int64 = self.graph.degrees.astype(np.int64, copy=True)
