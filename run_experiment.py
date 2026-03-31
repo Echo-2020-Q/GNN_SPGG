@@ -102,7 +102,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "spgg_CNN_12workers_PoolDynamic_warmupBC",
+    "experiment_name": "spgg_GNN_12workers_warmupBC_30M_PoolPowerMix",
 
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -288,7 +288,7 @@ BASE_EXPERIMENT = {
         "lambda_total_resource": 15/371.0,
 
         # Gini 不平等惩罚项的权重。
-        "lambda_gini": 0.0,
+        "lambda_gini": 5.0,
 
         # Gini 分母的极小修正项，通常不需要改。
         "epsilon": 1e-8,
@@ -334,7 +334,7 @@ BASE_EXPERIMENT = {
         # 程序内部会按：
         #   total_updates = ceil((warmup_env_steps + total_env_steps) / (num_workers * effective_steps_per_update))
         # 自动换算成 update 次数。
-        "total_env_steps": 15_000_000,#episode需要用总的steps除以episode_length=150
+        "total_env_steps": 30_000_000,#episode需要用总的steps除以episode_length=150
 
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
@@ -477,19 +477,19 @@ BASE_EXPERIMENT = {
         "warmup_selection_granularity": "per_episode",
 
         # warm-up 中均匀分配启发式的采样权重。
-        "warmup_uniform_prob": 0.20,
+        "warmup_uniform_prob": 0.05,
 
         # warm-up 中按局部贡献比例分配启发式的采样权重。
-        "warmup_proportional_prob": 0.25,
+        "warmup_proportional_prob": 0.05,
 
         # warm-up 中常数混合启发式的采样权重。
         # 行为形式：omega * uniform + (1 - omega) * proportional。
-        "warmup_constant_mix_prob": 0.15,
+        "warmup_constant_mix_prob": 0.55,
 
         # warm-up 中 pool 驱动混合启发式的采样权重。
         # 行为形式：omega_i * uniform + (1 - omega_i) * proportional，
         # 其中 omega_i = (clip(pool_raw_i, 0, p_max) / p_max) ^ k。
-        "warmup_pool_power_mix_prob": 0.25,
+        "warmup_pool_power_mix_prob": 0.2,
 
         # warm-up 中随机 logits 行为的采样权重。
         "warmup_random_logits_prob": 0.15,
