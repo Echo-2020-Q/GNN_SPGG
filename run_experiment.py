@@ -987,7 +987,7 @@ BATCH_EXPERIMENTS = [
 # 参数扫描配置：启用后会忽略上面的 BATCH_EXPERIMENTS，自动生成扫描实验
 # =============================================================================
 SCAN_EXPERIMENT = {
-    "enabled": True, #是否启用参数扫描实验，启用后会忽略上面的 BATCH_EXPERIMENTS，自动生成扫描实验
+    "enabled": False, #是否启用参数扫描实验，启用后会忽略上面的 BATCH_EXPERIMENTS，自动生成扫描实验
     "name": "3_31_dynamics_scan_mixed", #扫描实验的名字，会在output_root_dir下面生成一个同名子目录
     "output_root_dir": "outputs/Pool_dynamic_scan_mixed",#"outputs/scan",
     "parallel": True,
