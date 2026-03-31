@@ -25,6 +25,8 @@ class ReplayBuffer:
         self._action_buffers: dict[str, Tensor] = {}
         self._reward_buffer: Tensor | None = None
         self._done_buffer: Tensor | None = None
+        self._is_demo_buffer: Tensor | None = None
+        self._collapse_flag_buffer: Tensor | None = None
 
     def _is_initialized(self) -> bool:
         return self._reward_buffer is not None
@@ -43,6 +45,8 @@ class ReplayBuffer:
         }
         self._reward_buffer = torch.empty(self.capacity, dtype=transition.reward.dtype, device="cpu")
         self._done_buffer = torch.empty(self.capacity, dtype=transition.done.dtype, device="cpu")
+        self._is_demo_buffer = torch.empty(self.capacity, dtype=transition.is_demo.dtype, device="cpu")
+        self._collapse_flag_buffer = torch.empty(self.capacity, dtype=transition.collapse_flag.dtype, device="cpu")
 
     def _allocate_from_batch(self, batch: TensorReplayBatch) -> None:
         self._obs_buffers = {
@@ -58,6 +62,8 @@ class ReplayBuffer:
         }
         self._reward_buffer = torch.empty(self.capacity, dtype=batch.reward.dtype, device="cpu")
         self._done_buffer = torch.empty(self.capacity, dtype=batch.done.dtype, device="cpu")
+        self._is_demo_buffer = torch.empty(self.capacity, dtype=batch.is_demo.dtype, device="cpu")
+        self._collapse_flag_buffer = torch.empty(self.capacity, dtype=batch.collapse_flag.dtype, device="cpu")
 
     def _coerce_transition(self, transition: TensorTransition | Transition) -> TensorTransition:
         if isinstance(transition, TensorTransition):
@@ -89,6 +95,12 @@ class ReplayBuffer:
             buffer = self._action_buffers[key]
             if tuple(value.shape) != tuple(buffer.shape[1:]) or value.dtype != buffer.dtype:
                 raise ValueError("Action field '{0}' is incompatible with replay buffer schema.".format(key))
+        if self._is_demo_buffer is None or self._collapse_flag_buffer is None:
+            raise ValueError("Replay metadata buffers are not initialized.")
+        if transition.is_demo.shape != torch.Size([]) or transition.is_demo.dtype != self._is_demo_buffer.dtype:
+            raise ValueError("Transition field 'is_demo' is incompatible with replay buffer schema.")
+        if transition.collapse_flag.shape != torch.Size([]) or transition.collapse_flag.dtype != self._collapse_flag_buffer.dtype:
+            raise ValueError("Transition field 'collapse_flag' is incompatible with replay buffer schema.")
 
     def _write_transition_at_index(self, index: int, transition: TensorTransition) -> None:
         for key, value in transition.obs.items():
@@ -99,8 +111,12 @@ class ReplayBuffer:
         self._action_buffers["allocation"][index].copy_(transition.action.allocation)
         assert self._reward_buffer is not None
         assert self._done_buffer is not None
+        assert self._is_demo_buffer is not None
+        assert self._collapse_flag_buffer is not None
         self._reward_buffer[index] = transition.reward
         self._done_buffer[index] = transition.done
+        self._is_demo_buffer[index] = transition.is_demo
+        self._collapse_flag_buffer[index] = transition.collapse_flag
 
     def _validate_batch_structure(self, batch: TensorReplayBatch) -> None:
         if set(batch.obs.keys()) != set(self._obs_buffers.keys()):
@@ -125,6 +141,12 @@ class ReplayBuffer:
             buffer = self._action_buffers[key]
             if value.ndim < 1 or tuple(value.shape[1:]) != tuple(buffer.shape[1:]) or value.dtype != buffer.dtype:
                 raise ValueError("Action batch field '{0}' is incompatible with replay buffer schema.".format(key))
+        if self._is_demo_buffer is None or self._collapse_flag_buffer is None:
+            raise ValueError("Replay metadata buffers are not initialized.")
+        if batch.is_demo.ndim != 1 or batch.is_demo.dtype != self._is_demo_buffer.dtype:
+            raise ValueError("Replay batch field 'is_demo' is incompatible with replay buffer schema.")
+        if batch.collapse_flag.ndim != 1 or batch.collapse_flag.dtype != self._collapse_flag_buffer.dtype:
+            raise ValueError("Replay batch field 'collapse_flag' is incompatible with replay buffer schema.")
 
     def _write_batch_at_indices(self, indices: Tensor, batch: TensorReplayBatch) -> None:
         for key, value in batch.obs.items():
@@ -135,8 +157,12 @@ class ReplayBuffer:
         self._action_buffers["allocation"].index_copy_(0, indices, batch.action.allocation)
         assert self._reward_buffer is not None
         assert self._done_buffer is not None
+        assert self._is_demo_buffer is not None
+        assert self._collapse_flag_buffer is not None
         self._reward_buffer.index_copy_(0, indices, batch.reward)
         self._done_buffer.index_copy_(0, indices, batch.done)
+        self._is_demo_buffer.index_copy_(0, indices, batch.is_demo)
+        self._collapse_flag_buffer.index_copy_(0, indices, batch.collapse_flag)
 
     @staticmethod
     def _batch_is_cpu(batch: TensorReplayBatch) -> bool:
@@ -144,8 +170,66 @@ class ReplayBuffer:
             batch.action.allocation,
             batch.reward,
             batch.done,
+            batch.is_demo,
+            batch.collapse_flag,
         ] + list(batch.next_obs.values())
         return all(tensor.device.type == "cpu" for tensor in tensors)
+
+    def _sample_indices(self, batch_size: int, max_collapse_ratio: float | None) -> Tensor:
+        if (
+            max_collapse_ratio is None
+            or self._collapse_flag_buffer is None
+            or self._size <= 0
+        ):
+            return torch.as_tensor(
+                self._rng.integers(0, self._size, size=batch_size),
+                dtype=torch.int64,
+                device="cpu",
+            )
+
+        ratio = float(max_collapse_ratio)
+        ratio = min(max(ratio, 0.0), 1.0)
+        if ratio >= 1.0:
+            return torch.as_tensor(
+                self._rng.integers(0, self._size, size=batch_size),
+                dtype=torch.int64,
+                device="cpu",
+            )
+
+        collapse_flags = self._collapse_flag_buffer[: self._size].detach().cpu().numpy().astype(np.bool_, copy=False)
+        collapse_indices = np.flatnonzero(collapse_flags)
+        non_collapse_indices = np.flatnonzero(~collapse_flags)
+        if collapse_indices.size == 0 or non_collapse_indices.size == 0:
+            return torch.as_tensor(
+                self._rng.integers(0, self._size, size=batch_size),
+                dtype=torch.int64,
+                device="cpu",
+            )
+
+        max_collapse = int(np.floor(float(batch_size) * ratio))
+        collapse_take = min(int(collapse_indices.size), max_collapse)
+        non_collapse_take = min(int(non_collapse_indices.size), batch_size - collapse_take)
+
+        remaining = batch_size - collapse_take - non_collapse_take
+        if remaining > 0:
+            extra_non_collapse = min(int(non_collapse_indices.size) - non_collapse_take, remaining)
+            non_collapse_take += extra_non_collapse
+            remaining -= extra_non_collapse
+        if remaining > 0:
+            extra_collapse = min(int(collapse_indices.size) - collapse_take, remaining)
+            collapse_take += extra_collapse
+            remaining -= extra_collapse
+        if remaining > 0:
+            raise RuntimeError("Failed to assemble replay sample indices.")
+
+        sampled_parts: list[np.ndarray] = []
+        if non_collapse_take > 0:
+            sampled_parts.append(self._rng.choice(non_collapse_indices, size=non_collapse_take, replace=False))
+        if collapse_take > 0:
+            sampled_parts.append(self._rng.choice(collapse_indices, size=collapse_take, replace=False))
+        sampled_indices = np.concatenate(sampled_parts, axis=0)
+        self._rng.shuffle(sampled_indices)
+        return torch.as_tensor(sampled_indices, dtype=torch.int64, device="cpu")
 
     def add(self, transition: TensorTransition | Transition) -> None:
         tensor_transition = self._coerce_transition(transition)
@@ -175,7 +259,12 @@ class ReplayBuffer:
             self._next_index = int((self._next_index + batch_size) % self.capacity)
             self._size = min(self._size + batch_size, self.capacity)
 
-    def sample(self, batch_size: int, device: torch.device | str | None = None) -> TensorReplayBatch:
+    def sample(
+        self,
+        batch_size: int,
+        device: torch.device | str | None = None,
+        max_collapse_ratio: float | None = None,
+    ) -> TensorReplayBatch:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
 
@@ -183,11 +272,7 @@ class ReplayBuffer:
             if self._size == 0 or not self._is_initialized():
                 raise ValueError("Cannot sample from an empty replay buffer.")
 
-            indices = torch.as_tensor(
-                self._rng.integers(0, self._size, size=batch_size),
-                dtype=torch.int64,
-                device="cpu",
-            )
+            indices = self._sample_indices(batch_size=batch_size, max_collapse_ratio=max_collapse_ratio)
             obs = {key: buffer.index_select(0, indices) for key, buffer in self._obs_buffers.items()}
             next_obs = {key: buffer.index_select(0, indices) for key, buffer in self._next_obs_buffers.items()}
             action = TensorReplayActionRecord(
@@ -195,12 +280,16 @@ class ReplayBuffer:
             )
             assert self._reward_buffer is not None
             assert self._done_buffer is not None
+            assert self._is_demo_buffer is not None
+            assert self._collapse_flag_buffer is not None
             batch = TensorReplayBatch(
                 obs=obs,
                 action=action,
                 reward=self._reward_buffer.index_select(0, indices),
                 next_obs=next_obs,
                 done=self._done_buffer.index_select(0, indices),
+                is_demo=self._is_demo_buffer.index_select(0, indices),
+                collapse_flag=self._collapse_flag_buffer.index_select(0, indices),
             )
 
         if device is not None:
@@ -220,6 +309,10 @@ class ReplayBuffer:
                 "action_buffers": {key: value.detach().cpu().clone() for key, value in self._action_buffers.items()},
                 "reward_buffer": None if self._reward_buffer is None else self._reward_buffer.detach().cpu().clone(),
                 "done_buffer": None if self._done_buffer is None else self._done_buffer.detach().cpu().clone(),
+                "is_demo_buffer": None if self._is_demo_buffer is None else self._is_demo_buffer.detach().cpu().clone(),
+                "collapse_flag_buffer": (
+                    None if self._collapse_flag_buffer is None else self._collapse_flag_buffer.detach().cpu().clone()
+                ),
             }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -242,6 +335,8 @@ class ReplayBuffer:
                 self._action_buffers = {}
                 self._reward_buffer = None
                 self._done_buffer = None
+                self._is_demo_buffer = None
+                self._collapse_flag_buffer = None
                 return
 
             self._obs_buffers = {
@@ -258,8 +353,18 @@ class ReplayBuffer:
             }
             reward_buffer = state_dict.get("reward_buffer")
             done_buffer = state_dict.get("done_buffer")
+            is_demo_buffer = state_dict.get("is_demo_buffer")
+            collapse_flag_buffer = state_dict.get("collapse_flag_buffer")
             self._reward_buffer = None if reward_buffer is None else torch.as_tensor(reward_buffer, device="cpu").detach().clone()
             self._done_buffer = None if done_buffer is None else torch.as_tensor(done_buffer, device="cpu").detach().clone()
+            if is_demo_buffer is None:
+                self._is_demo_buffer = torch.zeros(self.capacity, dtype=torch.bool, device="cpu")
+            else:
+                self._is_demo_buffer = torch.as_tensor(is_demo_buffer, device="cpu").detach().clone()
+            if collapse_flag_buffer is None:
+                self._collapse_flag_buffer = torch.zeros(self.capacity, dtype=torch.bool, device="cpu")
+            else:
+                self._collapse_flag_buffer = torch.as_tensor(collapse_flag_buffer, device="cpu").detach().clone()
 
     def _load_legacy_state_dict(self, state_dict: dict[str, Any]) -> None:
         capacity = int(state_dict["capacity"])
@@ -278,6 +383,8 @@ class ReplayBuffer:
             self._action_buffers = {}
             self._reward_buffer = None
             self._done_buffer = None
+            self._is_demo_buffer = None
+            self._collapse_flag_buffer = None
 
             first_transition = next((item for item in buffer_state if item is not None), None)
             if first_transition is None:

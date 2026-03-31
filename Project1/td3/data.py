@@ -162,6 +162,8 @@ class TensorTransition:
     reward: Tensor
     next_obs: TensorObservation
     done: Tensor
+    is_demo: Tensor
+    collapse_flag: Tensor
 
     @classmethod
     def from_step(
@@ -171,6 +173,8 @@ class TensorTransition:
         reward: float,
         next_obs: Mapping[str, Any],
         done: bool,
+        is_demo: bool = False,
+        collapse_flag: bool = False,
     ) -> "TensorTransition":
         if isinstance(action, TensorActionRecord):
             replay_action = TensorReplayActionRecord(
@@ -184,6 +188,8 @@ class TensorTransition:
             reward=torch.tensor(float(reward), dtype=torch.float32, device="cpu"),
             next_obs=observation_to_replay_tensors(next_obs),
             done=torch.tensor(float(done), dtype=torch.float32, device="cpu"),
+            is_demo=torch.tensor(bool(is_demo), dtype=torch.bool, device="cpu"),
+            collapse_flag=torch.tensor(bool(collapse_flag), dtype=torch.bool, device="cpu"),
         )
 
     @classmethod
@@ -194,6 +200,8 @@ class TensorTransition:
             reward=float(transition.reward),
             next_obs=transition.next_obs,
             done=bool(transition.done),
+            is_demo=bool(transition.metadata.get("is_demo", False)),
+            collapse_flag=bool(transition.metadata.get("collapse_flag", False)),
         )
 
     def clone(self) -> "TensorTransition":
@@ -203,6 +211,8 @@ class TensorTransition:
             reward=self.reward.detach().cpu().clone(),
             next_obs=clone_tensor_observation(self.next_obs),
             done=self.done.detach().cpu().clone(),
+            is_demo=self.is_demo.detach().cpu().clone(),
+            collapse_flag=self.collapse_flag.detach().cpu().clone(),
         )
 
 
@@ -213,6 +223,8 @@ class TensorReplayBatch:
     reward: Tensor
     next_obs: TensorObservation
     done: Tensor
+    is_demo: Tensor
+    collapse_flag: Tensor
 
     def to(self, device: torch.device | str) -> "TensorReplayBatch":
         return TensorReplayBatch(
@@ -221,6 +233,8 @@ class TensorReplayBatch:
             reward=self.reward.to(device=device),
             next_obs={key: value.to(device=device) for key, value in self.next_obs.items()},
             done=self.done.to(device=device),
+            is_demo=self.is_demo.to(device=device),
+            collapse_flag=self.collapse_flag.to(device=device),
         )
 
     def __len__(self) -> int:
@@ -233,6 +247,8 @@ class TensorReplayBatch:
             reward=self.reward.detach().cpu().clone(),
             next_obs=clone_tensor_observation(self.next_obs),
             done=self.done.detach().cpu().clone(),
+            is_demo=self.is_demo.detach().cpu().clone(),
+            collapse_flag=self.collapse_flag.detach().cpu().clone(),
         )
 
 
@@ -254,10 +270,14 @@ def stack_tensor_transitions(transitions: Sequence[TensorTransition]) -> TensorR
     )
     reward = torch.stack([transition.reward for transition in transitions], dim=0)
     done = torch.stack([transition.done for transition in transitions], dim=0)
+    is_demo = torch.stack([transition.is_demo for transition in transitions], dim=0)
+    collapse_flag = torch.stack([transition.collapse_flag for transition in transitions], dim=0)
     return TensorReplayBatch(
         obs=obs,
         action=action,
         reward=reward,
         next_obs=next_obs,
         done=done,
+        is_demo=is_demo,
+        collapse_flag=collapse_flag,
     )

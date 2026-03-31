@@ -302,6 +302,8 @@ def _serialize_replay_batch_to_shared_memory(batch: TensorReplayBatch) -> tuple[
             "reward": _store_tensor(batch.reward),
             "next_obs": {key: _store_tensor(value) for key, value in batch.next_obs.items()},
             "done": _store_tensor(batch.done),
+            "is_demo": _store_tensor(batch.is_demo),
+            "collapse_flag": _store_tensor(batch.collapse_flag),
         },
         handles,
     )
@@ -326,6 +328,8 @@ def _deserialize_replay_batch_from_shared_memory(
             reward=_load_tensor(payload["reward"]),
             next_obs={key: _load_tensor(value) for key, value in dict(payload["next_obs"]).items()},
             done=_load_tensor(payload["done"]),
+            is_demo=_load_tensor(payload["is_demo"]),
+            collapse_flag=_load_tensor(payload["collapse_flag"]),
         )
     except Exception:
         _close_shared_memory_handles(handles, unlink=False)
@@ -579,6 +583,7 @@ class RolloutWorker:
                 self._ensure_environment(slot_index)
 
             actions_by_slot: dict[int, TensorActionRecord] = {}
+            is_demo_by_slot: dict[int, bool] = {}
             actor_slots: list[int] = []
             actor_observations: list[dict[str, np.ndarray]] = []
             actor_behavior_sources: list[str] = []
@@ -591,6 +596,7 @@ class RolloutWorker:
                 if is_warmup:
                     behavior_source = self._resolve_warmup_behavior_source(slot_index)
                     actions_by_slot[slot_index] = self._sample_warmup_action(observation, behavior_source)
+                    is_demo_by_slot[slot_index] = True
                     behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
                     continue
                 actor_slots.append(slot_index)
@@ -665,6 +671,7 @@ class RolloutWorker:
                 )
                 for actor_batch_index, slot_index in enumerate(actor_slots):
                     actions_by_slot[slot_index] = _slice_action_record(batched_action, actor_batch_index)
+                    is_demo_by_slot[slot_index] = False
                     behavior_source = actor_behavior_sources[actor_batch_index]
                     behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
 
@@ -683,18 +690,24 @@ class RolloutWorker:
                 env_step_seconds += perf_counter() - env_step_start
 
                 transition_encode_start = perf_counter()
+                actual_cooperation_rate = float(
+                    info.get("actual_cooperation_rate", np.asarray(next_observation["x_actual"]).mean())
+                )
+                collapse_flag = actual_cooperation_rate < float(self.train_config.replay_collapse_fc_threshold)
                 transition = TensorTransition.from_step(
                     obs=observation,
                     action=action,
                     reward=float(reward),
                     next_obs=next_observation,
                     done=bool(done),
+                    is_demo=bool(is_demo_by_slot.get(slot_index, False)),
+                    collapse_flag=collapse_flag,
                 )
                 transition_encode_seconds += perf_counter() - transition_encode_start
                 transitions.append(transition)
 
                 rewards.append(float(reward))
-                cooperation_rates.append(float(info.get("actual_cooperation_rate", np.asarray(next_observation["x_actual"]).mean())))
+                cooperation_rates.append(actual_cooperation_rate)
                 mean_resources.append(float(np.asarray(next_observation["resources"]).mean()))
                 gini_values.append(float(info.get("gini", np.asarray(next_observation["gini"]).item())))
                 mean_payoffs.append(float(np.asarray(info.get("payoff", np.zeros_like(next_observation["resources"]))).mean()))

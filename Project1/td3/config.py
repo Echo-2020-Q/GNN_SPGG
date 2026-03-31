@@ -44,9 +44,15 @@ class GraphTD3Config:
     warmup_pool_power_k: float = 19.0
     warmup_logit_noise_std: float = 0.0
     warmup_logit_noise_clip: float = 0.0
+    freeze_actor_q_during_warmup: bool = True
+    warmup_actor_bc_coef: float = 1.0
+    actor_demo_bc_coef: float = 0.25
+    actor_demo_bc_decay_end_fraction: float = 0.50
     train_every: int = 1
     gradient_steps_per_update: int = 1
     policy_delay: int = 2
+    replay_collapse_fc_threshold: float = 0.10
+    replay_max_collapse_sample_ratio: float = 0.20
 
     rollout_logit_noise_std: float = 0.30
     rollout_logit_noise_clip: float = 0.50
@@ -144,6 +150,14 @@ class GraphTD3Config:
             raise ValueError("warmup_logit_noise_std must be non-negative.")
         if self.warmup_logit_noise_clip < 0.0:
             raise ValueError("warmup_logit_noise_clip must be non-negative.")
+        if not isinstance(self.freeze_actor_q_during_warmup, bool):
+            raise ValueError("freeze_actor_q_during_warmup must be a bool.")
+        if self.warmup_actor_bc_coef < 0.0:
+            raise ValueError("warmup_actor_bc_coef must be non-negative.")
+        if self.actor_demo_bc_coef < 0.0:
+            raise ValueError("actor_demo_bc_coef must be non-negative.")
+        if self.actor_demo_bc_decay_end_fraction < 0.0 or self.actor_demo_bc_decay_end_fraction > 1.0:
+            raise ValueError("actor_demo_bc_decay_end_fraction must be in [0, 1].")
         if self.warmup_behavior_mode == "heuristic_mix":
             warmup_mix_total = (
                 self.warmup_uniform_prob
@@ -160,6 +174,10 @@ class GraphTD3Config:
             raise ValueError("gradient_steps_per_update must be positive.")
         if self.policy_delay <= 0:
             raise ValueError("policy_delay must be positive.")
+        if self.replay_collapse_fc_threshold < 0.0 or self.replay_collapse_fc_threshold > 1.0:
+            raise ValueError("replay_collapse_fc_threshold must be in [0, 1].")
+        if self.replay_max_collapse_sample_ratio < 0.0 or self.replay_max_collapse_sample_ratio > 1.0:
+            raise ValueError("replay_max_collapse_sample_ratio must be in [0, 1].")
         if self.rollout_logit_noise_std < 0.0:
             raise ValueError("rollout_logit_noise_std must be non-negative.")
         if self.rollout_logit_noise_clip < 0.0:

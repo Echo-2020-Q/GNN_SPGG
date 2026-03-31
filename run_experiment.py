@@ -332,7 +332,7 @@ BASE_EXPERIMENT = {
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
         # 它不计入上面的 total_env_steps，会额外附加在训练前面。
-        "warmup_env_steps": 300_000,
+        "warmup_env_steps": 307_200,
 
         # 每隔多少个全局环境步做一次评估。
         # 程序内部会自动换算成 update 间隔。
@@ -343,7 +343,7 @@ BASE_EXPERIMENT = {
 
         # 每个 worker 在每次训练迭代中收集多少个环境步。
         # 这是“每个 worker 每个 update”的采样粒度，不是全局总步数。
-        "steps_per_update": 800,  # episode_length=150
+        "steps_per_update": 800,  # episode_length=100
 
         # 是否强制把每次训练迭代的采样长度设为一个完整 episode。
         # 为 True 时，会忽略上面的 steps_per_update，改为使用 dynamics.episode_length。
@@ -423,7 +423,7 @@ BASE_EXPERIMENT = {
 
         # Actor loss 里的 valid logits L2 正则权重。
         # > 0 会抑制 logits 绝对值过大，减轻策略过尖。
-        "actor_logit_l2_coef": 1e-5,
+        "actor_logit_l2_coef": 5e-5,
 
         # TD3 twin critics 的状态编码器隐藏维度。
         # 对应 GraphActionCritic 里 state encoder 的 hidden_dim。
@@ -500,6 +500,19 @@ BASE_EXPERIMENT = {
         # 启发式 warm-up logits 噪声的截断范围。
         "warmup_logit_noise_clip": 0.25,
 
+        # warm-up 期间 actor 不做 max-Q 更新，只做 demo 行为克隆。
+        "freeze_actor_q_during_warmup": True,
+
+        # warm-up 期间 actor 的行为克隆损失系数。
+        "warmup_actor_bc_coef": 1.0,
+
+        # warm-up 结束后，继续在 demo 样本上保留一个较轻的行为克隆锚点。
+        "actor_demo_bc_coef": 0.25,
+
+        # warm-up 结束后，demo BC 系数线性衰减到 0 的总 rollout 步数比例。
+        # 例如 0.50 表示到总 rollout 步数的 20% 时衰减到 0。
+        "actor_demo_bc_decay_end_fraction": 0.20,
+
         # 每隔多少个外层训练迭代做一次 learner 更新。
         "train_every": 1,
 
@@ -507,7 +520,13 @@ BASE_EXPERIMENT = {
         "gradient_steps_per_update": 16,
 
         # TD3 delayed policy update 频率。
-        "policy_delay": 2,
+        "policy_delay": 4,
+
+        # 将实际合作率过低的 transition 视为塌缩样本。
+        "replay_collapse_fc_threshold": 0.10,
+
+        # replay 采样时允许的塌缩样本最大占比。
+        "replay_max_collapse_sample_ratio": 0.20,
 
         # target network soft update 系数 tau。
         "tau": 0.005,
@@ -1434,9 +1453,15 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         warmup_pool_power_k=training["warmup_pool_power_k"],
         warmup_logit_noise_std=training["warmup_logit_noise_std"],
         warmup_logit_noise_clip=training["warmup_logit_noise_clip"],
+        freeze_actor_q_during_warmup=training.get("freeze_actor_q_during_warmup", True),
+        warmup_actor_bc_coef=training.get("warmup_actor_bc_coef", 1.0),
+        actor_demo_bc_coef=training.get("actor_demo_bc_coef", 0.25),
+        actor_demo_bc_decay_end_fraction=training.get("actor_demo_bc_decay_end_fraction", 0.50),
         train_every=training["train_every"],
         gradient_steps_per_update=training["gradient_steps_per_update"],
         policy_delay=training["policy_delay"],
+        replay_collapse_fc_threshold=training.get("replay_collapse_fc_threshold", 0.10),
+        replay_max_collapse_sample_ratio=training.get("replay_max_collapse_sample_ratio", 0.20),
         tau=training["tau"],
         rollout_logit_noise_std=training["rollout_logit_noise_std"],
         rollout_logit_noise_clip=training["rollout_logit_noise_clip"],
@@ -2273,9 +2298,13 @@ def _format_console_recent_stats_lines(
         ("mean_rollout_reward", "mean_rollout_reward"),
         ("entropy", "entropy"),
         ("actor_logit_l2", "actor_logit_l2"),
+        ("actor_bc_loss", "actor_bc_loss"),
+        ("actor_bc_coef", "actor_bc_coef"),
         ("actor_lr", "actor_lr"),
         ("critic_lr", "critic_lr"),
         ("replay_size", "replay_size"),
+        ("replay_demo_frac", "replay_demo"),
+        ("replay_collapse_frac", "replay_collapse"),
         ("profile_rollout_steps_per_second", "rollout_sps"),
         ("profile_rollout_collect_seconds", "rollout_collect_s"),
         ("profile_rollout_collect_worker_seconds", "worker_collect_s"),

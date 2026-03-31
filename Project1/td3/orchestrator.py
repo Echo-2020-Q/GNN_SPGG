@@ -465,7 +465,7 @@ class GraphTD3Trainer:
                 learner_update_start = perf_counter()
                 if update % self.config.train_every == 0:
                     for _ in range(self.config.gradient_steps_per_update):
-                        learner_metrics = self.learner.train_step()
+                        learner_metrics = self.learner.train_step(global_env_steps=int(self.global_env_steps))
                 learner_update_seconds = float(perf_counter() - learner_update_start)
 
                 rollout_wait_start = perf_counter()
@@ -489,7 +489,7 @@ class GraphTD3Trainer:
                 learner_update_start = perf_counter()
                 if update % self.config.train_every == 0:
                     for _ in range(self.config.gradient_steps_per_update):
-                        learner_metrics = self.learner.train_step()
+                        learner_metrics = self.learner.train_step(global_env_steps=int(self.global_env_steps))
                 learner_update_seconds = float(perf_counter() - learner_update_start)
 
             rollout_metrics = [result.metrics for result in rollout_results]
@@ -539,7 +539,11 @@ class GraphTD3Trainer:
                 "actor_entropy": float(learner_metrics["actor_entropy"]),
                 "actor_logit_l2": float(learner_metrics["actor_logit_l2"]),
                 "actor_reg_loss": float(learner_metrics["actor_reg_loss"]),
+                "actor_bc_loss": float(learner_metrics.get("actor_bc_loss", 0.0)),
+                "actor_bc_coef": float(learner_metrics.get("actor_bc_coef", 0.0)),
                 "replay_size": float(len(self.replay_buffer)),
+                "replay_demo_frac": float(learner_metrics.get("replay_demo_frac", 0.0)),
+                "replay_collapse_frac": float(learner_metrics.get("replay_collapse_frac", 0.0)),
                 "mean_rollout_reward": mean_rollout_reward,
                 "actor_lr": float(learner_metrics["actor_lr"]),
                 "critic_lr": float(learner_metrics["critic_lr"]),
