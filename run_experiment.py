@@ -281,7 +281,7 @@ BASE_EXPERIMENT = {
         "lambda_total_resource": 10/371.0,
 
         # Gini 不平等惩罚项的权重。
-        "lambda_gini": 10/1,
+        "lambda_gini": 0.0,
 
         # Gini 分母的极小修正项，通常不需要改。
         "epsilon": 1e-8,
@@ -332,7 +332,7 @@ BASE_EXPERIMENT = {
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
         # 它不计入上面的 total_env_steps，会额外附加在训练前面。
-        "warmup_env_steps": 50_000,
+        "warmup_env_steps": 150_000,
 
         # 每隔多少个全局环境步做一次评估。
         # 程序内部会自动换算成 update 间隔。
@@ -419,11 +419,11 @@ BASE_EXPERIMENT = {
         # Actor loss 里的分配熵正则权重。
         # 这是训练目标里的辅助项，不是环境 reward。
         # > 0 会鼓励分配更平滑、更不那么尖锐。
-        "actor_entropy_coef": 0.0,
+        "actor_entropy_coef":  5e-4,
 
         # Actor loss 里的 valid logits L2 正则权重。
         # > 0 会抑制 logits 绝对值过大，减轻策略过尖。
-        "actor_logit_l2_coef": 0.0,
+        "actor_logit_l2_coef": 1e-5,
 
         # TD3 twin critics 的状态编码器隐藏维度。
         # 对应 GraphActionCritic 里 state encoder 的 hidden_dim。
@@ -446,10 +446,10 @@ BASE_EXPERIMENT = {
         "critic_q_hidden_dim": 64,
 
         # replay buffer 容量。
-        "replay_capacity": 300_000, # 300k 步=0.3M 步
+        "replay_capacity": 600_000, # 300k 步=0.3M 步
 
         # learner 每次更新采样的 batch 大小。
-        "batch_size": 256,
+        "batch_size": 512,
 
         # learner 内部做图张量化时的微批大小。
         # 这是为了避免把整个 replay batch 一次性展开成 dense [B, N, N, H] 图张量后显存占用过高。
@@ -504,7 +504,7 @@ BASE_EXPERIMENT = {
         "train_every": 1,
 
         # 每个外层训练迭代做多少次梯度更新。
-        "gradient_steps_per_update": 4,
+        "gradient_steps_per_update": 16,
 
         # TD3 delayed policy update 频率。
         "policy_delay": 2,
