@@ -180,6 +180,32 @@ class SPGGEnvTests(unittest.TestCase):
         self.assertAlmostEqual(info["reward_components"]["mean_resource_next"], 3.0)
         self.assertAlmostEqual(info["reward_components"]["total_resource_next"], 6.0)
 
+    def test_reward_can_include_collapse_ratio_penalty(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.0,
+                p_max=10.0,
+                beta=0.0,
+                episode_length=1,
+                reward=RewardConfig(
+                    lambda_payoff=0.0,
+                    lambda_cooperation=0.0,
+                    lambda_total_resource=0.0,
+                    lambda_collapse=2.0,
+                    lambda_gini=0.0,
+                ),
+            ),
+            {0: [1], 1: [0]},
+        )
+
+        observation = env.reset(initial_resources=[1.0, 3.0], initial_strategies=[0, 0], seed=0)
+        _, reward, done, info = env.step(UniformAllocationPolicy().allocate(observation))
+        self.assertTrue(done)
+        self.assertAlmostEqual(reward, -1.0)
+        self.assertAlmostEqual(info["reward_components"]["collapse_ratio_next"], 0.5)
+        self.assertAlmostEqual(info["reward_components"]["collapse_penalty"], 1.0)
+
     def test_proportional_resource_consumption_is_capped_by_available_resources(self) -> None:
         env = SPGGEnv(
             SPGGConfig(

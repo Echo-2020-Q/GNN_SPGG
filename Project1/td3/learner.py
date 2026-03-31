@@ -269,6 +269,9 @@ class GraphTD3Learner:
         self.last_replay_collapse_frac = float(state_dict.get("last_replay_collapse_frac", 0.0))
 
     def _current_demo_bc_coef(self, global_env_steps: int | None) -> float:
+        if int(self.config.warmup_steps) <= 0:
+            return 0.0
+
         if global_env_steps is None:
             return float(self.config.actor_demo_bc_coef)
 
