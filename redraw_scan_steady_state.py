@@ -139,6 +139,7 @@ def sort_scan_records(records: Sequence[Mapping[str, Any]]) -> List[Dict[str, An
         (dict(record) for record in records),
         key=lambda item: (
             str(item["run_mode"]),
+            str(item.get("run_mode_param_label") or ""),
             str(item["strategy_update_rule"]),
             str(item["consumption_label"]),
             str(item["network_label"]),
@@ -153,10 +154,11 @@ def redraw_steady_state_plots(
     metrics: Sequence[str],
     dpi: int,
 ) -> None:
-    grouped_records: Dict[tuple[str, str, str], List[Mapping[str, Any]]] = {}
+    grouped_records: Dict[tuple[str, str, str, str], List[Mapping[str, Any]]] = {}
     for record in scan_records:
         group_key = (
             str(record["run_mode"]),
+            str(record.get("run_mode_param_label") or ""),
             str(record["strategy_update_rule"]),
             str(record["consumption_label"]),
         )
@@ -165,17 +167,27 @@ def redraw_steady_state_plots(
     steady_state_dir = output_root / "steady_state_vs_r"
     steady_state_dir.mkdir(parents=True, exist_ok=True)
 
-    for (run_mode, strategy_update_rule, consumption_label), records in grouped_records.items():
-        output_path = steady_state_dir / "{0}__{1}__{2}__steady_state_vs_r.png".format(
-            run_mode,
-            strategy_update_rule,
-            consumption_label,
+    for (run_mode, run_mode_param_label, strategy_update_rule, consumption_label), records in grouped_records.items():
+        filename_parts = [run_mode]
+        title_parts = ["Steady-state vs r", "run_mode={0}".format(run_mode)]
+        if run_mode_param_label:
+            filename_parts.append(run_mode_param_label)
+            first_record = records[0]
+            title_parts.append(
+                "{0}={1}".format(
+                    first_record.get("run_mode_param_name"),
+                    first_record.get("run_mode_param_value"),
+                )
+            )
+        filename_parts.extend([strategy_update_rule, consumption_label, "steady_state_vs_r"])
+        output_path = steady_state_dir / "{0}.png".format("__".join(filename_parts))
+        title_parts.extend(
+            [
+                "strategy={0}".format(strategy_update_rule),
+                "consumption={0}".format(consumption_label),
+            ]
         )
-        title = "Steady-state vs r | run_mode={0} | strategy={1} | consumption={2}".format(
-            run_mode,
-            strategy_update_rule,
-            consumption_label,
-        )
+        title = " | ".join(title_parts)
         save_scan_metric_grid(
             records=records,
             output_path=output_path,

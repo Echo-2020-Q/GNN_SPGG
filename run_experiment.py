@@ -45,7 +45,12 @@ from Project1 import (
     make_random_regular_graph,
     make_watts_strogatz_graph,
 )
-from Project1.policies.rule_based import ProportionalContributionPolicy, UniformAllocationPolicy
+from Project1.policies.rule_based import (
+    ConstantMixAllocationPolicy,
+    PoolPowerMixAllocationPolicy,
+    ProportionalContributionPolicy,
+    UniformAllocationPolicy,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -107,6 +112,8 @@ BASE_EXPERIMENT = {
     # 运行模式：
     # - "uniform"      ：人工规则，均匀分配
     # - "proportional" ：人工规则，按贡献比例分配
+    # - "constant_mix" ：人工规则，常数混合分配
+    # - "pool_power_mix"：人工规则，pool 驱动混合分配
     # - "gnn_train"    ：训练 GNN-RL 分配器，再做训练后评估
     "run_mode": "gnn_train",
 
@@ -981,6 +988,8 @@ SCAN_EXPERIMENT = {
     "resource_consumption_modes": ["piecewise_linear"],#["fixed", "proportional", "piecewise_linear"],
     "resource_consumption_fixed_modes": ["constant", "degree_scaled"],
     "strategy_update_rules": ["q_learning", "fermi"],
+    "warmup_constant_mix_omega": [0.5],
+    "warmup_pool_power_k": [19.0],
     "run_mode": ["proportional", "uniform"],#["proportional", "uniform"],
 }
 
@@ -1109,11 +1118,14 @@ def _scan_run_modes(scan_config: Mapping[str, Any], base_run_mode: str) -> List[
 
     if not run_modes:
         raise ValueError("SCAN_EXPERIMENT['run_mode'] must contain at least one run mode.")
-    invalid_run_modes = [item for item in run_modes if item not in {"uniform", "proportional"}]
+    valid_run_modes = {"uniform", "proportional", "constant_mix", "pool_power_mix"}
+    invalid_run_modes = [item for item in run_modes if item not in valid_run_modes]
     if invalid_run_modes:
         raise ValueError(
-            "Scan mode currently supports only rule-based run_mode values {'uniform', 'proportional'}."
-            " Invalid values: {0}".format(invalid_run_modes)
+            "Scan mode currently supports only rule-based run_mode values {0}. Invalid values: {1}".format(
+                sorted(valid_run_modes),
+                invalid_run_modes,
+            )
         )
     return run_modes
 
@@ -1132,6 +1144,91 @@ def _scan_num_nodes(scan_config: Mapping[str, Any], base_num_nodes: int) -> List
     return num_nodes_values
 
 
+def _scan_constant_mix_omegas(scan_config: Mapping[str, Any], base_omega: float) -> List[float]:
+    configured_values = scan_config.get("warmup_constant_mix_omega", base_omega)
+    if isinstance(configured_values, (int, float)):
+        omega_values = [float(configured_values)]
+    else:
+        omega_values = [float(item) for item in configured_values]
+
+    if not omega_values:
+        raise ValueError("SCAN_EXPERIMENT['warmup_constant_mix_omega'] must contain at least one value.")
+    if any((item < 0.0) or (item > 1.0) for item in omega_values):
+        raise ValueError("SCAN_EXPERIMENT['warmup_constant_mix_omega'] values must be in [0, 1].")
+    return omega_values
+
+
+def _scan_pool_power_ks(scan_config: Mapping[str, Any], base_k: float) -> List[float]:
+    configured_values = scan_config.get("warmup_pool_power_k", base_k)
+    if isinstance(configured_values, (int, float)):
+        power_k_values = [float(configured_values)]
+    else:
+        power_k_values = [float(item) for item in configured_values]
+
+    if not power_k_values:
+        raise ValueError("SCAN_EXPERIMENT['warmup_pool_power_k'] must contain at least one value.")
+    if any(item < 0.0 for item in power_k_values):
+        raise ValueError("SCAN_EXPERIMENT['warmup_pool_power_k'] values must be non-negative.")
+    return power_k_values
+
+
+def _scan_run_mode_parameter_variants(
+    scan_config: Mapping[str, Any],
+    base_training: Mapping[str, Any],
+    run_mode: str,
+) -> List[Dict[str, Any]]:
+    if run_mode == "constant_mix":
+        variants: List[Dict[str, Any]] = []
+        for omega in _scan_constant_mix_omegas(scan_config, float(base_training["warmup_constant_mix_omega"])):
+            variants.append(
+                {
+                    "training_overrides": {
+                        "warmup_constant_mix_omega": float(omega),
+                    },
+                    "scan_tags": {
+                        "warmup_constant_mix_omega": float(omega),
+                        "warmup_pool_power_k": None,
+                        "run_mode_param_name": "warmup_constant_mix_omega",
+                        "run_mode_param_value": float(omega),
+                        "run_mode_param_label": "omega{0}".format(_format_float_token(omega)),
+                    },
+                }
+            )
+        return variants
+
+    if run_mode == "pool_power_mix":
+        variants = []
+        for power_k in _scan_pool_power_ks(scan_config, float(base_training["warmup_pool_power_k"])):
+            variants.append(
+                {
+                    "training_overrides": {
+                        "warmup_pool_power_k": float(power_k),
+                    },
+                    "scan_tags": {
+                        "warmup_constant_mix_omega": None,
+                        "warmup_pool_power_k": float(power_k),
+                        "run_mode_param_name": "warmup_pool_power_k",
+                        "run_mode_param_value": float(power_k),
+                        "run_mode_param_label": "k{0}".format(_format_float_token(power_k)),
+                    },
+                }
+            )
+        return variants
+
+    return [
+        {
+            "training_overrides": {},
+            "scan_tags": {
+                "warmup_constant_mix_omega": None,
+                "warmup_pool_power_k": None,
+                "run_mode_param_name": None,
+                "run_mode_param_value": None,
+                "run_mode_param_label": None,
+            },
+        }
+    ]
+
+
 def build_scan_experiment_specs() -> List[Dict[str, Any]]:
     base = deepcopy(BASE_EXPERIMENT)
     scan = SCAN_EXPERIMENT
@@ -1140,60 +1237,73 @@ def build_scan_experiment_specs() -> List[Dict[str, Any]]:
     specs: List[Dict[str, Any]] = []
 
     for run_mode in run_modes:
-        for strategy_update_rule in scan["strategy_update_rules"]:
-            for resource_consumption_mode, resource_consumption_fixed_mode in _consumption_variants(scan):
-                consumption_label = _consumption_variant_label(
-                    resource_consumption_mode,
-                    resource_consumption_fixed_mode,
-                )
-                for num_nodes in num_nodes_values:
-                    base_network = deepcopy(base["network"])
-                    base_network["num_nodes"] = int(num_nodes)
-                    for network_type in scan["network_types"]:
-                        network_override = _network_override_for_type(base_network, network_type)
-                        network_label = "n{0}_{1}".format(num_nodes, _network_variant_label(network_override))
-                        for r_value in scan["r_values"]:
-                            experiment_name = "{0}__{1}__{2}__{3}__r{4}".format(
-                                network_label,
-                                run_mode,
-                                consumption_label,
-                                strategy_update_rule,
-                                _format_float_token(r_value),
-                            )
-                            spec = deep_update(
-                                deepcopy(base),
-                                {
-                                    "experiment_name": experiment_name,
+        for run_mode_variant in _scan_run_mode_parameter_variants(scan, base["training"], run_mode):
+            run_mode_param_label = run_mode_variant["scan_tags"]["run_mode_param_label"]
+            run_mode_label = (
+                "{0}_{1}".format(run_mode, run_mode_param_label)
+                if run_mode_param_label is not None
+                else run_mode
+            )
+            for strategy_update_rule in scan["strategy_update_rules"]:
+                for resource_consumption_mode, resource_consumption_fixed_mode in _consumption_variants(scan):
+                    consumption_label = _consumption_variant_label(
+                        resource_consumption_mode,
+                        resource_consumption_fixed_mode,
+                    )
+                    for num_nodes in num_nodes_values:
+                        base_network = deepcopy(base["network"])
+                        base_network["num_nodes"] = int(num_nodes)
+                        for network_type in scan["network_types"]:
+                            network_override = _network_override_for_type(base_network, network_type)
+                            network_label = "n{0}_{1}".format(num_nodes, _network_variant_label(network_override))
+                            for r_value in scan["r_values"]:
+                                experiment_name = "{0}__{1}__{2}__{3}__r{4}".format(
+                                    network_label,
+                                    run_mode_label,
+                                    consumption_label,
+                                    strategy_update_rule,
+                                    _format_float_token(r_value),
+                                )
+                                spec = deep_update(
+                                    deepcopy(base),
+                                    {
+                                        "experiment_name": experiment_name,
+                                        "run_mode": run_mode,
+                                        "network": network_override,
+                                        "training": dict(run_mode_variant["training_overrides"]),
+                                        "dynamics": {
+                                            "r": float(r_value),
+                                            "resource_consumption_mode": resource_consumption_mode,
+                                            "strategy_update_rule": strategy_update_rule,
+                                        },
+                                        "output": {
+                                            "root_dir": scan["output_root_dir"],
+                                        },
+                                    },
+                                )
+                                if resource_consumption_fixed_mode is not None:
+                                    spec["dynamics"]["resource_consumption_fixed_mode"] = resource_consumption_fixed_mode
+                                spec["scan_tags"] = {
+                                    "scan_name": scan["name"],
                                     "run_mode": run_mode,
-                                    "network": network_override,
-                                    "dynamics": {
-                                        "r": float(r_value),
-                                        "resource_consumption_mode": resource_consumption_mode,
-                                        "strategy_update_rule": strategy_update_rule,
-                                    },
-                                    "output": {
-                                        "root_dir": scan["output_root_dir"],
-                                    },
-                                },
-                            )
-                            if resource_consumption_fixed_mode is not None:
-                                spec["dynamics"]["resource_consumption_fixed_mode"] = resource_consumption_fixed_mode
-                            spec["scan_tags"] = {
-                                "scan_name": scan["name"],
-                                "run_mode": run_mode,
-                                "num_nodes": int(num_nodes),
-                                "network_label": network_label,
-                                "consumption_label": consumption_label,
-                                "resource_consumption_mode": resource_consumption_mode,
-                                "resource_consumption_fixed_mode": resource_consumption_fixed_mode,
-                                "strategy_update_rule": strategy_update_rule,
-                                "r": float(r_value),
-                            }
-                            spec["_runtime"] = {
-                                "quiet_console": True,
-                                "scan_mode": True,
-                            }
-                            specs.append(spec)
+                                    "run_mode_param_name": run_mode_variant["scan_tags"]["run_mode_param_name"],
+                                    "run_mode_param_value": run_mode_variant["scan_tags"]["run_mode_param_value"],
+                                    "run_mode_param_label": run_mode_param_label,
+                                    "warmup_constant_mix_omega": run_mode_variant["scan_tags"]["warmup_constant_mix_omega"],
+                                    "warmup_pool_power_k": run_mode_variant["scan_tags"]["warmup_pool_power_k"],
+                                    "num_nodes": int(num_nodes),
+                                    "network_label": network_label,
+                                    "consumption_label": consumption_label,
+                                    "resource_consumption_mode": resource_consumption_mode,
+                                    "resource_consumption_fixed_mode": resource_consumption_fixed_mode,
+                                    "strategy_update_rule": strategy_update_rule,
+                                    "r": float(r_value),
+                                }
+                                spec["_runtime"] = {
+                                    "quiet_console": True,
+                                    "scan_mode": True,
+                                }
+                                specs.append(spec)
 
     return specs
 
@@ -2606,6 +2716,7 @@ def run_rule_based_mode(
     env = SPGGEnv(env_config, graph)
     run_mode = spec["run_mode"]
     rollout = spec["rollout"]
+    training = spec["training"]
     quiet_console = _runtime_quiet_console(spec)
     tensorboard = spec.get("tensorboard", {})
     console_progress_logs = bool(tensorboard.get("console_progress_logs", True))
@@ -2616,6 +2727,10 @@ def run_rule_based_mode(
         policy = UniformAllocationPolicy()
     elif run_mode == "proportional":
         policy = ProportionalContributionPolicy()
+    elif run_mode == "constant_mix":
+        policy = ConstantMixAllocationPolicy(float(training["warmup_constant_mix_omega"]))
+    elif run_mode == "pool_power_mix":
+        policy = PoolPowerMixAllocationPolicy(float(training["warmup_pool_power_k"]))
     else:
         raise ValueError("Unsupported rule-based run_mode: {0}".format(run_mode))
 
@@ -3083,7 +3198,7 @@ def run_one_experiment(spec: Mapping[str, Any]) -> Dict[str, Any]:
         if not quiet_console:
             print_header(spec, graph, env_config)
 
-        if spec["run_mode"] in {"uniform", "proportional"}:
+        if spec["run_mode"] in {"uniform", "proportional", "constant_mix", "pool_power_mix"}:
             results = run_rule_based_mode(spec, graph, env_config, output_dir)
         elif spec["run_mode"] == "gnn_train":
             results = run_gnn_training_mode(spec, graph, env_config, output_dir)
@@ -3107,6 +3222,11 @@ def _scan_record_from_results(spec: Mapping[str, Any], results: Mapping[str, Any
     return {
         "experiment_name": spec["experiment_name"],
         "run_mode": scan_tags["run_mode"],
+        "run_mode_param_name": scan_tags.get("run_mode_param_name"),
+        "run_mode_param_value": scan_tags.get("run_mode_param_value"),
+        "run_mode_param_label": scan_tags.get("run_mode_param_label"),
+        "warmup_constant_mix_omega": scan_tags.get("warmup_constant_mix_omega"),
+        "warmup_pool_power_k": scan_tags.get("warmup_pool_power_k"),
         "num_nodes": int(scan_tags["num_nodes"]),
         "network_type": spec["network"]["type"],
         "network_label": scan_tags["network_label"],
@@ -3140,6 +3260,11 @@ def _save_scan_summary_tables(
     fieldnames = [
         "experiment_name",
         "run_mode",
+        "run_mode_param_name",
+        "run_mode_param_value",
+        "run_mode_param_label",
+        "warmup_constant_mix_omega",
+        "warmup_pool_power_k",
         "num_nodes",
         "network_type",
         "network_label",
@@ -3180,10 +3305,11 @@ def _save_scan_steady_state_plots(
         "final_gini_mean",
     ]
 
-    grouped_records: Dict[tuple[str, str, str], List[Mapping[str, Any]]] = {}
+    grouped_records: Dict[tuple[str, str, str, str], List[Mapping[str, Any]]] = {}
     for record in scan_records:
         group_key = (
             str(record["run_mode"]),
+            str(record.get("run_mode_param_label") or ""),
             str(record["strategy_update_rule"]),
             str(record["consumption_label"]),
         )
@@ -3192,17 +3318,27 @@ def _save_scan_steady_state_plots(
     steady_state_dir = output_root / "steady_state_vs_r"
     steady_state_dir.mkdir(parents=True, exist_ok=True)
 
-    for (run_mode, strategy_update_rule, consumption_label), records in grouped_records.items():
-        output_path = steady_state_dir / "{0}__{1}__{2}__steady_state_vs_r.png".format(
-            run_mode,
-            strategy_update_rule,
-            consumption_label,
+    for (run_mode, run_mode_param_label, strategy_update_rule, consumption_label), records in grouped_records.items():
+        filename_parts = [run_mode]
+        title_parts = ["Steady-state vs r", "run_mode={0}".format(run_mode)]
+        if run_mode_param_label:
+            filename_parts.append(run_mode_param_label)
+            first_record = records[0]
+            title_parts.append(
+                "{0}={1}".format(
+                    first_record.get("run_mode_param_name"),
+                    first_record.get("run_mode_param_value"),
+                )
+            )
+        filename_parts.extend([strategy_update_rule, consumption_label, "steady_state_vs_r"])
+        output_path = steady_state_dir / "{0}.png".format("__".join(filename_parts))
+        title_parts.extend(
+            [
+                "strategy={0}".format(strategy_update_rule),
+                "consumption={0}".format(consumption_label),
+            ]
         )
-        title = "Steady-state vs r | run_mode={0} | strategy={1} | consumption={2}".format(
-            run_mode,
-            strategy_update_rule,
-            consumption_label,
-        )
+        title = " | ".join(title_parts)
         save_scan_metric_grid(
             records=records,
             output_path=output_path,
@@ -3269,6 +3405,7 @@ def run_scan_experiments() -> None:
     scan_records.sort(
         key=lambda item: (
             str(item["run_mode"]),
+            str(item.get("run_mode_param_label") or ""),
             str(item["strategy_update_rule"]),
             str(item["consumption_label"]),
             str(item["network_label"]),
