@@ -97,7 +97,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "spgg_CNN_12workers_PoolDynamic",
+    "experiment_name": "spgg_CNN_12workers_PoolDynamic_promotelearning",
 
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -270,7 +270,7 @@ BASE_EXPERIMENT = {
         #   # 为了方便正则化，我们将这些标量奖励规范化，每项为10，规范化的分母为对应项的理论稳态最大值，
 
         # 平均净收益项的权重。
-        "lambda_payoff": 0.0,
+        "lambda_payoff": 0.5,
 
         # 下一时刻实际合作比例项的权重。
         "lambda_cooperation": 0.0,
@@ -278,7 +278,7 @@ BASE_EXPERIMENT = {
         # 下一时刻全局平均资源项的权重。
         # 单步使用 mean(next_resources)；跨时间平均后对应评估里的 mean_resource 口径。
         #Pc=50，Pmax=250,α=0.5，τ=0.1，\bar_{d}=4, R_M=370.83
-        "lambda_total_resource": 10/371.0,
+        "lambda_total_resource": 15/371.0,
 
         # Gini 不平等惩罚项的权重。
         "lambda_gini": 0.0,
@@ -332,7 +332,7 @@ BASE_EXPERIMENT = {
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
         # 它不计入上面的 total_env_steps，会额外附加在训练前面。
-        "warmup_env_steps": 150_000,
+        "warmup_env_steps": 300_000,
 
         # 每隔多少个全局环境步做一次评估。
         # 程序内部会自动换算成 update 间隔。
