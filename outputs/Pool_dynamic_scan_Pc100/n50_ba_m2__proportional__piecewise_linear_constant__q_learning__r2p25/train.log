@@ -1,0 +1,41 @@
+Console Log: /home/QinYiHang/Code/GNN_SPGG/outputs/Pool_dynamic_scan/n50_ba_m2__proportional__piecewise_linear_constant__q_learning__r2p25/train.log
+================================================================================
+Experiment: n50_ba_m2__proportional__piecewise_linear_constant__q_learning__r2p25
+Run mode  : proportional
+Network   : scale_free
+Graph     : nodes=50, edges=97, degree_min=2, degree_max=19, degree_mean=3.880
+Dynamics  : alpha=0.5, r=2.25, p_mode=dynamic, p_c=20.0, episode_length=1000
+Consume   : mode=piecewise_linear, fixed_mode=constant, fixed=4, rate=0.05, threshold=4.0
+Strategy  : rule=q_learning, state=none, lr=0.1, gamma=0.1, epsilon=0.05, q0=0.0
+Reward    : lambda_payoff=1.0, lambda_cooperation=0.0, lambda_total_resource=0.0, lambda_gini=0.0
+Reg       : actor_wd=0.0, critic_wd=0.0, actor_entropy_coef=0.0, actor_logit_l2_coef=0.0
+================================================================================
+[Episode 001] return=3961.167136, final_actual_cooperation=0.460000, final_gini=0.692336
+[INFO 16:38:19] rollout episode: 1 / 5
+[INFO 16:38:19] rollout Estimated time left: 16 seconds. Time passed: 4 seconds
+[Episode 002] return=3787.995315, final_actual_cooperation=0.400000, final_gini=0.739858
+[INFO 16:38:26] rollout episode: 2 / 5
+[INFO 16:38:26] rollout Estimated time left: 15 seconds. Time passed: 10 seconds
+[Episode 003] return=4139.452995, final_actual_cooperation=0.480000, final_gini=0.707681
+[INFO 16:38:28] rollout episode: 3 / 5
+[INFO 16:38:28] rollout Estimated time left: 8 seconds. Time passed: 13 seconds
+[Episode 004] return=3622.296798, final_actual_cooperation=0.440000, final_gini=0.676504
+[INFO 16:38:31] rollout episode: 4 / 5
+[INFO 16:38:31] rollout Estimated time left: 4 seconds. Time passed: 15 seconds
+[Episode 005] return=4032.262056, final_actual_cooperation=0.380000, final_gini=0.742256
+[INFO 16:38:34] rollout episode: 5 / 5
+[INFO 16:38:34] rollout Estimated time left: 0 seconds. Time passed: 18 seconds
+Final summary:
+{
+  "return_mean": 3908.634860038913,
+  "return_std": 183.22866627917446,
+  "final_cooperation_mean": 0.43200000000000005,
+  "final_actual_cooperation_mean": 0.43200000000000005,
+  "final_mean_resource_mean": 37.12215251494546,
+  "final_mean_pool_grown_mean": 22.79298274497947,
+  "final_consumption_mean": 3.559502598564039,
+  "final_mean_consumption_mean": 3.559502598564039,
+  "final_mean_payoff_mean": 3.2356031422287233,
+  "final_gini_mean": 0.7117269890325975
+}
+Results saved to: /home/QinYiHang/Code/GNN_SPGG/outputs/Pool_dynamic_scan/n50_ba_m2__proportional__piecewise_linear_constant__q_learning__r2p25/results.json

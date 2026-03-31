@@ -1,0 +1,51 @@
+Console Log: /home/QinYiHang/Code/GNN_SPGG/outputs/GNN_SPGG/spgg_CNN_demo1_4workers_3_25/train.log
+================================================================================
+Experiment: spgg_CNN_demo1_4workers_3_25
+Run mode  : gnn_train
+Network   : regular
+Graph     : nodes=100, edges=200, degree_min=4, degree_max=4, degree_mean=4.000
+Dynamics  : alpha=0.5, r=2, p_max=100.0, episode_length=150
+Consume   : mode=piecewise_linear, fixed_mode=degree_scaled, degree_multiplier=1.0, rate=0.05, threshold=4.0
+Strategy  : rule=q_learning, state=none, lr=0.1, gamma=0.1, epsilon=0.05, q0=0.0
+Reward    : lambda_payoff=1.0, lambda_cooperation=0.0, lambda_gini=0.0
+Reg       : actor_wd=0.0, critic_wd=0.0, actor_entropy_coef=0.0, actor_logit_l2_coef=0.0
+================================================================================
+Train CFG : steps_per_update=1500, source=training.steps_per_update, total_env_steps=15000000 (training.total_env_steps), total_updates=2500, warmup_env_steps=60000 (training.warmup_env_steps)
+Eval CFG  : mode=custom_env_families(4), periodic_eval_episodes=8, eval_interval_env_steps=2000000 (training.eval_interval_env_steps), eval_interval_updates=334
+Curriculum: regular_only@1[regular:1.00] | regular_plus_scale_free@1001[regular:0.70,scale_free:0.30] | all_topologies@1751[regular:0.40,scale_free:0.30,erdos_renyi:0.15,small_world:0.15]
+TensorBoard: log_dir=/home/QinYiHang/Code/GNN_SPGG/outputs/GNN_SPGG/spgg_CNN_demo1_4workers_3_25/tensorboard/0325_131906
+Curriculum: update=1, stage=regular_only, train=['regular'], train_weights=[1.0], eval=['regular']
+[INFO 13:21:00] train t_env: 6000 / 15000000 | update: 1 / 2500
+[INFO 13:21:00] train Estimated time left: 79 hours, 4 minutes, 42 seconds. Time passed: 1 minutes, 54 seconds
+[INFO 13:21:00] train Recent Stats | update: 1 / 2500 | t_env: 6000 / 15000000 | stage: regular_only
+train_f_c:                     0.4962  train_gini:                    0.3550  train_R_mean:                231.1048
+train_payoff_mean:            15.5358  train_pool_grown:             65.7986  train_pool:                   50.2997
+loss:                        662.2299  policy_loss:                  -0.1559  value_loss:                  662.3858
+mean_rollout_reward:          15.5358  entropy:                       1.6090  actor_logit_l2:                0.0384
+actor_lr:                      0.0001  critic_lr:                     0.0001  replay_size:                6000.0000
+uniform:                       0.1750  proportional:                  0.2500  constant_mix:                  0.0500
+pool_power_mix:                0.2250  random_logits:                 0.3000  actor_logits:                  0.0000
+[INFO 13:28:44] train t_env: 30000 / 15000000 | update: 5 / 2500
+[INFO 13:28:44] train Estimated time left: 80 hours, 6 minutes, 44 seconds. Time passed: 9 minutes, 38 seconds
+[INFO 13:38:59] train t_env: 60000 / 15000000 | update: 10 / 2500
+[INFO 13:38:59] train Estimated time left: 82 hours, 32 minutes, 41 seconds. Time passed: 19 minutes, 53 seconds
+[INFO 13:38:59] train Recent Stats | update: 10 / 2500 | t_env: 60000 / 15000000 | stage: regular_only
+train_f_c:                     0.5095  train_gini:                    0.3358  train_R_mean:                257.1598
+train_payoff_mean:            17.1787  train_pool_grown:             70.3470  train_pool:                   53.1831
+loss:                        574.1768  policy_loss:                  -5.0206  value_loss:                  579.1974
+mean_rollout_reward:          17.1787  entropy:                       1.5221  actor_logit_l2:                0.4910
+actor_lr:                      0.0001  critic_lr:                     0.0001  replay_size:               33000.0000
+uniform:                       0.2225  proportional:                  0.2250  constant_mix:                  0.1350
+pool_power_mix:                0.2275  random_logits:                 0.1900  actor_logits:                  0.0000
+[INFO 15:12:24] train t_env: 90000 / 15000000 | update: 15 / 2500
+[INFO 15:12:24] train Estimated time left: 312 hours, 49 minutes, 20 seconds. Time passed: 1 hours, 53 minutes, 18 seconds
+[INFO 16:47:38] train t_env: 120000 / 15000000 | update: 20 / 2500
+[INFO 16:47:38] train Estimated time left: 430 hours, 59 minutes, 22 seconds. Time passed: 3 hours, 28 minutes, 33 seconds
+[INFO 16:47:38] train Recent Stats | update: 20 / 2500 | t_env: 120000 / 15000000 | stage: regular_only
+train_f_c:                     0.1627  train_gini:                    0.5846  train_R_mean:                284.3541
+train_payoff_mean:            17.6250  train_pool_grown:             31.8406  train_pool:                   14.2794
+loss:                        125.2134  policy_loss:                 -18.3982  value_loss:                  143.6116
+mean_rollout_reward:          17.6250  entropy:                       0.1828  actor_logit_l2:               44.2175
+actor_lr:                      0.0001  critic_lr:                     0.0001  replay_size:               93000.0000
+uniform:                       0.0000  proportional:                  0.0000  constant_mix:                  0.0000
+pool_power_mix:                0.0000  random_logits:                 0.0000  actor_logits:                  1.0000

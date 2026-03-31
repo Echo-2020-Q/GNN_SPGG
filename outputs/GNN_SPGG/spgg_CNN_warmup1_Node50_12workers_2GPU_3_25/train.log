@@ -1,0 +1,82 @@
+Console Log: /home/QinYiHang/Code/GNN_SPGG/outputs/GNN_SPGG/spgg_CNN_warmup1_Node50_12workers_2GPU_3_25/train.log
+================================================================================
+Experiment: spgg_CNN_warmup1_Node50_12workers_2GPU_3_25
+Run mode  : gnn_train
+Network   : regular
+Graph     : nodes=50, edges=100, degree_min=4, degree_max=4, degree_mean=4.000
+Dynamics  : alpha=0.5, r=2, p_max=100.0, episode_length=150
+Consume   : mode=piecewise_linear, fixed_mode=degree_scaled, degree_multiplier=1.0, rate=0.05, threshold=4.0
+Strategy  : rule=q_learning, state=none, lr=0.1, gamma=0.1, epsilon=0.05, q0=0.0
+Reward    : lambda_payoff=1.0, lambda_cooperation=0.0, lambda_gini=0.0
+Reg       : actor_wd=0.0, critic_wd=0.0, actor_entropy_coef=0.0, actor_logit_l2_coef=0.0
+================================================================================
+Train CFG : steps_per_update=1500, source=training.steps_per_update, total_env_steps=15012000 (training.total_env_steps), total_updates=834, warmup_env_steps=1 (training.warmup_env_steps)
+Train DEV : learner_device=cuda:1, rollout_device=cuda:0, rollout_mode=centralized, rollout_batch_timeout_ms=2.0, rollout_num_threads=1
+Eval CFG  : mode=custom_env_families(4), periodic_eval_episodes=8, eval_interval_env_steps=2000000 (training.eval_interval_env_steps), eval_interval_updates=112
+Curriculum: regular_only@1[regular:1.00] | regular_plus_scale_free@334[regular:0.70,scale_free:0.30] | all_topologies@584[regular:0.40,scale_free:0.30,erdos_renyi:0.15,small_world:0.15]
+TensorBoard: log_dir=/home/QinYiHang/Code/GNN_SPGG/outputs/GNN_SPGG/spgg_CNN_warmup1_Node50_12workers_2GPU_3_25/tensorboard/0325_191944
+Curriculum: update=1, stage=regular_only, train=['regular'], train_weights=[1.0], eval=['regular']
+[INFO 19:24:49] train t_env: 18000 / 15012000 | update: 1 / 834
+[INFO 19:24:49] train Estimated time left: 70 hours, 34 minutes, 34 seconds. Time passed: 5 minutes, 5 seconds
+[INFO 19:24:49] train Recent Stats | update: 1 / 834 | t_env: 18000 / 15012000 | stage: regular_only
+train_f_c:                     0.2118  train_gini:                    0.3744  train_R_mean:                329.1223
+train_payoff_mean:            20.0382  train_pool_grown:             36.3673  train_pool:                   16.4072
+loss:                       1327.1641  policy_loss:                  -0.1437  value_loss:                 1327.3078
+mean_rollout_reward:          20.0382  entropy:                       1.6094  actor_logit_l2:                0.0108
+actor_lr:                      0.0001  critic_lr:                     0.0001  replay_size:               18000.0000
+rollout_sps:                  63.1999  rollout_collect_s:           284.8106  worker_collect_s:            284.2676
+env_step_s:                    8.0475  inference_wait_s:            273.3263  local_forward_s:               0.0000
+learner_update_s:             19.9931  infer_batch_mean:              8.2686  infer_batch_max:              11.0000
+uniform:                       0.0000  proportional:                  0.0000  constant_mix:                  0.0000
+pool_power_mix:                0.0000  random_logits:                 0.0001  actor_logits:                  0.9999
+[INFO 19:45:44] train t_env: 90000 / 15012000 | update: 5 / 834
+[INFO 19:45:44] train Estimated time left: 71 hours, 50 minutes, 18 seconds. Time passed: 26 minutes, 0 seconds
+[INFO 20:11:11] train t_env: 180000 / 15012000 | update: 10 / 834
+[INFO 20:11:11] train Estimated time left: 70 hours, 39 minutes, 57 seconds. Time passed: 51 minutes, 27 seconds
+[INFO 20:11:11] train Recent Stats | update: 10 / 834 | t_env: 180000 / 15012000 | stage: regular_only
+train_f_c:                     0.2137  train_gini:                    0.3747  train_R_mean:                331.9089
+train_payoff_mean:            20.1761  train_pool_grown:             36.7848  train_pool:                   16.6853
+loss:                       1307.6904  policy_loss:                  -0.4747  value_loss:                 1308.1651
+mean_rollout_reward:          20.1761  entropy:                       1.6090  actor_logit_l2:                0.0055
+actor_lr:                      0.0001  critic_lr:                     0.0001  replay_size:               99000.0000
+rollout_sps:                  62.0696  rollout_collect_s:           291.1213  worker_collect_s:            290.5999
+env_step_s:                    8.0357  inference_wait_s:            279.7655  local_forward_s:               0.0000
+learner_update_s:             17.4469  infer_batch_mean:              8.1323  infer_batch_max:              11.1000
+uniform:                       0.0000  proportional:                  0.0000  constant_mix:                  0.0000
+pool_power_mix:                0.0000  random_logits:                 0.0000  actor_logits:                  1.0000
+Console Log: /home/QinYiHang/Code/GNN_SPGG/outputs/GNN_SPGG/spgg_CNN_warmup1_Node50_12workers_2GPU_3_25/train.log
+================================================================================
+Experiment: spgg_CNN_warmup1_Node50_12workers_2GPU_3_25
+Run mode  : gnn_train
+Network   : regular
+Graph     : nodes=50, edges=100, degree_min=4, degree_max=4, degree_mean=4.000
+Dynamics  : alpha=0.5, r=2, p_max=100.0, episode_length=150
+Consume   : mode=piecewise_linear, fixed_mode=degree_scaled, degree_multiplier=1.0, rate=0.05, threshold=4.0
+Strategy  : rule=q_learning, state=none, lr=0.1, gamma=0.1, epsilon=0.05, q0=0.0
+Reward    : lambda_payoff=1.0, lambda_cooperation=0.0, lambda_gini=0.0
+Reg       : actor_wd=0.0, critic_wd=0.0, actor_entropy_coef=0.0, actor_logit_l2_coef=0.0
+================================================================================
+Train CFG : steps_per_update=1500, source=training.steps_per_update, total_env_steps=15000000 (training.total_env_steps), total_updates=2500, warmup_env_steps=1 (training.warmup_env_steps)
+Train DEV : learner_device=cuda:1, rollout_device=cuda:0, rollout_mode=centralized, rollout_batch_timeout_ms=2.0, rollout_num_threads=1
+Eval CFG  : mode=custom_env_families(4), periodic_eval_episodes=8, eval_interval_env_steps=2000000 (training.eval_interval_env_steps), eval_interval_updates=334
+Curriculum: regular_only@1[regular:1.00] | regular_plus_scale_free@1001[regular:0.70,scale_free:0.30] | all_topologies@1751[regular:0.40,scale_free:0.30,erdos_renyi:0.15,small_world:0.15]
+TensorBoard: log_dir=/home/QinYiHang/Code/GNN_SPGG/outputs/GNN_SPGG/spgg_CNN_warmup1_Node50_12workers_2GPU_3_25/tensorboard/0325_215409
+Curriculum: update=1, stage=regular_only, train=['regular'], train_weights=[1.0], eval=['regular']
+Console Log: /home/QinYiHang/Code/GNN_SPGG/outputs/GNN_SPGG/spgg_CNN_warmup1_Node50_12workers_2GPU_3_25/train.log
+================================================================================
+Experiment: spgg_CNN_warmup1_Node50_12workers_2GPU_3_25
+Run mode  : gnn_train
+Network   : regular
+Graph     : nodes=50, edges=100, degree_min=4, degree_max=4, degree_mean=4.000
+Dynamics  : alpha=0.5, r=2, p_max=100.0, episode_length=150
+Consume   : mode=piecewise_linear, fixed_mode=degree_scaled, degree_multiplier=1.0, rate=0.05, threshold=4.0
+Strategy  : rule=q_learning, state=none, lr=0.1, gamma=0.1, epsilon=0.05, q0=0.0
+Reward    : lambda_payoff=1.0, lambda_cooperation=0.0, lambda_gini=0.0
+Reg       : actor_wd=0.0, critic_wd=0.0, actor_entropy_coef=0.0, actor_logit_l2_coef=0.0
+================================================================================
+Train CFG : steps_per_update=1500, source=training.steps_per_update, total_env_steps=15000000 (training.total_env_steps), total_updates=2500, warmup_env_steps=1 (training.warmup_env_steps)
+Train DEV : learner_device=cuda:1, rollout_device=cuda:0, rollout_mode=centralized, rollout_batch_timeout_ms=2.0, rollout_num_threads=1
+Eval CFG  : mode=custom_env_families(4), periodic_eval_episodes=8, eval_interval_env_steps=2000000 (training.eval_interval_env_steps), eval_interval_updates=334
+Curriculum: regular_only@1[regular:1.00] | regular_plus_scale_free@1001[regular:0.70,scale_free:0.30] | all_topologies@1751[regular:0.40,scale_free:0.30,erdos_renyi:0.15,small_world:0.15]
+TensorBoard: log_dir=/home/QinYiHang/Code/GNN_SPGG/outputs/GNN_SPGG/spgg_CNN_warmup1_Node50_12workers_2GPU_3_25/tensorboard/0325_215936
+Curriculum: update=1, stage=regular_only, train=['regular'], train_weights=[1.0], eval=['regular']

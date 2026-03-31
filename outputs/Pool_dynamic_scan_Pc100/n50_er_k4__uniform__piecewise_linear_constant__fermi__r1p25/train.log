@@ -1,0 +1,42 @@
+Console Log: /home/QinYiHang/Code/GNN_SPGG/outputs/Pool_dynamic_scan/n50_er_k4__uniform__piecewise_linear_constant__fermi__r1p25/train.log
+================================================================================
+Experiment: n50_er_k4__uniform__piecewise_linear_constant__fermi__r1p25
+Run mode  : uniform
+Network   : erdos_renyi
+ER Params : target_mean_degree=4.0, edge_prob=0.0816327
+Graph     : nodes=50, edges=89, degree_min=0, degree_max=8, degree_mean=3.560
+Dynamics  : alpha=0.5, r=1.25, p_mode=dynamic, p_c=20.0, episode_length=1000
+Consume   : mode=piecewise_linear, fixed_mode=constant, fixed=4, rate=0.05, threshold=4.0
+Strategy  : rule=fermi, beta=1.0
+Reward    : lambda_payoff=1.0, lambda_cooperation=0.0, lambda_total_resource=0.0, lambda_gini=0.0
+Reg       : actor_wd=0.0, critic_wd=0.0, actor_entropy_coef=0.0, actor_logit_l2_coef=0.0
+================================================================================
+[Episode 001] return=13.040808, final_actual_cooperation=0.000000, final_gini=0.000000
+[INFO 16:39:02] rollout episode: 1 / 5
+[INFO 16:39:02] rollout Estimated time left: 8 seconds. Time passed: 2 seconds
+[Episode 002] return=140.187434, final_actual_cooperation=0.020000, final_gini=0.980000
+[INFO 16:39:05] rollout episode: 2 / 5
+[INFO 16:39:05] rollout Estimated time left: 7 seconds. Time passed: 5 seconds
+[Episode 003] return=130.660927, final_actual_cooperation=0.020000, final_gini=0.980000
+[INFO 16:39:07] rollout episode: 3 / 5
+[INFO 16:39:07] rollout Estimated time left: 4 seconds. Time passed: 7 seconds
+[Episode 004] return=6.394670, final_actual_cooperation=0.000000, final_gini=0.000000
+[INFO 16:39:09] rollout episode: 4 / 5
+[INFO 16:39:09] rollout Estimated time left: 2 seconds. Time passed: 9 seconds
+[Episode 005] return=22.784264, final_actual_cooperation=0.000000, final_gini=0.000000
+[INFO 16:39:11] rollout episode: 5 / 5
+[INFO 16:39:11] rollout Estimated time left: 0 seconds. Time passed: 11 seconds
+Final summary:
+{
+  "return_mean": 62.61362086099232,
+  "return_std": 59.75373498027797,
+  "final_cooperation_mean": 0.008,
+  "final_actual_cooperation_mean": 0.008,
+  "final_mean_resource_mean": 0.22836363636363632,
+  "final_mean_pool_grown_mean": 0.16,
+  "final_consumption_mean": 0.04181818181818182,
+  "final_mean_consumption_mean": 0.04181818181818182,
+  "final_mean_payoff_mean": 0.041818181818181845,
+  "final_gini_mean": 0.3919999999986268
+}
+Results saved to: /home/QinYiHang/Code/GNN_SPGG/outputs/Pool_dynamic_scan/n50_er_k4__uniform__piecewise_linear_constant__fermi__r1p25/results.json
