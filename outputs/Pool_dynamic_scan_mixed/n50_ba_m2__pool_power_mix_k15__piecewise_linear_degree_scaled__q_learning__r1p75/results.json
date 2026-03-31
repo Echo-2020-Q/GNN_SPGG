@@ -1,0 +1,421 @@
+{
+  "experiment": {
+    "experiment_name": "n50_ba_m2__pool_power_mix_k15__piecewise_linear_degree_scaled__q_learning__r1p75",
+    "seed": 42,
+    "run_mode": "pool_power_mix",
+    "network": {
+      "type": "scale_free",
+      "num_nodes": 50,
+      "regular_degree": 4,
+      "er_target_mean_degree": 4.0,
+      "er_edge_prob": null,
+      "ws_degree": 4,
+      "ws_rewiring_prob": 0.1,
+      "ba_attachments_per_new_node": 2,
+      "grid_rows": 10,
+      "grid_cols": 10,
+      "grid_periodic": false
+    },
+    "dynamics": {
+      "alpha": 0.5,
+      "r": 1.75,
+      "p_mode": "dynamic",
+      "p_max": 100.0,
+      "p_c": 50.0,
+      "resource_consumption_mode": "piecewise_linear",
+      "resource_consumption_fixed_mode": "degree_scaled",
+      "resource_consumption_fixed": 4,
+      "resource_consumption_degree_multiplier": 1.0,
+      "resource_consumption_rate": 0.05,
+      "resource_consumption_threshold": 4.0,
+      "strategy_update_rule": "q_learning",
+      "beta": 1.0,
+      "q_learning_rate": 0.1,
+      "q_learning_discount": 0.1,
+      "q_learning_epsilon": 0.05,
+      "q_learning_initial_value": 0.0,
+      "episode_length": 200,
+      "initial_resource": 20.0,
+      "initial_cooperation_prob": 0.5
+    },
+    "reward": {
+      "lambda_payoff": 0.5,
+      "lambda_cooperation": 0.0,
+      "lambda_total_resource": 0.04043126684636118,
+      "lambda_gini": 0.0,
+      "epsilon": 1e-08
+    },
+    "gnn": {
+      "hidden_dim": 128,
+      "local_hidden_dim": 64,
+      "score_hidden_dim": 64,
+      "critic_hidden_dim": null,
+      "num_message_passing_layers": 2,
+      "temperature": 1
+    },
+    "training": {
+      "total_env_steps": 15000000,
+      "warmup_env_steps": 307200,
+      "eval_interval_env_steps": 2000000,
+      "total_updates": null,
+      "steps_per_update": 800,
+      "use_episode_length_as_steps_per_update": false,
+      "gamma": 0.99,
+      "learning_rate": 0.0001,
+      "actor_lr": null,
+      "critic_lr": null,
+      "lr_schedule_type": "exponential_decay",
+      "lr_final": 1e-05,
+      "lr_decay_rate": 0.05,
+      "lr_decay_steps": 10000,
+      "save_checkpoints": true,
+      "checkpoint_interval": 500,
+      "save_final_checkpoint": true,
+      "save_best_checkpoint": true,
+      "checkpoint_mode": "lightweight",
+      "resume_from_checkpoint": null,
+      "actor_weight_decay": 0.0,
+      "critic_weight_decay": 0.0,
+      "actor_entropy_coef": 0.0005,
+      "actor_logit_l2_coef": 5e-05,
+      "critic_state_hidden_dim": 64,
+      "critic_action_hidden_dim": 64,
+      "critic_pool_hidden_dim": 64,
+      "critic_q_hidden_dim": 64,
+      "replay_capacity": 600000,
+      "batch_size": 512,
+      "graph_batch_chunk_size": 48,
+      "warmup_steps": null,
+      "warmup_behavior_mode": "heuristic_mix",
+      "warmup_selection_granularity": "per_episode",
+      "warmup_uniform_prob": 0.2,
+      "warmup_proportional_prob": 0.25,
+      "warmup_constant_mix_prob": 0.15,
+      "warmup_pool_power_mix_prob": 0.25,
+      "warmup_random_logits_prob": 0.15,
+      "warmup_constant_mix_omega": 0.5,
+      "warmup_pool_power_k": 15.0,
+      "warmup_logit_noise_std": 0.15,
+      "warmup_logit_noise_clip": 0.25,
+      "freeze_actor_q_during_warmup": true,
+      "warmup_actor_bc_coef": 1.0,
+      "actor_demo_bc_coef": 0.25,
+      "actor_demo_bc_decay_end_fraction": 0.2,
+      "train_every": 1,
+      "gradient_steps_per_update": 16,
+      "policy_delay": 4,
+      "replay_collapse_fc_threshold": 0.1,
+      "replay_max_collapse_sample_ratio": 0.2,
+      "tau": 0.005,
+      "rollout_logit_noise_std": 0.3,
+      "rollout_logit_noise_clip": 0.5,
+      "rollout_noise_decay": 0.9995,
+      "target_logit_noise_std": 0.1,
+      "target_logit_noise_clip": 0.25,
+      "num_workers": 12,
+      "num_envs_per_worker": 4,
+      "worker_sync_interval": 1,
+      "overlap_rollout_and_update": true,
+      "worker_rpc_timeout_seconds": 12000.0,
+      "rollout_device": "cuda:3",
+      "rollout_inference_mode": "local",
+      "rollout_inference_batch_timeout_ms": 2.0,
+      "device": "cuda:0",
+      "rollout_num_threads": 1,
+      "collapse_resource_threshold": 1e-06,
+      "eval_interval": null,
+      "eval_episodes": 8
+    },
+    "domain_randomization": {
+      "enabled": true,
+      "network_types": [
+        "regular",
+        "erdos_renyi",
+        "small_world",
+        "scale_free"
+      ],
+      "network_type_weights": null,
+      "num_nodes_choices": [
+        50
+      ],
+      "regular_degree_choices": [
+        4
+      ],
+      "er_mean_degree_choices": [
+        4.0
+      ],
+      "ws_degree_choices": [
+        4
+      ],
+      "ws_rewiring_choices": [
+        0.1
+      ],
+      "ba_attachment_choices": [
+        2
+      ],
+      "initial_resource_range": null,
+      "initial_cooperation_prob_range": null,
+      "alpha_range": null,
+      "r_range": null,
+      "p_max_range": null
+    },
+    "evaluation": {
+      "use_custom_env_families": true,
+      "env_families": [
+        {
+          "network_type": "regular",
+          "num_nodes": 50,
+          "regular_degree": 4
+        },
+        {
+          "network_type": "erdos_renyi",
+          "num_nodes": 50,
+          "er_target_mean_degree": 4.0
+        },
+        {
+          "network_type": "small_world",
+          "num_nodes": 50,
+          "ws_degree": 4,
+          "ws_rewiring_prob": 0.1
+        },
+        {
+          "network_type": "scale_free",
+          "num_nodes": 50,
+          "ba_attachments_per_new_node": 2
+        }
+      ]
+    },
+    "curriculum": {
+      "enabled": true,
+      "mode": "update_steps",
+      "stages": [
+        {
+          "label": "regular_only",
+          "portion": 0.3,
+          "train_network_types": [
+            "regular"
+          ],
+          "train_network_type_weights": [
+            1.0
+          ],
+          "eval_network_types": [
+            "regular"
+          ]
+        },
+        {
+          "label": "regular_plus_scale_free",
+          "portion": 0.3,
+          "train_network_types": [
+            "regular",
+            "scale_free"
+          ],
+          "train_network_type_weights": [
+            0.7,
+            0.3
+          ],
+          "eval_network_types": [
+            "regular",
+            "scale_free"
+          ]
+        },
+        {
+          "label": "all_topologies",
+          "portion": 0.4,
+          "train_network_types": [
+            "regular",
+            "scale_free",
+            "erdos_renyi",
+            "small_world"
+          ],
+          "train_network_type_weights": [
+            0.4,
+            0.3,
+            0.15,
+            0.15
+          ],
+          "eval_network_types": [
+            "regular",
+            "scale_free",
+            "erdos_renyi",
+            "small_world"
+          ]
+        }
+      ]
+    },
+    "rollout": {
+      "episodes": 5,
+      "post_training_eval_episodes": 5
+    },
+    "visualization": {
+      "enable_micro_snapshots": false,
+      "enable_macro_timeseries": true,
+      "episodes_to_visualize": [
+        1
+      ],
+      "frame_stride": 1,
+      "layout": "spring",
+      "spring_iterations": 80,
+      "node_color_metric": "x_actual",
+      "node_size_metric": "resources",
+      "node_value_metric": "resources",
+      "node_value_decimals": 1,
+      "label_nodes": true,
+      "macro_metrics": [
+        "actual_cooperation_rate",
+        "mean_resource",
+        "mean_pool_grown",
+        "mean_consumption",
+        "mean_payoff",
+        "gini"
+      ],
+      "save_dpi": 160
+    },
+    "tensorboard": {
+      "enabled": true,
+      "subdir": "tensorboard",
+      "flush_secs": 30,
+      "write_config_text": true,
+      "write_static_scalars": true,
+      "console_progress_logs": true,
+      "console_progress_interval": 1,
+      "console_training_logs": true,
+      "console_log_interval": 1,
+      "console_recent_window_updates": 10
+    },
+    "output": {
+      "root_dir": "outputs/Pool_dynamic_scan_mixed",
+      "save_results_json": true,
+      "save_micro_snapshots": true,
+      "save_macro_timeseries": true,
+      "save_console_log": true,
+      "console_log_filename": "train.log"
+    },
+    "scan_tags": {
+      "scan_name": "3_31_dynamics_scan_mixed",
+      "run_mode": "pool_power_mix",
+      "run_mode_param_name": "warmup_pool_power_k",
+      "run_mode_param_value": 15.0,
+      "run_mode_param_label": "k15",
+      "warmup_constant_mix_omega": null,
+      "warmup_pool_power_k": 15.0,
+      "num_nodes": 50,
+      "network_label": "n50_ba_m2",
+      "consumption_label": "piecewise_linear_degree_scaled",
+      "resource_consumption_mode": "piecewise_linear",
+      "resource_consumption_fixed_mode": "degree_scaled",
+      "strategy_update_rule": "q_learning",
+      "r": 1.75
+    },
+    "_runtime": {
+      "quiet_console": true,
+      "scan_mode": true
+    }
+  },
+  "graph_summary": {
+    "num_nodes": 50.0,
+    "num_edges": 97.0,
+    "degree_min": 2.0,
+    "degree_max": 19.0,
+    "degree_mean": 3.88
+  },
+  "env_config": {
+    "alpha": 0.5,
+    "r": 1.75,
+    "p_mode": "dynamic",
+    "p_max": 100.0,
+    "p_c": 50.0,
+    "resource_consumption_mode": "piecewise_linear",
+    "resource_consumption_fixed_mode": "degree_scaled",
+    "resource_consumption_fixed": 4,
+    "resource_consumption_degree_multiplier": 1.0,
+    "resource_consumption_rate": 0.05,
+    "resource_consumption_threshold": 4.0,
+    "strategy_update_rule": "q_learning",
+    "beta": 1.0,
+    "q_learning_rate": 0.1,
+    "q_learning_discount": 0.1,
+    "q_learning_epsilon": 0.05,
+    "q_learning_initial_value": 0.0,
+    "episode_length": 200,
+    "initial_resource": 20.0,
+    "initial_cooperation_prob": 0.5,
+    "num_nodes": null,
+    "target_mean_degree": 3.88,
+    "reward": {
+      "lambda_payoff": 0.5,
+      "lambda_cooperation": 0.0,
+      "lambda_total_resource": 0.04043126684636118,
+      "lambda_gini": 0.0,
+      "epsilon": 1e-08
+    }
+  },
+  "results": {
+    "experiment_name": "n50_ba_m2__pool_power_mix_k15__piecewise_linear_degree_scaled__q_learning__r1p75",
+    "run_mode": "pool_power_mix",
+    "network_type": "scale_free",
+    "episode_summaries": [
+      {
+        "final_actual_cooperation": 0.78,
+        "final_mean_resource": 201.64457952955019,
+        "final_mean_pool_grown": 118.52229130518604,
+        "final_mean_consumption": 12.627306708097048,
+        "final_mean_payoff": 9.195193893935736,
+        "final_gini": 0.5181639428968527,
+        "episode_return": 3440.2243114680723,
+        "episode_index": 1.0
+      },
+      {
+        "final_actual_cooperation": 0.76,
+        "final_mean_resource": 232.2483613850037,
+        "final_mean_pool_grown": 124.7770724889146,
+        "final_mean_consumption": 14.184469164847185,
+        "final_mean_payoff": 13.199376650779122,
+        "final_gini": 0.4823677544353465,
+        "episode_return": 3524.6388125587982,
+        "episode_index": 2.0
+      },
+      {
+        "final_actual_cooperation": 0.72,
+        "final_mean_resource": 193.89712205013774,
+        "final_mean_pool_grown": 109.57909838699312,
+        "final_mean_consumption": 12.020285111119296,
+        "final_mean_payoff": 12.088493722107467,
+        "final_gini": 0.5294839415013662,
+        "episode_return": 3097.427123721275,
+        "episode_index": 3.0
+      },
+      {
+        "final_actual_cooperation": 0.6,
+        "final_mean_resource": 117.10888207144907,
+        "final_mean_pool_grown": 67.5142085984191,
+        "final_mean_consumption": 7.487249142016581,
+        "final_mean_payoff": 8.052285983372588,
+        "final_gini": 0.595155406207022,
+        "episode_return": 2196.2484462664306,
+        "episode_index": 4.0
+      },
+      {
+        "final_actual_cooperation": 0.88,
+        "final_mean_resource": 294.3420454604657,
+        "final_mean_pool_grown": 174.26936090225564,
+        "final_mean_consumption": 17.52880707854481,
+        "final_mean_payoff": 21.08673747894061,
+        "final_gini": 0.465885452350834,
+        "episode_return": 4392.916859011841,
+        "episode_index": 5.0
+      }
+    ],
+    "summary": {
+      "return_mean": 3330.291110605284,
+      "return_std": 709.8321238168115,
+      "final_cooperation_mean": 0.748,
+      "final_actual_cooperation_mean": 0.748,
+      "final_mean_resource_mean": 207.84819809932128,
+      "final_mean_pool_grown_mean": 118.9324063363537,
+      "final_consumption_mean": 12.769623440924985,
+      "final_mean_consumption_mean": 12.769623440924985,
+      "final_mean_payoff_mean": 12.724417545827103,
+      "final_gini_mean": 0.5182112994782843
+    }
+  }
+}

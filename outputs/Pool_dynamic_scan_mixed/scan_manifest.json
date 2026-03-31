@@ -1,0 +1,60 @@
+{
+  "scan_config": {
+    "enabled": true,
+    "name": "3_31_dynamics_scan_mixed",
+    "output_root_dir": "outputs/Pool_dynamic_scan_mixed",
+    "parallel": true,
+    "max_workers": 32,
+    "r_values": [
+      0.25,
+      0.75,
+      1.25,
+      1.75,
+      2.25
+    ],
+    "resource_consumption_rate": [
+      0.05
+    ],
+    "num_nodes": [
+      50
+    ],
+    "network_types": [
+      "regular",
+      "erdos_renyi",
+      "small_world",
+      "scale_free"
+    ],
+    "resource_consumption_modes": [
+      "piecewise_linear"
+    ],
+    "resource_consumption_fixed_modes": [
+      "constant",
+      "degree_scaled"
+    ],
+    "strategy_update_rules": [
+      "q_learning",
+      "fermi"
+    ],
+    "warmup_constant_mix_omega": [
+      0.5
+    ],
+    "warmup_pool_power_k": [
+      15,
+      17.0,
+      18.0,
+      19.0,
+      20,
+      22,
+      25
+    ],
+    "run_mode": [
+      "proportional",
+      "uniform",
+      "constant_mix",
+      "pool_power_mix"
+    ]
+  },
+  "base_experiment_name": "spgg_CNN_12workers_PoolDynamic_warmupBC",
+  "base_run_mode": "gnn_train",
+  "num_experiments": 800
+}
