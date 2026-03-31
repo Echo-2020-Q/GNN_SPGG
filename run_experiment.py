@@ -976,9 +976,9 @@ BATCH_EXPERIMENTS = [
 # 参数扫描配置：启用后会忽略上面的 BATCH_EXPERIMENTS，自动生成扫描实验
 # =============================================================================
 SCAN_EXPERIMENT = {
-    "enabled": False, #是否启用参数扫描实验，启用后会忽略上面的 BATCH_EXPERIMENTS，自动生成扫描实验
-    "name": "3_30_dynamics_scan", #扫描实验的名字，会在output_root_dir下面生成一个同名子目录
-    "output_root_dir": "outputs/Pool_dynamic_scan",#"outputs/scan",
+    "enabled": True, #是否启用参数扫描实验，启用后会忽略上面的 BATCH_EXPERIMENTS，自动生成扫描实验
+    "name": "3_31_dynamics_scan_mixed", #扫描实验的名字，会在output_root_dir下面生成一个同名子目录
+    "output_root_dir": "outputs/Pool_dynamic_scan_mixed",#"outputs/scan",
     "parallel": True,
     "max_workers": 32,#自己的电脑为16核
     "r_values": [0.25, 0.75, 1.25, 1.75, 2.25],
@@ -989,8 +989,8 @@ SCAN_EXPERIMENT = {
     "resource_consumption_fixed_modes": ["constant", "degree_scaled"],
     "strategy_update_rules": ["q_learning", "fermi"],
     "warmup_constant_mix_omega": [0.5],
-    "warmup_pool_power_k": [19.0],
-    "run_mode": ["proportional", "uniform"],#["proportional", "uniform"],
+    "warmup_pool_power_k": [15 ,17.0, 18.0, 19.0, 20, 22, 25],
+    "run_mode": ["proportional", "uniform","constant_mix","pool_power_mix"],#["proportional", "uniform"],
 }
 
 def deep_update(base: Dict[str, Any], overrides: Mapping[str, Any]) -> Dict[str, Any]:
