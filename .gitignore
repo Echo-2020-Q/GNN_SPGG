@@ -9,4 +9,17 @@ build/
 .DS_Store
 
 # Generated experiment artifacts
+outputs/200frame_fixed_degree_Pmax100_R020_r2_len200/
+outputs/200frame_piecewise_degree_Pmax100_R020_r2_len200/
+outputs/200frame_prop_degree_Pmax100_R020_r2_len200/
+outputs/200frame_r_network_consumption_strategy_scan_0.05tau/
+outputs/Noframe_Pmax100_R020_r2_len20000/
+outputs/Noframe_consum_fixed_Pmax100_R020_r2_len20000/
+outputs/Noframe_consum_piecewise_Pmax100_R020_r2_len20000/
+outputs/Noframe_consum_propo_constant_Pmax100_R020_r2_len20000/
+outputs/Pmax100_initial20_r2_len200/
+outputs/r_network_consumption_strategy_scan/
+outputs/r_network_consumption_strategy_scan_0.05tau/
+outputs/spgg_CNN_12workers_PoolDynamic_promotelearning/
+outputs/刚开始尝试的/
 
