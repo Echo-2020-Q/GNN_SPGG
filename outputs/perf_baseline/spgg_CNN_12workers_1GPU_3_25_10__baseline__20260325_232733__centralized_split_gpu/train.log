@@ -1,0 +1,306 @@
+Console Log: /home/QinYiHang/Code/GNN_SPGG/outputs/perf_baseline/spgg_CNN_12workers_1GPU_3_25_10__baseline__20260325_232733__centralized_split_gpu/train.log
+================================================================================
+Experiment: spgg_CNN_12workers_1GPU_3_25_10__baseline__20260325_232733__centralized_split_gpu
+Run mode  : gnn_train
+Network   : regular
+Graph     : nodes=50, edges=100, degree_min=4, degree_max=4, degree_mean=4.000
+Dynamics  : alpha=0.5, r=2, p_max=100.0, episode_length=150
+Consume   : mode=piecewise_linear, fixed_mode=degree_scaled, degree_multiplier=1.0, rate=0.05, threshold=4.0
+Strategy  : rule=q_learning, state=none, lr=0.1, gamma=0.1, epsilon=0.05, q0=0.0
+Reward    : lambda_payoff=1.0, lambda_cooperation=0.0, lambda_gini=0.0
+Reg       : actor_wd=0.0, critic_wd=0.0, actor_entropy_coef=0.0, actor_logit_l2_coef=0.0
+================================================================================
+Train CFG : steps_per_update=750, source=training.steps_per_update, total_env_steps=72000 (training.total_updates), total_updates=8, warmup_env_steps=9000 (training.warmup_env_steps)
+Train DEV : learner_device=cuda:1, rollout_device=cuda:2, rollout_mode=centralized, rollout_batch_timeout_ms=2.0, rollout_num_threads=1, num_envs_per_worker=4, overlap_rollout_update=True
+Eval CFG  : mode=custom_env_families(4), periodic_eval_episodes=2, eval_interval_env_steps=36000 (training.eval_interval), eval_interval_updates=4
+Curriculum: regular_only@1[regular:1.00] | regular_plus_scale_free@4[regular:0.70,scale_free:0.30] | all_topologies@6[regular:0.40,scale_free:0.30,erdos_renyi:0.15,small_world:0.15]
+Curriculum: update=1, stage=regular_only, train=['regular'], train_weights=[1.0], eval=['regular']
+[INFO 23:28:07] train t_env: 9000 / 72000 | update: 1 / 8
+[INFO 23:28:07] train Estimated time left: 47 seconds. Time passed: 7 seconds
+[INFO 23:28:07] train Recent Stats | update: 1 / 8 | t_env: 9000 / 72000 | stage: regular_only
+train_f_c:                     0.5830  train_gini:                    0.3193  train_R_mean:                255.9863
+train_payoff_mean:            18.8588  train_pool_grown:             80.2857  train_pool:                   61.3789
+loss:                        864.5326  policy_loss:                  -0.0293  value_loss:                  864.5619
+mean_rollout_reward:          18.8588  entropy:                       1.6091  actor_logit_l2:                0.0338
+actor_lr:                      0.0001  critic_lr:                     0.0001  replay_size:                9000.0000
+rollout_sps:                2251.6512  rollout_collect_s:             3.9971  worker_collect_s:              2.9591
+env_step_s:                    1.9207  inference_wait_s:              0.0000  infer_build_s:                 0.0000
+local_forward_s:               0.0000  action_to_numpy_s:             0.0163  transition_encode_s:           0.3674
+stack_transitions_s:           0.0335  shm_serialize_s:               0.0151  shm_deserialize_s:             0.0082
+rollout_wait_s:                0.0000  overlap_s:                     0.0000  actor_sync_s:                  0.2768
+actor_publish_s:               0.0387  actor_sync_server_s:           0.0369  actor_sync_worker_s:           0.2012
+replay_extend_s:               0.0467  replay_sample_s:               0.0018  to_device_s:                   0.0021
+critic_update_s:               0.2922  actor_update_s:                0.0000  target_update_s:               0.0000
+learner_update_s:              2.3696  eval_s:                        0.0000  infer_batch_mean:              0.0000
+infer_batch_max:               0.0000  uniform:                       0.1456  proportional:                  0.3250
+constant_mix:                  0.1542  pool_power_mix:                0.2126  random_logits:                 0.1627
+actor_logits:                  0.0000
+[INFO 23:28:15] train t_env: 18000 / 72000 | update: 2 / 8
+[INFO 23:28:15] train Estimated time left: 43 seconds. Time passed: 14 seconds
+[INFO 23:28:15] train Recent Stats | update: 2 / 8 | t_env: 18000 / 72000 | stage: regular_only
+train_f_c:                     0.4363  train_gini:                    0.3410  train_R_mean:                338.1683
+train_payoff_mean:            22.3353  train_pool_grown:             65.1232  train_pool:                   42.7897
+loss:                        959.4075  policy_loss:                  -0.0749  value_loss:                  959.4825
+mean_rollout_reward:          22.3353  entropy:                       1.6092  actor_logit_l2:                0.0277
+actor_lr:                      0.0001  critic_lr:                     0.0001  replay_size:               13500.0000
+rollout_sps:                1727.5081  rollout_collect_s:             5.7380  worker_collect_s:              5.0662
+env_step_s:                    2.1407  inference_wait_s:              1.8526  infer_build_s:                 0.0197
+local_forward_s:               0.0000  action_to_numpy_s:             0.0187  transition_encode_s:           0.4836
+stack_transitions_s:           0.0325  shm_serialize_s:               0.0145  shm_deserialize_s:             0.0047
+rollout_wait_s:                2.7015  overlap_s:                     1.0380  actor_sync_s:                  0.2440
+actor_publish_s:               0.0211  actor_sync_server_s:           0.0248  actor_sync_worker_s:           0.1981
+replay_extend_s:               0.0450  replay_sample_s:               0.0021  to_device_s:                   0.0022
+critic_update_s:               0.3239  actor_update_s:                0.0000  target_update_s:               0.0000
+learner_update_s:              2.2226  eval_s:                        0.0000  infer_batch_mean:             12.1698
+infer_batch_max:              24.0000  uniform:                       0.0728  proportional:                  0.1625
+constant_mix:                  0.0771  pool_power_mix:                0.1063  random_logits:                 0.0813
+actor_logits:                  0.5000
+[INFO 23:28:22] train t_env: 27000 / 72000 | update: 3 / 8
+[INFO 23:28:22] train Estimated time left: 35 seconds. Time passed: 21 seconds
+[INFO 23:28:22] train Recent Stats | update: 3 / 8 | t_env: 27000 / 72000 | stage: regular_only
+train_f_c:                     0.3553  train_gini:                    0.3524  train_R_mean:                332.3571
+train_payoff_mean:            20.9871  train_pool_grown:             54.4202  train_pool:                   33.4760
+loss:                       1069.5008  policy_loss:                  -0.1157  value_loss:                 1069.6164
+mean_rollout_reward:          20.9871  entropy:                       1.6093  actor_logit_l2:                0.0227
+actor_lr:                      0.0001  critic_lr:                     0.0001  replay_size:               18000.0000
+rollout_sps:                1605.3235  rollout_collect_s:             6.0297  worker_collect_s:              5.4480
+env_step_s:                    2.1925  inference_wait_s:              2.2549  infer_build_s:                 0.0254
+local_forward_s:               0.0000  action_to_numpy_s:             0.0187  transition_encode_s:           0.4532
+stack_transitions_s:           0.0382  shm_serialize_s:               0.0160  shm_deserialize_s:             0.0035
+rollout_wait_s:                3.4552  overlap_s:                     1.2422  actor_sync_s:                  0.2214
+actor_publish_s:               0.0154  actor_sync_server_s:           0.0212  actor_sync_worker_s:           0.1849
+replay_extend_s:               0.0465  replay_sample_s:               0.0024  to_device_s:                   0.0019
+critic_update_s:               0.3227  actor_update_s:                0.0000  target_update_s:               0.0000
+learner_update_s:              2.0318  eval_s:                        0.0000  infer_batch_mean:             16.7101
+infer_batch_max:              32.0000  uniform:                       0.0485  proportional:                  0.1083
+constant_mix:                  0.0514  pool_power_mix:                0.0709  random_logits:                 0.0542
+actor_logits:                  0.6667
+Curriculum: update=4, stage=regular_plus_scale_free, train=['regular', 'scale_free'], train_weights=[0.7, 0.3], eval=['regular', 'scale_free']
+[INFO 23:28:35] train t_env: 36000 / 72000 | update: 4 / 8
+[INFO 23:28:35] train Estimated time left: 34 seconds. Time passed: 34 seconds
+[INFO 23:28:35] train Recent Stats | update: 4 / 8 | t_env: 36000 / 72000 | stage: regular_plus_scale_free
+train_f_c:                     0.3302  train_gini:                    0.3640  train_R_mean:                330.3833
+train_payoff_mean:            21.3829  train_pool_grown:             51.3538  train_pool:                   29.9903
+f_c:                           0.0000  gini:                          0.6668  return_mean:                2907.3913
+R_mean:                      320.6359  payoff_mean:                  19.3826  pool_grown_mean:              36.3918
+pool_mean:                    17.0092  R_total_mean:              16031.7927  collapse_rate:                 0.2500
+loss:                       1110.4845  policy_loss:                  -0.1514  value_loss:                 1110.6358
+mean_rollout_reward:          21.3829  entropy:                       1.6093  actor_logit_l2:                0.0191
+actor_lr:                      0.0001  critic_lr:                     0.0001  replay_size:               22500.0000
+rollout_sps:                1497.0625  rollout_collect_s:             6.4416  worker_collect_s:              5.8567
+env_step_s:                    2.2064  inference_wait_s:              2.6756  infer_build_s:                 0.0287
+local_forward_s:               0.0000  action_to_numpy_s:             0.0190  transition_encode_s:           0.4401
+stack_transitions_s:           0.0381  shm_serialize_s:               0.0163  shm_deserialize_s:             0.0029
+rollout_wait_s:                3.9909  overlap_s:                     1.4514  actor_sync_s:                  0.2255
+actor_publish_s:               0.0125  actor_sync_server_s:           0.0201  actor_sync_worker_s:           0.1928
+replay_extend_s:               0.0469  replay_sample_s:               0.0034  to_device_s:                   0.0020
+critic_update_s:               0.3335  actor_update_s:                0.0000  target_update_s:               0.0000
+learner_update_s:              2.0435  eval_s:                        1.2837  infer_batch_mean:             18.3686
+infer_batch_max:              35.0000  uniform:                       0.0364  proportional:                  0.0813
+constant_mix:                  0.0386  pool_power_mix:                0.0531  random_logits:                 0.0407
+actor_logits:                  0.7500
+[INFO 23:28:35] train Latest eval | f_c=0.0000, gini=0.6668, return=2907.3913, R=320.6359, payoff=19.3826, pool_grown=36.3918, pool=17.0092, collapse_rate=0.2500
+[INFO 23:28:42] train t_env: 45000 / 72000 | update: 5 / 8
+[INFO 23:28:42] train Estimated time left: 25 seconds. Time passed: 42 seconds
+[INFO 23:28:42] train Recent Stats | update: 5 / 8 | t_env: 45000 / 72000 | stage: regular_plus_scale_free
+train_f_c:                     0.3091  train_gini:                    0.3734  train_R_mean:                335.6948
+train_payoff_mean:            21.2904  train_pool_grown:             48.7792  train_pool:                   27.5315
+f_c:                           0.0000  gini:                          0.6668  return_mean:                2907.3913
+R_mean:                      320.6359  payoff_mean:                  19.3826  pool_grown_mean:              36.3918
+pool_mean:                    17.0092  R_total_mean:              16031.7927  collapse_rate:                 0.2500
+loss:                       1153.3814  policy_loss:                  -0.1834  value_loss:                 1153.5647
+mean_rollout_reward:          21.2904  entropy:                       1.6064  actor_logit_l2:                0.0165
+actor_lr:                      0.0001  critic_lr:                     0.0001  replay_size:               27000.0000
+rollout_sps:                1435.2907  rollout_collect_s:             6.6682  worker_collect_s:              6.0979
+env_step_s:                    2.2087  inference_wait_s:              2.9473  infer_build_s:                 0.0300
+local_forward_s:               0.0000  action_to_numpy_s:             0.0188  transition_encode_s:           0.4265
+stack_transitions_s:           0.0361  shm_serialize_s:               0.0161  shm_deserialize_s:             0.0025
+rollout_wait_s:                4.2686  overlap_s:                     1.6002  actor_sync_s:                  0.2198
+actor_publish_s:               0.0109  actor_sync_server_s:           0.0191  actor_sync_worker_s:           0.1898
+replay_extend_s:               0.0466  replay_sample_s:               0.0050  to_device_s:                   0.0019
+critic_update_s:               0.3445  actor_update_s:                0.0000  target_update_s:               0.0000
+learner_update_s:              2.0735  eval_s:                        1.0270  infer_batch_mean:             19.4018
+infer_batch_max:              37.6000  uniform:                       0.0291  proportional:                  0.0650
+constant_mix:                  0.0308  pool_power_mix:                0.0425  random_logits:                 0.0325
+actor_logits:                  0.8000
+Curriculum: update=6, stage=all_topologies, train=['regular', 'scale_free', 'erdos_renyi', 'small_world'], train_weights=[0.4, 0.3, 0.15, 0.15], eval=['regular', 'scale_free', 'erdos_renyi', 'small_world']
+[INFO 23:28:49] train t_env: 54000 / 72000 | update: 6 / 8
+[INFO 23:28:49] train Estimated time left: 16 seconds. Time passed: 49 seconds
+[INFO 23:28:49] train Recent Stats | update: 6 / 8 | t_env: 54000 / 72000 | stage: all_topologies
+train_f_c:                     0.2436  train_gini:                    0.3940  train_R_mean:                346.3400
+train_payoff_mean:            21.8419  train_pool_grown:             40.9373  train_pool:                   19.1375
+f_c:                           0.0000  gini:                          0.6668  return_mean:                2907.3913
+R_mean:                      320.6359  payoff_mean:                  19.3826  pool_grown_mean:              36.3918
+pool_mean:                    17.0092  R_total_mean:              16031.7927  collapse_rate:                 0.2500
+loss:                       1261.0954  policy_loss:                  -0.2516  value_loss:                 1261.3470
+mean_rollout_reward:          21.8419  entropy:                       1.6031  actor_logit_l2:                0.0107
+actor_lr:                      0.0001  critic_lr:                     0.0001  replay_size:               36000.0000
+rollout_sps:                1249.1868  rollout_collect_s:             7.2312  worker_collect_s:              6.7872
+env_step_s:                    2.2352  inference_wait_s:              3.6794  infer_build_s:                 0.0361
+local_forward_s:               0.0000  action_to_numpy_s:             0.0182  transition_encode_s:           0.4146
+stack_transitions_s:           0.0330  shm_serialize_s:               0.0154  shm_deserialize_s:             0.0012
+rollout_wait_s:                5.1721  overlap_s:                     2.0591  actor_sync_s:                  0.2038
+actor_publish_s:               0.0037  actor_sync_server_s:           0.0149  actor_sync_worker_s:           0.1852
+replay_extend_s:               0.0458  replay_sample_s:               0.0074  to_device_s:                   0.0019
+critic_update_s:               0.3608  actor_update_s:                0.0000  target_update_s:               0.0000
+learner_update_s:              2.0582  eval_s:                        1.0270  infer_batch_mean:             23.9527
+infer_batch_max:              44.8000  uniform:                       0.0000  proportional:                  0.0000
+constant_mix:                  0.0000  pool_power_mix:                0.0000  random_logits:                 0.0000
+actor_logits:                  1.0000
+[INFO 23:28:57] train t_env: 63000 / 72000 | update: 7 / 8
+[INFO 23:28:57] train Estimated time left: 8 seconds. Time passed: 56 seconds
+[INFO 23:28:57] train Recent Stats | update: 7 / 8 | t_env: 63000 / 72000 | stage: all_topologies
+train_f_c:                     0.2311  train_gini:                    0.4074  train_R_mean:                332.8873
+train_payoff_mean:            20.8382  train_pool_grown:             38.6307  train_pool:                   17.8517
+f_c:                           0.0000  gini:                          0.6668  return_mean:                2907.3913
+R_mean:                      320.6359  payoff_mean:                  19.3826  pool_grown_mean:              36.3918
+pool_mean:                    17.0092  R_total_mean:              16031.7927  collapse_rate:                 0.2500
+loss:                       1310.0635  policy_loss:                  -0.3188  value_loss:                 1310.3823
+mean_rollout_reward:          20.8382  entropy:                       1.5975  actor_logit_l2:                0.0072
+actor_lr:                      0.0001  critic_lr:                     0.0001  replay_size:               45000.0000
+rollout_sps:                1258.0020  rollout_collect_s:             7.1784  worker_collect_s:              6.7416
+env_step_s:                    2.1708  inference_wait_s:              3.7415  infer_build_s:                 0.0344
+local_forward_s:               0.0000  action_to_numpy_s:             0.0167  transition_encode_s:           0.3905
+stack_transitions_s:           0.0320  shm_serialize_s:               0.0156  shm_deserialize_s:             0.0011
+rollout_wait_s:                5.1431  overlap_s:                     2.0352  actor_sync_s:                  0.1864
+actor_publish_s:               0.0037  actor_sync_server_s:           0.0151  actor_sync_worker_s:           0.1676
+replay_extend_s:               0.0469  replay_sample_s:               0.0085  to_device_s:                   0.0019
+critic_update_s:               0.3521  actor_update_s:                0.0000  target_update_s:               0.0000
+learner_update_s:              2.0343  eval_s:                        1.0270  infer_batch_mean:             23.8550
+infer_batch_max:              44.8000  uniform:                       0.0000  proportional:                  0.0000
+constant_mix:                  0.0000  pool_power_mix:                0.0000  random_logits:                 0.0000
+actor_logits:                  1.0000
+[INFO 23:29:15] train t_env: 72000 / 72000 | update: 8 / 8
+[INFO 23:29:15] train Estimated time left: 0 seconds. Time passed: 1 minutes, 15 seconds
+[INFO 23:29:15] train Recent Stats | update: 8 / 8 | t_env: 72000 / 72000 | stage: all_topologies
+train_f_c:                     0.2328  train_gini:                    0.4198  train_R_mean:                332.1239
+train_payoff_mean:            20.8428  train_pool_grown:             38.7915  train_pool:                   18.0057
+f_c:                           0.0075  gini:                          0.7102  return_mean:                2966.3748
+R_mean:                      326.7018  payoff_mean:                  19.7758  pool_grown_mean:              37.1394
+pool_mean:                    17.3636  R_total_mean:              16335.0914  collapse_rate:                 0.1875
+loss:                       1293.2364  policy_loss:                  -0.3886  value_loss:                 1293.6250
+mean_rollout_reward:          20.8428  entropy:                       1.5905  actor_logit_l2:                0.0053
+actor_lr:                      0.0001  critic_lr:                     0.0001  replay_size:               54000.0000
+rollout_sps:                1218.2892  rollout_collect_s:             7.4043  worker_collect_s:              6.9595
+env_step_s:                    2.1396  inference_wait_s:              4.0082  infer_build_s:                 0.0338
+local_forward_s:               0.0000  action_to_numpy_s:             0.0163  transition_encode_s:           0.3809
+stack_transitions_s:           0.0255  shm_serialize_s:               0.0143  shm_deserialize_s:             0.0012
+rollout_wait_s:                5.2394  overlap_s:                     2.1649  actor_sync_s:                  0.1810
+actor_publish_s:               0.0035  actor_sync_server_s:           0.0153  actor_sync_worker_s:           0.1622
+replay_extend_s:               0.0455  replay_sample_s:               0.0095  to_device_s:                   0.0020
+critic_update_s:               0.3749  actor_update_s:                0.0000  target_update_s:               0.0000
+learner_update_s:              2.1636  eval_s:                        3.1008  infer_batch_mean:             23.4204
+infer_batch_max:              44.8000  uniform:                       0.0000  proportional:                  0.0000
+constant_mix:                  0.0000  pool_power_mix:                0.0000  random_logits:                 0.0000
+actor_logits:                  1.0000
+[INFO 23:29:15] train Latest eval | f_c=0.0150, gini=0.7537, return=3025.3583, R=332.7678, payoff=20.1691, pool_grown=37.8870, pool=17.7179, collapse_rate=0.1250
+Final summary:
+{
+  "update": 8.0,
+  "loss": 1205.5513630509377,
+  "policy_loss": -0.5462207198143005,
+  "value_loss": 1206.097583770752,
+  "entropy": 1.574812412261963,
+  "critic1_loss": 606.2404594421387,
+  "critic2_loss": 599.8571243286133,
+  "critic_loss": 1206.097583770752,
+  "actor_loss": -0.5462207198143005,
+  "actor_q_loss": -0.5462207198143005,
+  "actor_entropy": 1.574812412261963,
+  "actor_logit_l2": 0.0032577722340308046,
+  "actor_reg_loss": 0.0,
+  "replay_size": 72000.0,
+  "mean_rollout_reward": 18.313469561351585,
+  "actor_lr": 9.907562188221045e-05,
+  "critic_lr": 9.907562188221045e-05,
+  "curriculum_stage": 2.0,
+  "rollout_f_c": 0.20140222222222218,
+  "rollout_R_mean": 316.91789789476024,
+  "rollout_gini": 0.43715202222175736,
+  "rollout_payoff_mean": 18.313469561351585,
+  "rollout_pool_grown_mean": 33.81822795592488,
+  "rollout_pool_mean": 15.618565181628135,
+  "profile_rollout_collect_seconds": 7.74266623519361,
+  "profile_rollout_collect_worker_seconds": 7.300907745336493,
+  "profile_rollout_env_step_seconds": 2.140323784900829,
+  "profile_rollout_inference_wait_seconds": 4.39275557322738,
+  "profile_rollout_inference_request_build_seconds": 0.033696578505138554,
+  "profile_rollout_local_policy_forward_seconds": 0.0,
+  "profile_rollout_action_to_numpy_seconds": 0.016556694094712537,
+  "profile_rollout_transition_encode_seconds": 0.34442411200143397,
+  "profile_rollout_stack_transitions_seconds": 0.01716830690080921,
+  "profile_rollout_shared_memory_serialize_seconds": 0.012246090608338514,
+  "profile_rollout_shared_memory_deserialize_seconds": 0.001262467276925842,
+  "profile_rollout_finish_wait_seconds": 5.443848431110382,
+  "profile_rollout_overlap_seconds": 2.298817804083228,
+  "profile_replay_extend_seconds": 0.04247647151350975,
+  "profile_rollout_steps_per_second": 1162.3902834777107,
+  "profile_rollout_inference_batch_size_mean": 23.61790780141844,
+  "profile_rollout_inference_batch_size_max": 48.0,
+  "profile_learner_update_seconds": 2.2969144554808736,
+  "profile_replay_sample_seconds": 0.00808052346110344,
+  "profile_batch_to_device_seconds": 0.0021137380972504616,
+  "profile_critic_update_seconds": 0.4345907773822546,
+  "profile_actor_update_seconds": 0.0,
+  "profile_target_soft_update_seconds": 0.0,
+  "profile_eval_seconds": 10.369186540134251,
+  "global_env_steps": 72000.0,
+  "profile_actor_sync_seconds": 0.14932116400450468,
+  "profile_actor_publish_seconds": 0.0032562771812081337,
+  "profile_actor_sync_inference_server_seconds": 0.014776713214814663,
+  "profile_actor_sync_worker_rpc_seconds": 0.13128817360848188,
+  "behavior_frac_uniform": 0.0,
+  "behavior_frac_proportional": 0.0,
+  "behavior_frac_constant_mix": 0.0,
+  "behavior_frac_pool_power_mix": 0.0,
+  "behavior_frac_random_logits": 0.0,
+  "behavior_frac_actor_logits": 1.0,
+  "eval_return_mean": 3025.3583003055705,
+  "eval_cooperation_mean": 0.015,
+  "eval_gini_mean": 0.7536654802828799,
+  "eval_mean_total_resource": 16638.390097217212,
+  "eval_collapse_rate": 0.125,
+  "eval_mean_resource": 332.7678019443442,
+  "eval_mean_payoff": 20.169055335370466,
+  "eval_mean_pool_raw": 17.717945653766684,
+  "eval_mean_pool_grown": 37.88700098587802,
+  "eval_sustainability_rate": 0.875,
+  "eval_return_mean/regular": 3067.0560287410553,
+  "eval_return_mean/erdos_renyi": 3032.9440801097453,
+  "eval_return_mean/small_world": 3225.3836509614166,
+  "eval_return_mean/scale_free": 2776.049441410065,
+  "eval_mean_resource/regular": 341.6349137850076,
+  "eval_mean_resource/erdos_renyi": 327.0488632253905,
+  "eval_mean_resource/small_world": 359.50926593081806,
+  "eval_mean_resource/scale_free": 302.8781648361608,
+  "eval_mean_total_resource/regular": 17081.74568925038,
+  "eval_mean_total_resource/erdos_renyi": 16352.443161269526,
+  "eval_mean_total_resource/small_world": 17975.463296540904,
+  "eval_mean_total_resource/scale_free": 15143.908241808042,
+  "eval_mean_payoff/regular": 20.447040191607037,
+  "eval_mean_payoff/erdos_renyi": 20.21962720073163,
+  "eval_mean_payoff/small_world": 21.502557673076105,
+  "eval_mean_payoff/scale_free": 18.5069962760671,
+  "eval_mean_pool_raw/regular": 17.568867697521654,
+  "eval_mean_pool_raw/erdos_renyi": 17.58765473330542,
+  "eval_mean_pool_raw/small_world": 19.003550430667012,
+  "eval_mean_pool_raw/scale_free": 16.71170975357265,
+  "eval_mean_pool_grown/regular": 38.01590787844684,
+  "eval_mean_pool_grown/erdos_renyi": 37.80728195199937,
+  "eval_mean_pool_grown/small_world": 40.50610807187974,
+  "eval_mean_pool_grown/scale_free": 35.21870604118611,
+  "eval_cooperation_mean/regular": 0.0,
+  "eval_cooperation_mean/erdos_renyi": 0.02,
+  "eval_cooperation_mean/small_world": 0.04,
+  "eval_cooperation_mean/scale_free": 0.0,
+  "eval_gini_mean/regular": 0.44431394549957137,
+  "eval_gini_mean/erdos_renyi": 0.9253282331380199,
+  "eval_gini_mean/small_world": 0.7653122924585645,
+  "eval_gini_mean/scale_free": 0.8797074500353643,
+  "eval_collapse_rate/regular": 0.5,
+  "eval_collapse_rate/erdos_renyi": 0.0,
+  "eval_collapse_rate/small_world": 0.0,
+  "eval_collapse_rate/scale_free": 0.0,
+  "profile_on_update_seconds": 0.0011028684675693512
+}
+Results saved to: /home/QinYiHang/Code/GNN_SPGG/outputs/perf_baseline/spgg_CNN_12workers_1GPU_3_25_10__baseline__20260325_232733__centralized_split_gpu/results.json

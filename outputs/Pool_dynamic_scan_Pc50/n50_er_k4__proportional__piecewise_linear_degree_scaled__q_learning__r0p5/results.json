@@ -1,0 +1,410 @@
+{
+  "experiment": {
+    "experiment_name": "n50_er_k4__proportional__piecewise_linear_degree_scaled__q_learning__r0p5",
+    "seed": 42,
+    "run_mode": "proportional",
+    "network": {
+      "type": "erdos_renyi",
+      "num_nodes": 50,
+      "regular_degree": 4,
+      "er_target_mean_degree": 4.0,
+      "er_edge_prob": null,
+      "ws_degree": 4,
+      "ws_rewiring_prob": 0.1,
+      "ba_attachments_per_new_node": 2,
+      "grid_rows": 10,
+      "grid_cols": 10,
+      "grid_periodic": false
+    },
+    "dynamics": {
+      "alpha": 0.5,
+      "r": 0.5,
+      "p_mode": "dynamic",
+      "p_max": 100.0,
+      "p_c": 50.0,
+      "resource_consumption_mode": "piecewise_linear",
+      "resource_consumption_fixed_mode": "degree_scaled",
+      "resource_consumption_fixed": 4,
+      "resource_consumption_degree_multiplier": 1.0,
+      "resource_consumption_rate": 0.05,
+      "resource_consumption_threshold": 4.0,
+      "strategy_update_rule": "q_learning",
+      "beta": 1.0,
+      "q_learning_rate": 0.1,
+      "q_learning_discount": 0.1,
+      "q_learning_epsilon": 0.05,
+      "q_learning_initial_value": 0.0,
+      "episode_length": 500,
+      "initial_resource": 20.0,
+      "initial_cooperation_prob": 0.5
+    },
+    "reward": {
+      "lambda_payoff": 1.0,
+      "lambda_cooperation": 0.0,
+      "lambda_total_resource": 0.0,
+      "lambda_gini": 0.0,
+      "epsilon": 1e-08
+    },
+    "gnn": {
+      "hidden_dim": 128,
+      "local_hidden_dim": 64,
+      "score_hidden_dim": 64,
+      "critic_hidden_dim": null,
+      "num_message_passing_layers": 2,
+      "temperature": 1
+    },
+    "training": {
+      "total_env_steps": 15000000,
+      "warmup_env_steps": 9000,
+      "eval_interval_env_steps": 2000000,
+      "total_updates": null,
+      "steps_per_update": 750,
+      "use_episode_length_as_steps_per_update": false,
+      "gamma": 0.99,
+      "learning_rate": 0.0001,
+      "actor_lr": null,
+      "critic_lr": null,
+      "lr_schedule_type": "exponential_decay",
+      "lr_final": 1e-05,
+      "lr_decay_rate": 0.05,
+      "lr_decay_steps": 10000,
+      "save_checkpoints": true,
+      "checkpoint_interval": 500,
+      "save_final_checkpoint": true,
+      "save_best_checkpoint": true,
+      "checkpoint_mode": "lightweight",
+      "resume_from_checkpoint": null,
+      "actor_weight_decay": 0.0,
+      "critic_weight_decay": 0.0,
+      "actor_entropy_coef": 0.0,
+      "actor_logit_l2_coef": 0.0,
+      "critic_state_hidden_dim": 64,
+      "critic_action_hidden_dim": 64,
+      "critic_pool_hidden_dim": 64,
+      "critic_q_hidden_dim": 64,
+      "replay_capacity": 300000,
+      "batch_size": 256,
+      "graph_batch_chunk_size": 48,
+      "warmup_steps": null,
+      "warmup_behavior_mode": "heuristic_mix",
+      "warmup_selection_granularity": "per_episode",
+      "warmup_uniform_prob": 0.2,
+      "warmup_proportional_prob": 0.25,
+      "warmup_constant_mix_prob": 0.15,
+      "warmup_pool_power_mix_prob": 0.25,
+      "warmup_random_logits_prob": 0.15,
+      "warmup_constant_mix_omega": 0.5,
+      "warmup_pool_power_k": 19.0,
+      "warmup_logit_noise_std": 0.15,
+      "warmup_logit_noise_clip": 0.25,
+      "train_every": 1,
+      "gradient_steps_per_update": 4,
+      "policy_delay": 2,
+      "tau": 0.005,
+      "rollout_logit_noise_std": 0.3,
+      "rollout_logit_noise_clip": 0.5,
+      "rollout_noise_decay": 0.9995,
+      "target_logit_noise_std": 0.1,
+      "target_logit_noise_clip": 0.25,
+      "num_workers": 12,
+      "num_envs_per_worker": 4,
+      "worker_sync_interval": 1,
+      "overlap_rollout_and_update": true,
+      "worker_rpc_timeout_seconds": 12000.0,
+      "rollout_device": "cuda:1",
+      "rollout_inference_mode": "local",
+      "rollout_inference_batch_timeout_ms": 2.0,
+      "device": "cuda:2",
+      "rollout_num_threads": 1,
+      "collapse_resource_threshold": 1e-06,
+      "eval_interval": null,
+      "eval_episodes": 8
+    },
+    "domain_randomization": {
+      "enabled": true,
+      "network_types": [
+        "regular",
+        "erdos_renyi",
+        "small_world",
+        "scale_free"
+      ],
+      "network_type_weights": null,
+      "num_nodes_choices": [
+        50
+      ],
+      "regular_degree_choices": [
+        4
+      ],
+      "er_mean_degree_choices": [
+        4.0
+      ],
+      "ws_degree_choices": [
+        4
+      ],
+      "ws_rewiring_choices": [
+        0.1
+      ],
+      "ba_attachment_choices": [
+        2
+      ],
+      "initial_resource_range": null,
+      "initial_cooperation_prob_range": null,
+      "alpha_range": null,
+      "r_range": null,
+      "p_max_range": null
+    },
+    "evaluation": {
+      "use_custom_env_families": true,
+      "env_families": [
+        {
+          "network_type": "regular",
+          "num_nodes": 50,
+          "regular_degree": 4
+        },
+        {
+          "network_type": "erdos_renyi",
+          "num_nodes": 50,
+          "er_target_mean_degree": 4.0
+        },
+        {
+          "network_type": "small_world",
+          "num_nodes": 50,
+          "ws_degree": 4,
+          "ws_rewiring_prob": 0.1
+        },
+        {
+          "network_type": "scale_free",
+          "num_nodes": 50,
+          "ba_attachments_per_new_node": 2
+        }
+      ]
+    },
+    "curriculum": {
+      "enabled": true,
+      "mode": "update_steps",
+      "stages": [
+        {
+          "label": "regular_only",
+          "portion": 0.4,
+          "train_network_types": [
+            "regular"
+          ],
+          "train_network_type_weights": [
+            1.0
+          ],
+          "eval_network_types": [
+            "regular"
+          ]
+        },
+        {
+          "label": "regular_plus_scale_free",
+          "portion": 0.3,
+          "train_network_types": [
+            "regular",
+            "scale_free"
+          ],
+          "train_network_type_weights": [
+            0.7,
+            0.3
+          ],
+          "eval_network_types": [
+            "regular",
+            "scale_free"
+          ]
+        },
+        {
+          "label": "all_topologies",
+          "portion": 0.3,
+          "train_network_types": [
+            "regular",
+            "scale_free",
+            "erdos_renyi",
+            "small_world"
+          ],
+          "train_network_type_weights": [
+            0.4,
+            0.3,
+            0.15,
+            0.15
+          ],
+          "eval_network_types": [
+            "regular",
+            "scale_free",
+            "erdos_renyi",
+            "small_world"
+          ]
+        }
+      ]
+    },
+    "rollout": {
+      "episodes": 5,
+      "post_training_eval_episodes": 5
+    },
+    "visualization": {
+      "enable_micro_snapshots": false,
+      "enable_macro_timeseries": true,
+      "episodes_to_visualize": [
+        1
+      ],
+      "frame_stride": 1,
+      "layout": "spring",
+      "spring_iterations": 80,
+      "node_color_metric": "x_actual",
+      "node_size_metric": "resources",
+      "node_value_metric": "resources",
+      "node_value_decimals": 1,
+      "label_nodes": true,
+      "macro_metrics": [
+        "actual_cooperation_rate",
+        "mean_resource",
+        "mean_pool_grown",
+        "mean_consumption",
+        "mean_payoff",
+        "gini"
+      ],
+      "save_dpi": 160
+    },
+    "tensorboard": {
+      "enabled": true,
+      "subdir": "tensorboard",
+      "flush_secs": 30,
+      "write_config_text": true,
+      "write_static_scalars": true,
+      "console_progress_logs": true,
+      "console_progress_interval": 1,
+      "console_training_logs": true,
+      "console_log_interval": 1,
+      "console_recent_window_updates": 10
+    },
+    "output": {
+      "root_dir": "outputs/Pool_dynamic_scan_Pc50",
+      "save_results_json": true,
+      "save_micro_snapshots": true,
+      "save_macro_timeseries": true,
+      "save_console_log": true,
+      "console_log_filename": "train.log"
+    },
+    "scan_tags": {
+      "scan_name": "3_30_dynamics_scan_Pc100",
+      "run_mode": "proportional",
+      "num_nodes": 50,
+      "network_label": "n50_er_k4",
+      "consumption_label": "piecewise_linear_degree_scaled",
+      "resource_consumption_mode": "piecewise_linear",
+      "resource_consumption_fixed_mode": "degree_scaled",
+      "strategy_update_rule": "q_learning",
+      "r": 0.5
+    },
+    "_runtime": {
+      "quiet_console": true,
+      "scan_mode": true
+    }
+  },
+  "graph_summary": {
+    "num_nodes": 50.0,
+    "num_edges": 89.0,
+    "degree_min": 0.0,
+    "degree_max": 8.0,
+    "degree_mean": 3.56
+  },
+  "env_config": {
+    "alpha": 0.5,
+    "r": 0.5,
+    "p_mode": "dynamic",
+    "p_max": 100.0,
+    "p_c": 50.0,
+    "resource_consumption_mode": "piecewise_linear",
+    "resource_consumption_fixed_mode": "degree_scaled",
+    "resource_consumption_fixed": 4,
+    "resource_consumption_degree_multiplier": 1.0,
+    "resource_consumption_rate": 0.05,
+    "resource_consumption_threshold": 4.0,
+    "strategy_update_rule": "q_learning",
+    "beta": 1.0,
+    "q_learning_rate": 0.1,
+    "q_learning_discount": 0.1,
+    "q_learning_epsilon": 0.05,
+    "q_learning_initial_value": 0.0,
+    "episode_length": 500,
+    "initial_resource": 20.0,
+    "initial_cooperation_prob": 0.5,
+    "num_nodes": null,
+    "target_mean_degree": 4.0,
+    "reward": {
+      "lambda_payoff": 1.0,
+      "lambda_cooperation": 0.0,
+      "lambda_total_resource": 0.0,
+      "lambda_gini": 0.0,
+      "epsilon": 1e-08
+    }
+  },
+  "results": {
+    "experiment_name": "n50_er_k4__proportional__piecewise_linear_degree_scaled__q_learning__r0p5",
+    "run_mode": "proportional",
+    "network_type": "erdos_renyi",
+    "episode_summaries": [
+      {
+        "final_actual_cooperation": 0.52,
+        "final_mean_resource": 90.95801634999039,
+        "final_mean_pool_grown": 50.241629404915905,
+        "final_mean_consumption": 5.873538130084848,
+        "final_mean_payoff": 6.000791878378302,
+        "final_gini": 0.6436563558687193,
+        "episode_return": 3372.7338984432104,
+        "episode_index": 1.0
+      },
+      {
+        "final_actual_cooperation": 0.52,
+        "final_mean_resource": 86.36227759398277,
+        "final_mean_pool_grown": 50.18792057807201,
+        "final_mean_consumption": 5.60021837852331,
+        "final_mean_payoff": 6.278128402039893,
+        "final_gini": 0.6284263636014171,
+        "episode_return": 3418.9519893709407,
+        "episode_index": 2.0
+      },
+      {
+        "final_actual_cooperation": 0.52,
+        "final_mean_resource": 77.84126637952191,
+        "final_mean_pool_grown": 45.53843431447812,
+        "final_mean_consumption": 5.21628352311359,
+        "final_mean_payoff": 4.251879440363724,
+        "final_gini": 0.6269972151499987,
+        "episode_return": 3052.433394177029,
+        "episode_index": 3.0
+      },
+      {
+        "final_actual_cooperation": 0.54,
+        "final_mean_resource": 91.8071724725648,
+        "final_mean_pool_grown": 51.13851570749597,
+        "final_mean_consumption": 5.865225119038689,
+        "final_mean_payoff": 7.327895210829692,
+        "final_gini": 0.6137127243495666,
+        "episode_return": 3223.2055411180518,
+        "episode_index": 4.0
+      },
+      {
+        "final_actual_cooperation": 0.44,
+        "final_mean_resource": 72.23967255582276,
+        "final_mean_pool_grown": 37.741936785426695,
+        "final_mean_consumption": 4.673942543825659,
+        "final_mean_payoff": 5.9147642231352435,
+        "final_gini": 0.7020777193595928,
+        "episode_return": 3259.509889656953,
+        "episode_index": 5.0
+      }
+    ],
+    "summary": {
+      "return_mean": 3265.366942553237,
+      "return_std": 128.27206608359225,
+      "final_cooperation_mean": 0.508,
+      "final_actual_cooperation_mean": 0.508,
+      "final_mean_resource_mean": 83.84168107037652,
+      "final_mean_pool_grown_mean": 46.969687358077735,
+      "final_consumption_mean": 5.445841538917219,
+      "final_mean_consumption_mean": 5.445841538917219,
+      "final_mean_payoff_mean": 5.95469183094937,
+      "final_gini_mean": 0.642974075665859
+    }
+  }
+}
