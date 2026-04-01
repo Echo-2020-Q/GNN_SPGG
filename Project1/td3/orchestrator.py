@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from collections import Counter
 from multiprocessing.connection import wait
+from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
+import torch
 
 from Project1.env import SPGGEnv
 from Project1.policies.gnn_rl import GNNAllocationPolicy
@@ -58,7 +60,16 @@ class GraphTD3Trainer:
         self.env = env
         self.policy = policy
         self.config = config
-        self.replay_buffer = ReplayBuffer(config.replay_capacity, seed=config.seed)
+        self.replay_buffer = ReplayBuffer(
+            config.replay_capacity,
+            seed=config.seed,
+            replay_strategy=config.replay_strategy,
+            topology_names=config.replay_topology_names,
+            recent_fraction=config.replay_recent_fraction,
+            long_term_fraction=config.replay_long_term_fraction,
+            demo_fraction=config.replay_demo_fraction,
+            demo_behavior_source=config.replay_demo_behavior_source,
+        )
 
         default_critic_hidden_dim = int(getattr(policy.config, "hidden_dim", 64))
         critic_config = GraphActionCriticConfig(
@@ -158,6 +169,8 @@ class GraphTD3Trainer:
         self.history: list[dict[str, float]] = []
         self._rollout_collect_inflight = False
         self._last_replay_extend_seconds = 0.0
+        self.demo_pretrain_completed = False
+        self.demo_pretrain_summary: dict[str, float | str | bool | None] | None = None
 
     def close(self) -> None:
         for worker in self.workers:
@@ -251,6 +264,8 @@ class GraphTD3Trainer:
             "global_env_steps": int(self.global_env_steps),
             "active_curriculum_stage_index": self.active_curriculum_stage_index,
             "history": [dict(item) for item in self.history],
+            "demo_pretrain_completed": bool(self.demo_pretrain_completed),
+            "demo_pretrain_summary": None if self.demo_pretrain_summary is None else dict(self.demo_pretrain_summary),
         }
         if checkpoint_mode == "full_resume":
             payload["replay_buffer_state"] = self.replay_buffer.state_dict()
@@ -263,6 +278,9 @@ class GraphTD3Trainer:
         self.global_env_steps = int(checkpoint.get("global_env_steps", 0))
         self.history = [dict(item) for item in checkpoint.get("history", [])]
         self.active_curriculum_stage_index = checkpoint.get("active_curriculum_stage_index")
+        self.demo_pretrain_completed = bool(checkpoint.get("demo_pretrain_completed", False))
+        demo_pretrain_summary = checkpoint.get("demo_pretrain_summary")
+        self.demo_pretrain_summary = None if demo_pretrain_summary is None else dict(demo_pretrain_summary)
         checkpoint_mode = str(
             checkpoint.get(
                 "checkpoint_mode",
@@ -317,6 +335,275 @@ class GraphTD3Trainer:
             remaining_global_warmup -= allocation
             remaining_workers -= 1
         return allocations
+
+    def _global_step_allocations(self, total_steps: int) -> list[int]:
+        remaining_steps = max(0, int(total_steps))
+        if remaining_steps <= 0:
+            return [0 for _ in self.workers]
+
+        allocations: list[int] = []
+        remaining_workers = len(self.workers)
+        for worker in self.workers:
+            per_worker_steps = int(worker.config.rollout_steps_per_sync)
+            if remaining_workers <= 1:
+                allocation = min(per_worker_steps, remaining_steps)
+            else:
+                fair_share = int(np.ceil(float(remaining_steps) / float(remaining_workers)))
+                allocation = min(per_worker_steps, fair_share, remaining_steps)
+            allocations.append(allocation)
+            remaining_steps -= allocation
+            remaining_workers -= 1
+        return allocations
+
+    def _collect_rollouts_with_allocations(
+        self,
+        step_allocations: Sequence[int],
+        *,
+        warmup_allocations: Sequence[int] | None = None,
+        forced_behavior_source: str | None = None,
+        mark_as_demo: bool | None = None,
+        count_env_steps: bool = True,
+    ) -> list[RolloutResult]:
+        if len(step_allocations) != len(self.workers):
+            raise ValueError("step_allocations must align with workers.")
+        if warmup_allocations is None:
+            warmup_allocations = [0 for _ in self.workers]
+        if len(warmup_allocations) != len(self.workers):
+            raise ValueError("warmup_allocations must align with workers.")
+
+        positive_requests = [
+            (worker, int(num_steps), int(warmup_steps))
+            for worker, num_steps, warmup_steps in zip(self.workers, step_allocations, warmup_allocations)
+            if int(num_steps) > 0
+        ]
+        if not positive_requests:
+            return []
+
+        if self.config.num_workers <= 1:
+            worker, num_steps, warmup_steps = positive_requests[0]
+            rollout_results = [
+                worker.collect(
+                    num_steps=num_steps,
+                    global_warmup_steps=warmup_steps,
+                    forced_behavior_source=forced_behavior_source,
+                    mark_as_demo=mark_as_demo,
+                    count_env_steps=count_env_steps,
+                )
+            ]
+        else:
+            rollout_results: list[RolloutResult] = []
+            started_workers: list[Any] = []
+            pending_workers: dict[Any, Any] = {}
+            try:
+                for worker, num_steps, warmup_steps in positive_requests:
+                    worker.start_collect(
+                        num_steps=num_steps,
+                        global_warmup_steps=warmup_steps,
+                        forced_behavior_source=forced_behavior_source,
+                        mark_as_demo=mark_as_demo,
+                        count_env_steps=count_env_steps,
+                    )
+                    started_workers.append(worker)
+                    pending_workers[worker.connection] = worker
+
+                while pending_workers:
+                    ready_connections = wait(
+                        list(pending_workers.keys()),
+                        timeout=float(self.config.worker_rpc_timeout_seconds),
+                    )
+                    if not ready_connections:
+                        raise TimeoutError(
+                            "Timed out waiting for rollout workers: {0}".format(
+                                [worker.config.worker_id for worker in pending_workers.values()]
+                            )
+                        )
+                    for ready_connection in ready_connections:
+                        worker = pending_workers.pop(ready_connection)
+                        rollout_results.append(worker.finish_collect_ready())
+            except Exception:
+                for worker in started_workers:
+                    if getattr(worker, "_collect_inflight", False):
+                        try:
+                            worker.finish_collect()
+                        except Exception:
+                            pass
+                raise
+
+        try:
+            replay_extend_start = perf_counter()
+            for result in rollout_results:
+                self.replay_buffer.extend(result.replay_batch)
+                if count_env_steps:
+                    self.global_env_steps += len(result.replay_batch)
+            self._last_replay_extend_seconds = float(perf_counter() - replay_extend_start)
+            return rollout_results
+        finally:
+            for result in rollout_results:
+                result.release_shared_memory()
+
+    def _build_demo_collection_factory(self) -> RandomizedEnvFactory:
+        base_randomization = self.train_factory.randomization
+        if not bool(self.config.demo_collection_use_domain_randomization) or not bool(base_randomization.enabled):
+            demo_randomization = replace(base_randomization, enabled=False)
+            return RandomizedEnvFactory(
+                self.train_factory.base_config,
+                self.train_factory.base_graph,
+                randomization=demo_randomization,
+            )
+
+        configured_network_types = tuple(str(item) for item in self.config.demo_collection_network_types if str(item))
+        if configured_network_types:
+            supported_types = set(str(item) for item in base_randomization.network_types)
+            selected_network_types = tuple(item for item in configured_network_types if item in supported_types)
+            if not selected_network_types:
+                raise ValueError("demo_collection_network_types must overlap domain_randomization.network_types.")
+        else:
+            selected_network_types = tuple(str(item) for item in base_randomization.network_types)
+
+        selected_weights = None
+        if base_randomization.network_type_weights is not None:
+            weight_by_type = {
+                str(network_type): float(weight)
+                for network_type, weight in zip(base_randomization.network_types, base_randomization.network_type_weights)
+            }
+            selected_weights = tuple(weight_by_type[item] for item in selected_network_types)
+
+        demo_randomization = replace(
+            base_randomization,
+            enabled=True,
+            network_types=selected_network_types,
+            network_type_weights=selected_weights,
+        )
+        return RandomizedEnvFactory(
+            self.train_factory.base_config,
+            self.train_factory.base_graph,
+            randomization=demo_randomization,
+        )
+
+    def _save_demo_dataset(self, replay_batches: Sequence[Any]) -> str | None:
+        save_path = self.config.demo_dataset_save_path
+        if not save_path:
+            return None
+
+        dataset_path = Path(str(save_path)).expanduser()
+        if not dataset_path.is_absolute():
+            dataset_path = Path.cwd() / dataset_path
+        dataset_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "source": "pool_power_mix_demo_collection",
+                "num_batches": int(len(replay_batches)),
+                "replay_batches": [batch.clone() for batch in replay_batches],
+            },
+            dataset_path,
+        )
+        return str(dataset_path)
+
+    def _run_demo_pretrain(self) -> dict[str, float | str | bool | None]:
+        summary: dict[str, float | str | bool | None] = {
+            "enabled": bool(self.config.demo_pretrain_enabled),
+            "demo_collection_env_steps": float(self.config.demo_collection_env_steps),
+            "demo_replay_size_after_collection": float(self.replay_buffer.demo_size()),
+            "actor_bc_updates": float(0),
+            "critic_pretrain_updates": float(0),
+            "actor_bc_loss_last": 0.0,
+            "critic_loss_last": 0.0,
+            "seconds_collection": 0.0,
+            "seconds_actor_bc": 0.0,
+            "seconds_critic": 0.0,
+            "dataset_path": None,
+            "behavior_source": str(self.config.demo_collection_behavior_source),
+        }
+        if not bool(self.config.demo_pretrain_enabled):
+            self.demo_pretrain_completed = False
+            self.demo_pretrain_summary = dict(summary)
+            return dict(summary)
+
+        demo_batches_to_save: list[Any] = []
+        demo_collection_steps = max(0, int(self.config.demo_collection_env_steps))
+        if demo_collection_steps > 0:
+            print(
+                "Demo Pretrain | collection start | env_steps={0} | behavior={1}".format(
+                    demo_collection_steps,
+                    self.config.demo_collection_behavior_source,
+                )
+            )
+            demo_collection_start = perf_counter()
+            demo_factory = self._build_demo_collection_factory()
+            for worker in self.workers:
+                worker.set_env_factory(demo_factory, reset_environment=True)
+            try:
+                remaining_steps = int(demo_collection_steps)
+                while remaining_steps > 0:
+                    step_allocations = self._global_step_allocations(remaining_steps)
+                    if sum(step_allocations) <= 0:
+                        break
+                    rollout_results = self._collect_rollouts_with_allocations(
+                        step_allocations,
+                        forced_behavior_source=str(self.config.demo_collection_behavior_source),
+                        mark_as_demo=True,
+                        count_env_steps=False,
+                    )
+                    collected_now = sum(len(result.replay_batch) for result in rollout_results)
+                    if collected_now <= 0:
+                        raise RuntimeError("Demo collection produced zero transitions.")
+                    if self.config.demo_dataset_save_path:
+                        demo_batches_to_save.extend(result.replay_batch.clone() for result in rollout_results)
+                    remaining_steps -= collected_now
+            finally:
+                for worker in self.workers:
+                    worker.set_env_factory(self.train_factory, reset_environment=True)
+
+            summary["seconds_collection"] = float(perf_counter() - demo_collection_start)
+            summary["demo_replay_size_after_collection"] = float(self.replay_buffer.demo_size())
+            summary["dataset_path"] = self._save_demo_dataset(demo_batches_to_save)
+            print(
+                "Demo Pretrain | collection done | demo_replay_size={0:.0f} | seconds={1:.3f}".format(
+                    float(summary["demo_replay_size_after_collection"]),
+                    float(summary["seconds_collection"]),
+                )
+            )
+
+        if self.replay_buffer.demo_size() <= 0:
+            raise ValueError("Demo pretrain requires at least one demo transition in replay.")
+
+        actor_updates = max(0, int(self.config.actor_bc_pretrain_updates))
+        if actor_updates > 0:
+            print("Demo Pretrain | actor BC start | updates={0}".format(actor_updates))
+            actor_pretrain_start = perf_counter()
+            actor_metrics: dict[str, float] = {}
+            for _ in range(actor_updates):
+                actor_metrics = self.learner.actor_bc_pretrain_step()
+            summary["seconds_actor_bc"] = float(perf_counter() - actor_pretrain_start)
+            summary["actor_bc_updates"] = float(actor_updates)
+            summary["actor_bc_loss_last"] = float(actor_metrics.get("actor_bc_loss", 0.0))
+            print(
+                "Demo Pretrain | actor BC done | last_bc_loss={0:.6f} | seconds={1:.3f}".format(
+                    float(summary["actor_bc_loss_last"]),
+                    float(summary["seconds_actor_bc"]),
+                )
+            )
+
+        critic_updates = max(0, int(self.config.critic_pretrain_updates))
+        if critic_updates > 0:
+            print("Demo Pretrain | critic start | updates={0}".format(critic_updates))
+            critic_pretrain_start = perf_counter()
+            critic_metrics: dict[str, float] = {}
+            for _ in range(critic_updates):
+                critic_metrics = self.learner.critic_pretrain_step()
+            summary["seconds_critic"] = float(perf_counter() - critic_pretrain_start)
+            summary["critic_pretrain_updates"] = float(critic_updates)
+            summary["critic_loss_last"] = float(critic_metrics.get("critic_loss", 0.0))
+            print(
+                "Demo Pretrain | critic done | last_critic_loss={0:.6f} | seconds={1:.3f}".format(
+                    float(summary["critic_loss_last"]),
+                    float(summary["seconds_critic"]),
+                )
+            )
+
+        self.demo_pretrain_completed = True
+        self.demo_pretrain_summary = dict(summary)
+        return dict(summary)
 
     def _collect_rollouts(self) -> list[RolloutResult]:
         if self.config.num_workers > 1:
@@ -434,6 +721,8 @@ class GraphTD3Trainer:
         total_updates = int(num_updates or self.config.total_updates)
         if self.completed_updates >= total_updates:
             return [dict(item) for item in self.history]
+        if self.completed_updates == 0 and not self.demo_pretrain_completed and bool(self.config.demo_pretrain_enabled):
+            self._run_demo_pretrain()
 
         overlap_rollout_and_update = self._should_overlap_rollout_and_update()
         pending_collect_started_at: float | None = None
@@ -543,6 +832,7 @@ class GraphTD3Trainer:
                 "actor_bc_coef": float(learner_metrics.get("actor_bc_coef", 0.0)),
                 "replay_size": float(len(self.replay_buffer)),
                 "replay_demo_frac": float(learner_metrics.get("replay_demo_frac", 0.0)),
+                "replay_pool_power_demo_frac": float(learner_metrics.get("replay_pool_power_demo_frac", 0.0)),
                 "replay_collapse_frac": float(learner_metrics.get("replay_collapse_frac", 0.0)),
                 "mean_rollout_reward": mean_rollout_reward,
                 "actor_lr": float(learner_metrics["actor_lr"]),
@@ -583,6 +873,9 @@ class GraphTD3Trainer:
                 "global_env_steps": float(self.global_env_steps),
                 **rollout_sync_metrics,
             }
+            for key, value in learner_metrics.items():
+                if key.startswith("replay_source_frac_") or key.startswith("replay_topology_frac_"):
+                    metrics[key] = float(value)
             total_behavior_samples = float(sum(behavior_counts.values()))
             for source in (
                 "uniform",

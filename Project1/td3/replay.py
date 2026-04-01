@@ -1,23 +1,109 @@
 from __future__ import annotations
 
 import threading
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from .data import TensorReplayActionRecord, TensorReplayBatch, TensorTransition, Transition
+from .data import (
+    TensorReplayActionRecord,
+    TensorReplayBatch,
+    TensorTransition,
+    Transition,
+    topology_id_to_name,
+)
 
 
-class ReplayBuffer:
-    def __init__(self, capacity: int, seed: int | None = None):
+def _coerce_transition(transition: TensorTransition | Transition) -> TensorTransition:
+    if isinstance(transition, TensorTransition):
+        return transition
+    if isinstance(transition, Transition):
+        return TensorTransition.from_transition(transition)
+    raise TypeError("ReplayBuffer.add expects TensorTransition or Transition.")
+
+
+def _concat_replay_batches(batches: Sequence[TensorReplayBatch]) -> TensorReplayBatch:
+    if not batches:
+        raise ValueError("batches must contain at least one item.")
+    if len(batches) == 1:
+        return batches[0].clone()
+
+    first_batch = batches[0]
+    return TensorReplayBatch(
+        obs={key: torch.cat([batch.obs[key] for batch in batches], dim=0) for key in first_batch.obs},
+        action=TensorReplayActionRecord(
+            allocation=torch.cat([batch.action.allocation for batch in batches], dim=0),
+        ),
+        reward=torch.cat([batch.reward for batch in batches], dim=0),
+        next_obs={key: torch.cat([batch.next_obs[key] for batch in batches], dim=0) for key in first_batch.next_obs},
+        done=torch.cat([batch.done for batch in batches], dim=0),
+        is_demo=torch.cat([batch.is_demo for batch in batches], dim=0),
+        collapse_flag=torch.cat([batch.collapse_flag for batch in batches], dim=0),
+        topology_id=torch.cat([batch.topology_id for batch in batches], dim=0),
+        pool_power_demo_flag=torch.cat([batch.pool_power_demo_flag for batch in batches], dim=0),
+    )
+
+
+def _slice_replay_batch(batch: TensorReplayBatch, indices: Tensor) -> TensorReplayBatch:
+    return TensorReplayBatch(
+        obs={key: value.index_select(0, indices) for key, value in batch.obs.items()},
+        action=TensorReplayActionRecord(
+            allocation=batch.action.allocation.index_select(0, indices),
+        ),
+        reward=batch.reward.index_select(0, indices),
+        next_obs={key: value.index_select(0, indices) for key, value in batch.next_obs.items()},
+        done=batch.done.index_select(0, indices),
+        is_demo=batch.is_demo.index_select(0, indices),
+        collapse_flag=batch.collapse_flag.index_select(0, indices),
+        topology_id=batch.topology_id.index_select(0, indices),
+        pool_power_demo_flag=batch.pool_power_demo_flag.index_select(0, indices),
+    )
+
+
+def _shuffle_replay_batch(batch: TensorReplayBatch, rng: np.random.Generator) -> TensorReplayBatch:
+    if len(batch) <= 1:
+        return batch
+    indices = torch.as_tensor(rng.permutation(len(batch)), dtype=torch.int64, device="cpu")
+    return _slice_replay_batch(batch, indices)
+
+
+def _allocate_integer_counts(total: int, weights: Sequence[float]) -> list[int]:
+    if total <= 0:
+        return [0 for _ in weights]
+    if not weights:
+        return []
+
+    weight_array = np.asarray(weights, dtype=np.float64)
+    if np.any(weight_array < 0.0):
+        raise ValueError("weights must be non-negative.")
+    if float(weight_array.sum()) <= 0.0:
+        raise ValueError("weights must sum to a positive value.")
+    normalized = weight_array / weight_array.sum()
+    raw = normalized * float(total)
+    counts = np.floor(raw).astype(np.int64)
+    remainder = int(total - int(counts.sum()))
+    if remainder > 0:
+        fractional = raw - counts.astype(np.float64)
+        order = np.argsort(-fractional, kind="stable")
+        for index in order[:remainder]:
+            counts[index] += 1
+    return [int(item) for item in counts.tolist()]
+
+
+class _TensorReplayStorage:
+    def __init__(self, capacity: int, seed: int | None = None, replacement_policy: str = "ring"):
         if capacity <= 0:
             raise ValueError("capacity must be positive.")
+        if replacement_policy not in {"ring", "reservoir"}:
+            raise ValueError("replacement_policy must be one of {'ring', 'reservoir'}.")
+
         self.capacity = int(capacity)
+        self.replacement_policy = str(replacement_policy)
         self._next_index = 0
         self._size = 0
-        self._lock = threading.Lock()
+        self._seen_count = 0
         self._rng = np.random.default_rng(seed)
 
         self._obs_buffers: dict[str, Tensor] = {}
@@ -27,6 +113,11 @@ class ReplayBuffer:
         self._done_buffer: Tensor | None = None
         self._is_demo_buffer: Tensor | None = None
         self._collapse_flag_buffer: Tensor | None = None
+        self._topology_id_buffer: Tensor | None = None
+        self._pool_power_demo_flag_buffer: Tensor | None = None
+
+    def __len__(self) -> int:
+        return int(self._size)
 
     def _is_initialized(self) -> bool:
         return self._reward_buffer is not None
@@ -41,12 +132,22 @@ class ReplayBuffer:
             for key, value in transition.next_obs.items()
         }
         self._action_buffers = {
-            "allocation": torch.empty((self.capacity, *tuple(transition.action.allocation.shape)), dtype=transition.action.allocation.dtype, device="cpu"),
+            "allocation": torch.empty(
+                (self.capacity, *tuple(transition.action.allocation.shape)),
+                dtype=transition.action.allocation.dtype,
+                device="cpu",
+            ),
         }
         self._reward_buffer = torch.empty(self.capacity, dtype=transition.reward.dtype, device="cpu")
         self._done_buffer = torch.empty(self.capacity, dtype=transition.done.dtype, device="cpu")
         self._is_demo_buffer = torch.empty(self.capacity, dtype=transition.is_demo.dtype, device="cpu")
         self._collapse_flag_buffer = torch.empty(self.capacity, dtype=transition.collapse_flag.dtype, device="cpu")
+        self._topology_id_buffer = torch.empty(self.capacity, dtype=transition.topology_id.dtype, device="cpu")
+        self._pool_power_demo_flag_buffer = torch.empty(
+            self.capacity,
+            dtype=transition.pool_power_demo_flag.dtype,
+            device="cpu",
+        )
 
     def _allocate_from_batch(self, batch: TensorReplayBatch) -> None:
         self._obs_buffers = {
@@ -58,111 +159,92 @@ class ReplayBuffer:
             for key, value in batch.next_obs.items()
         }
         self._action_buffers = {
-            "allocation": torch.empty((self.capacity, *tuple(batch.action.allocation.shape[1:])), dtype=batch.action.allocation.dtype, device="cpu"),
+            "allocation": torch.empty(
+                (self.capacity, *tuple(batch.action.allocation.shape[1:])),
+                dtype=batch.action.allocation.dtype,
+                device="cpu",
+            ),
         }
         self._reward_buffer = torch.empty(self.capacity, dtype=batch.reward.dtype, device="cpu")
         self._done_buffer = torch.empty(self.capacity, dtype=batch.done.dtype, device="cpu")
         self._is_demo_buffer = torch.empty(self.capacity, dtype=batch.is_demo.dtype, device="cpu")
         self._collapse_flag_buffer = torch.empty(self.capacity, dtype=batch.collapse_flag.dtype, device="cpu")
-
-    def _coerce_transition(self, transition: TensorTransition | Transition) -> TensorTransition:
-        if isinstance(transition, TensorTransition):
-            return transition
-        if isinstance(transition, Transition):
-            return TensorTransition.from_transition(transition)
-        raise TypeError("ReplayBuffer.add expects TensorTransition or Transition.")
+        self._topology_id_buffer = torch.empty(self.capacity, dtype=batch.topology_id.dtype, device="cpu")
+        self._pool_power_demo_flag_buffer = torch.empty(
+            self.capacity,
+            dtype=batch.pool_power_demo_flag.dtype,
+            device="cpu",
+        )
 
     def _validate_transition_structure(self, transition: TensorTransition) -> None:
         if set(transition.obs.keys()) != set(self._obs_buffers.keys()):
             raise ValueError("Observation keys do not match replay buffer schema.")
         if set(transition.next_obs.keys()) != set(self._next_obs_buffers.keys()):
             raise ValueError("Next-observation keys do not match replay buffer schema.")
-
         for key, value in transition.obs.items():
             buffer = self._obs_buffers[key]
             if tuple(value.shape) != tuple(buffer.shape[1:]) or value.dtype != buffer.dtype:
                 raise ValueError("Observation field '{0}' is incompatible with replay buffer schema.".format(key))
-
         for key, value in transition.next_obs.items():
             buffer = self._next_obs_buffers[key]
             if tuple(value.shape) != tuple(buffer.shape[1:]) or value.dtype != buffer.dtype:
                 raise ValueError("Next-observation field '{0}' is incompatible with replay buffer schema.".format(key))
-
-        action_fields = {
-            "allocation": transition.action.allocation,
-        }
-        for key, value in action_fields.items():
-            buffer = self._action_buffers[key]
-            if tuple(value.shape) != tuple(buffer.shape[1:]) or value.dtype != buffer.dtype:
-                raise ValueError("Action field '{0}' is incompatible with replay buffer schema.".format(key))
+        action_buffer = self._action_buffers["allocation"]
+        if (
+            tuple(transition.action.allocation.shape) != tuple(action_buffer.shape[1:])
+            or transition.action.allocation.dtype != action_buffer.dtype
+        ):
+            raise ValueError("Action field 'allocation' is incompatible with replay buffer schema.")
         if self._is_demo_buffer is None or self._collapse_flag_buffer is None:
             raise ValueError("Replay metadata buffers are not initialized.")
         if transition.is_demo.shape != torch.Size([]) or transition.is_demo.dtype != self._is_demo_buffer.dtype:
             raise ValueError("Transition field 'is_demo' is incompatible with replay buffer schema.")
-        if transition.collapse_flag.shape != torch.Size([]) or transition.collapse_flag.dtype != self._collapse_flag_buffer.dtype:
+        if (
+            transition.collapse_flag.shape != torch.Size([])
+            or transition.collapse_flag.dtype != self._collapse_flag_buffer.dtype
+        ):
             raise ValueError("Transition field 'collapse_flag' is incompatible with replay buffer schema.")
-
-    def _write_transition_at_index(self, index: int, transition: TensorTransition) -> None:
-        for key, value in transition.obs.items():
-            self._obs_buffers[key][index].copy_(value)
-        for key, value in transition.next_obs.items():
-            self._next_obs_buffers[key][index].copy_(value)
-
-        self._action_buffers["allocation"][index].copy_(transition.action.allocation)
-        assert self._reward_buffer is not None
-        assert self._done_buffer is not None
-        assert self._is_demo_buffer is not None
-        assert self._collapse_flag_buffer is not None
-        self._reward_buffer[index] = transition.reward
-        self._done_buffer[index] = transition.done
-        self._is_demo_buffer[index] = transition.is_demo
-        self._collapse_flag_buffer[index] = transition.collapse_flag
+        if self._topology_id_buffer is None or transition.topology_id.dtype != self._topology_id_buffer.dtype:
+            raise ValueError("Transition field 'topology_id' is incompatible with replay buffer schema.")
+        if (
+            self._pool_power_demo_flag_buffer is None
+            or transition.pool_power_demo_flag.dtype != self._pool_power_demo_flag_buffer.dtype
+        ):
+            raise ValueError("Transition field 'pool_power_demo_flag' is incompatible with replay buffer schema.")
 
     def _validate_batch_structure(self, batch: TensorReplayBatch) -> None:
         if set(batch.obs.keys()) != set(self._obs_buffers.keys()):
             raise ValueError("Observation keys do not match replay buffer schema.")
         if set(batch.next_obs.keys()) != set(self._next_obs_buffers.keys()):
             raise ValueError("Next-observation keys do not match replay buffer schema.")
-
         for key, value in batch.obs.items():
             buffer = self._obs_buffers[key]
             if value.ndim < 1 or tuple(value.shape[1:]) != tuple(buffer.shape[1:]) or value.dtype != buffer.dtype:
                 raise ValueError("Observation batch field '{0}' is incompatible with replay buffer schema.".format(key))
-
         for key, value in batch.next_obs.items():
             buffer = self._next_obs_buffers[key]
             if value.ndim < 1 or tuple(value.shape[1:]) != tuple(buffer.shape[1:]) or value.dtype != buffer.dtype:
                 raise ValueError("Next-observation batch field '{0}' is incompatible with replay buffer schema.".format(key))
-
-        action_fields = {
-            "allocation": batch.action.allocation,
-        }
-        for key, value in action_fields.items():
-            buffer = self._action_buffers[key]
-            if value.ndim < 1 or tuple(value.shape[1:]) != tuple(buffer.shape[1:]) or value.dtype != buffer.dtype:
-                raise ValueError("Action batch field '{0}' is incompatible with replay buffer schema.".format(key))
+        action_buffer = self._action_buffers["allocation"]
+        if (
+            batch.action.allocation.ndim < 1
+            or tuple(batch.action.allocation.shape[1:]) != tuple(action_buffer.shape[1:])
+            or batch.action.allocation.dtype != action_buffer.dtype
+        ):
+            raise ValueError("Action batch field 'allocation' is incompatible with replay buffer schema.")
         if self._is_demo_buffer is None or self._collapse_flag_buffer is None:
             raise ValueError("Replay metadata buffers are not initialized.")
         if batch.is_demo.ndim != 1 or batch.is_demo.dtype != self._is_demo_buffer.dtype:
             raise ValueError("Replay batch field 'is_demo' is incompatible with replay buffer schema.")
         if batch.collapse_flag.ndim != 1 or batch.collapse_flag.dtype != self._collapse_flag_buffer.dtype:
             raise ValueError("Replay batch field 'collapse_flag' is incompatible with replay buffer schema.")
-
-    def _write_batch_at_indices(self, indices: Tensor, batch: TensorReplayBatch) -> None:
-        for key, value in batch.obs.items():
-            self._obs_buffers[key].index_copy_(0, indices, value)
-        for key, value in batch.next_obs.items():
-            self._next_obs_buffers[key].index_copy_(0, indices, value)
-
-        self._action_buffers["allocation"].index_copy_(0, indices, batch.action.allocation)
-        assert self._reward_buffer is not None
-        assert self._done_buffer is not None
-        assert self._is_demo_buffer is not None
-        assert self._collapse_flag_buffer is not None
-        self._reward_buffer.index_copy_(0, indices, batch.reward)
-        self._done_buffer.index_copy_(0, indices, batch.done)
-        self._is_demo_buffer.index_copy_(0, indices, batch.is_demo)
-        self._collapse_flag_buffer.index_copy_(0, indices, batch.collapse_flag)
+        if self._topology_id_buffer is None or batch.topology_id.dtype != self._topology_id_buffer.dtype:
+            raise ValueError("Replay batch field 'topology_id' is incompatible with replay buffer schema.")
+        if (
+            self._pool_power_demo_flag_buffer is None
+            or batch.pool_power_demo_flag.dtype != self._pool_power_demo_flag_buffer.dtype
+        ):
+            raise ValueError("Replay batch field 'pool_power_demo_flag' is incompatible with replay buffer schema.")
 
     @staticmethod
     def _batch_is_cpu(batch: TensorReplayBatch) -> bool:
@@ -172,26 +254,133 @@ class ReplayBuffer:
             batch.done,
             batch.is_demo,
             batch.collapse_flag,
+            batch.topology_id,
+            batch.pool_power_demo_flag,
         ] + list(batch.next_obs.values())
         return all(tensor.device.type == "cpu" for tensor in tensors)
 
-    def _sample_indices(self, batch_size: int, max_collapse_ratio: float | None) -> Tensor:
-        if (
-            max_collapse_ratio is None
-            or self._collapse_flag_buffer is None
-            or self._size <= 0
-        ):
+    def _write_transition_at_index(self, index: int, transition: TensorTransition) -> None:
+        for key, value in transition.obs.items():
+            self._obs_buffers[key][index].copy_(value)
+        for key, value in transition.next_obs.items():
+            self._next_obs_buffers[key][index].copy_(value)
+        self._action_buffers["allocation"][index].copy_(transition.action.allocation)
+        assert self._reward_buffer is not None
+        assert self._done_buffer is not None
+        assert self._is_demo_buffer is not None
+        assert self._collapse_flag_buffer is not None
+        assert self._topology_id_buffer is not None
+        assert self._pool_power_demo_flag_buffer is not None
+        self._reward_buffer[index] = transition.reward
+        self._done_buffer[index] = transition.done
+        self._is_demo_buffer[index] = transition.is_demo
+        self._collapse_flag_buffer[index] = transition.collapse_flag
+        self._topology_id_buffer[index] = transition.topology_id
+        self._pool_power_demo_flag_buffer[index] = transition.pool_power_demo_flag
+
+    def _write_batch_at_indices(self, indices: Tensor, batch: TensorReplayBatch) -> None:
+        for key, value in batch.obs.items():
+            self._obs_buffers[key].index_copy_(0, indices, value)
+        for key, value in batch.next_obs.items():
+            self._next_obs_buffers[key].index_copy_(0, indices, value)
+        self._action_buffers["allocation"].index_copy_(0, indices, batch.action.allocation)
+        assert self._reward_buffer is not None
+        assert self._done_buffer is not None
+        assert self._is_demo_buffer is not None
+        assert self._collapse_flag_buffer is not None
+        assert self._topology_id_buffer is not None
+        assert self._pool_power_demo_flag_buffer is not None
+        self._reward_buffer.index_copy_(0, indices, batch.reward)
+        self._done_buffer.index_copy_(0, indices, batch.done)
+        self._is_demo_buffer.index_copy_(0, indices, batch.is_demo)
+        self._collapse_flag_buffer.index_copy_(0, indices, batch.collapse_flag)
+        self._topology_id_buffer.index_copy_(0, indices, batch.topology_id)
+        self._pool_power_demo_flag_buffer.index_copy_(0, indices, batch.pool_power_demo_flag)
+
+    def _select_write_index(self) -> int | None:
+        if self.replacement_policy == "ring":
+            index = int(self._next_index)
+            self._next_index = int((self._next_index + 1) % self.capacity)
+            self._size = min(self._size + 1, self.capacity)
+            self._seen_count += 1
+            return index
+
+        self._seen_count += 1
+        if self._size < self.capacity:
+            index = int(self._size)
+            self._size += 1
+            return index
+        replacement_index = int(self._rng.integers(0, self._seen_count))
+        if replacement_index >= self.capacity:
+            return None
+        return replacement_index
+
+    def add(self, transition: TensorTransition | Transition) -> None:
+        tensor_transition = _coerce_transition(transition)
+        if not self._is_initialized():
+            self._allocate_from_transition(tensor_transition)
+        else:
+            self._validate_transition_structure(tensor_transition)
+        index = self._select_write_index()
+        if index is None:
+            return
+        self._write_transition_at_index(index, tensor_transition)
+
+    def extend(self, batch: TensorReplayBatch) -> None:
+        if len(batch) == 0:
+            return
+        cpu_batch = batch if self._batch_is_cpu(batch) else batch.to("cpu")
+        if not self._is_initialized():
+            self._allocate_from_batch(cpu_batch)
+        else:
+            self._validate_batch_structure(cpu_batch)
+
+        if self.replacement_policy == "ring":
+            batch_size = len(cpu_batch)
+            indices = (
+                torch.arange(batch_size, dtype=torch.int64, device="cpu") + int(self._next_index)
+            ) % int(self.capacity)
+            self._write_batch_at_indices(indices, cpu_batch)
+            self._next_index = int((self._next_index + batch_size) % self.capacity)
+            self._size = min(self._size + batch_size, self.capacity)
+            self._seen_count += batch_size
+            return
+
+        for batch_index in range(len(cpu_batch)):
+            index = self._select_write_index()
+            if index is None:
+                continue
+            item = _slice_replay_batch(
+                cpu_batch,
+                torch.tensor([batch_index], dtype=torch.int64, device="cpu"),
+            )
+            self._write_batch_at_indices(
+                torch.tensor([index], dtype=torch.int64, device="cpu"),
+                item,
+            )
+
+    def _sample_indices_up_to(
+        self,
+        batch_size: int,
+        max_collapse_ratio: float | None,
+        strict_max_collapse_ratio: bool,
+    ) -> Tensor:
+        if self._size <= 0:
+            return torch.empty(0, dtype=torch.int64, device="cpu")
+        requested = min(int(batch_size), int(self._size))
+        if requested <= 0:
+            return torch.empty(0, dtype=torch.int64, device="cpu")
+        if max_collapse_ratio is None or self._collapse_flag_buffer is None:
             return torch.as_tensor(
-                self._rng.integers(0, self._size, size=batch_size),
+                self._rng.choice(self._size, size=requested, replace=False),
                 dtype=torch.int64,
                 device="cpu",
             )
 
-        ratio = float(max_collapse_ratio)
-        ratio = min(max(ratio, 0.0), 1.0)
+        ratio = min(max(float(max_collapse_ratio), 0.0), 1.0)
         if ratio >= 1.0:
             return torch.as_tensor(
-                self._rng.integers(0, self._size, size=batch_size),
+                self._rng.choice(self._size, size=requested, replace=False),
                 dtype=torch.int64,
                 device="cpu",
             )
@@ -199,65 +388,741 @@ class ReplayBuffer:
         collapse_flags = self._collapse_flag_buffer[: self._size].detach().cpu().numpy().astype(np.bool_, copy=False)
         collapse_indices = np.flatnonzero(collapse_flags)
         non_collapse_indices = np.flatnonzero(~collapse_flags)
-        if collapse_indices.size == 0 or non_collapse_indices.size == 0:
-            return torch.as_tensor(
-                self._rng.integers(0, self._size, size=batch_size),
-                dtype=torch.int64,
-                device="cpu",
+
+        if not strict_max_collapse_ratio:
+            if collapse_indices.size == 0 or non_collapse_indices.size == 0:
+                return torch.as_tensor(
+                    self._rng.choice(self._size, size=requested, replace=False),
+                    dtype=torch.int64,
+                    device="cpu",
+                )
+
+        if ratio <= 0.0:
+            take_non_collapse = min(int(non_collapse_indices.size), requested)
+            if take_non_collapse <= 0:
+                return torch.empty(0, dtype=torch.int64, device="cpu")
+            sampled_indices = self._rng.choice(non_collapse_indices, size=take_non_collapse, replace=False)
+            return torch.as_tensor(sampled_indices, dtype=torch.int64, device="cpu")
+
+        take_non_collapse = min(int(non_collapse_indices.size), requested)
+        if strict_max_collapse_ratio:
+            allowed_collapse_by_non_collapse = int(
+                np.floor((ratio * float(take_non_collapse)) / max(1.0 - ratio, 1e-12))
             )
+            take_collapse = min(int(collapse_indices.size), requested - take_non_collapse, allowed_collapse_by_non_collapse)
+        else:
+            max_collapse = int(np.floor(float(requested) * ratio))
+            take_collapse = min(int(collapse_indices.size), max_collapse)
+            take_non_collapse = min(int(non_collapse_indices.size), requested - take_collapse)
+            remaining = requested - take_non_collapse - take_collapse
+            if remaining > 0:
+                extra_non_collapse = min(int(non_collapse_indices.size) - take_non_collapse, remaining)
+                take_non_collapse += extra_non_collapse
+                remaining -= extra_non_collapse
+            if remaining > 0:
+                extra_collapse = min(int(collapse_indices.size) - take_collapse, remaining)
+                take_collapse += extra_collapse
 
-        max_collapse = int(np.floor(float(batch_size) * ratio))
-        collapse_take = min(int(collapse_indices.size), max_collapse)
-        non_collapse_take = min(int(non_collapse_indices.size), batch_size - collapse_take)
-
-        remaining = batch_size - collapse_take - non_collapse_take
-        if remaining > 0:
-            extra_non_collapse = min(int(non_collapse_indices.size) - non_collapse_take, remaining)
-            non_collapse_take += extra_non_collapse
-            remaining -= extra_non_collapse
-        if remaining > 0:
-            extra_collapse = min(int(collapse_indices.size) - collapse_take, remaining)
-            collapse_take += extra_collapse
-            remaining -= extra_collapse
-        if remaining > 0:
-            raise RuntimeError("Failed to assemble replay sample indices.")
+        if take_non_collapse <= 0 and take_collapse <= 0:
+            return torch.empty(0, dtype=torch.int64, device="cpu")
 
         sampled_parts: list[np.ndarray] = []
-        if non_collapse_take > 0:
-            sampled_parts.append(self._rng.choice(non_collapse_indices, size=non_collapse_take, replace=False))
-        if collapse_take > 0:
-            sampled_parts.append(self._rng.choice(collapse_indices, size=collapse_take, replace=False))
+        if take_non_collapse > 0:
+            sampled_parts.append(self._rng.choice(non_collapse_indices, size=take_non_collapse, replace=False))
+        if take_collapse > 0:
+            sampled_parts.append(self._rng.choice(collapse_indices, size=take_collapse, replace=False))
         sampled_indices = np.concatenate(sampled_parts, axis=0)
         self._rng.shuffle(sampled_indices)
         return torch.as_tensor(sampled_indices, dtype=torch.int64, device="cpu")
 
-    def add(self, transition: TensorTransition | Transition) -> None:
-        tensor_transition = self._coerce_transition(transition)
-        with self._lock:
-            if not self._is_initialized():
-                self._allocate_from_transition(tensor_transition)
-            else:
-                self._validate_transition_structure(tensor_transition)
+    def _sample_candidate_indices_up_to(
+        self,
+        candidate_indices: np.ndarray,
+        batch_size: int,
+        max_collapse_ratio: float | None,
+        strict_max_collapse_ratio: bool,
+    ) -> Tensor:
+        if batch_size <= 0 or candidate_indices.size <= 0:
+            return torch.empty(0, dtype=torch.int64, device="cpu")
 
-            self._write_transition_at_index(self._next_index, tensor_transition)
-            self._next_index = (self._next_index + 1) % self.capacity
-            self._size = min(self._size + 1, self.capacity)
+        requested = min(int(batch_size), int(candidate_indices.size))
+        if requested <= 0:
+            return torch.empty(0, dtype=torch.int64, device="cpu")
+
+        if max_collapse_ratio is None or self._collapse_flag_buffer is None:
+            sampled_indices = self._rng.choice(candidate_indices, size=requested, replace=False)
+            return torch.as_tensor(sampled_indices, dtype=torch.int64, device="cpu")
+
+        ratio = min(max(float(max_collapse_ratio), 0.0), 1.0)
+        if ratio >= 1.0:
+            sampled_indices = self._rng.choice(candidate_indices, size=requested, replace=False)
+            return torch.as_tensor(sampled_indices, dtype=torch.int64, device="cpu")
+
+        collapse_flags = self._collapse_flag_buffer[candidate_indices].detach().cpu().numpy().astype(np.bool_, copy=False)
+        collapse_indices = candidate_indices[np.flatnonzero(collapse_flags)]
+        non_collapse_indices = candidate_indices[np.flatnonzero(~collapse_flags)]
+
+        if not strict_max_collapse_ratio:
+            if collapse_indices.size == 0 or non_collapse_indices.size == 0:
+                sampled_indices = self._rng.choice(candidate_indices, size=requested, replace=False)
+                return torch.as_tensor(sampled_indices, dtype=torch.int64, device="cpu")
+
+        if ratio <= 0.0:
+            take_non_collapse = min(int(non_collapse_indices.size), requested)
+            if take_non_collapse <= 0:
+                return torch.empty(0, dtype=torch.int64, device="cpu")
+            sampled_indices = self._rng.choice(non_collapse_indices, size=take_non_collapse, replace=False)
+            return torch.as_tensor(sampled_indices, dtype=torch.int64, device="cpu")
+
+        take_non_collapse = min(int(non_collapse_indices.size), requested)
+        if strict_max_collapse_ratio:
+            allowed_collapse_by_non_collapse = int(
+                np.floor((ratio * float(take_non_collapse)) / max(1.0 - ratio, 1e-12))
+            )
+            take_collapse = min(int(collapse_indices.size), requested - take_non_collapse, allowed_collapse_by_non_collapse)
+        else:
+            max_collapse = int(np.floor(float(requested) * ratio))
+            take_collapse = min(int(collapse_indices.size), max_collapse)
+            take_non_collapse = min(int(non_collapse_indices.size), requested - take_collapse)
+            remaining = requested - take_non_collapse - take_collapse
+            if remaining > 0:
+                extra_non_collapse = min(int(non_collapse_indices.size) - take_non_collapse, remaining)
+                take_non_collapse += extra_non_collapse
+                remaining -= extra_non_collapse
+            if remaining > 0:
+                extra_collapse = min(int(collapse_indices.size) - take_collapse, remaining)
+                take_collapse += extra_collapse
+
+        if take_non_collapse <= 0 and take_collapse <= 0:
+            return torch.empty(0, dtype=torch.int64, device="cpu")
+
+        sampled_parts: list[np.ndarray] = []
+        if take_non_collapse > 0:
+            sampled_parts.append(self._rng.choice(non_collapse_indices, size=take_non_collapse, replace=False))
+        if take_collapse > 0:
+            sampled_parts.append(self._rng.choice(collapse_indices, size=take_collapse, replace=False))
+        sampled_indices = np.concatenate(sampled_parts, axis=0)
+        self._rng.shuffle(sampled_indices)
+        return torch.as_tensor(sampled_indices, dtype=torch.int64, device="cpu")
+
+    def sample_up_to(
+        self,
+        batch_size: int,
+        max_collapse_ratio: float | None = None,
+        strict_max_collapse_ratio: bool = False,
+    ) -> TensorReplayBatch | None:
+        if batch_size <= 0 or self._size <= 0 or not self._is_initialized():
+            return None
+        indices = self._sample_indices_up_to(
+            batch_size=batch_size,
+            max_collapse_ratio=max_collapse_ratio,
+            strict_max_collapse_ratio=strict_max_collapse_ratio,
+        )
+        if indices.numel() == 0:
+            return None
+        obs = {key: buffer.index_select(0, indices) for key, buffer in self._obs_buffers.items()}
+        next_obs = {key: buffer.index_select(0, indices) for key, buffer in self._next_obs_buffers.items()}
+        assert self._reward_buffer is not None
+        assert self._done_buffer is not None
+        assert self._is_demo_buffer is not None
+        assert self._collapse_flag_buffer is not None
+        assert self._topology_id_buffer is not None
+        assert self._pool_power_demo_flag_buffer is not None
+        return TensorReplayBatch(
+            obs=obs,
+            action=TensorReplayActionRecord(
+                allocation=self._action_buffers["allocation"].index_select(0, indices),
+            ),
+            reward=self._reward_buffer.index_select(0, indices),
+            next_obs=next_obs,
+            done=self._done_buffer.index_select(0, indices),
+            is_demo=self._is_demo_buffer.index_select(0, indices),
+            collapse_flag=self._collapse_flag_buffer.index_select(0, indices),
+            topology_id=self._topology_id_buffer.index_select(0, indices),
+            pool_power_demo_flag=self._pool_power_demo_flag_buffer.index_select(0, indices),
+        )
+
+    def sample_filtered_up_to(
+        self,
+        batch_size: int,
+        *,
+        max_collapse_ratio: float | None = None,
+        strict_max_collapse_ratio: bool = False,
+        require_demo: bool = False,
+        require_pool_power_demo: bool = False,
+    ) -> TensorReplayBatch | None:
+        if batch_size <= 0 or self._size <= 0 or not self._is_initialized():
+            return None
+        candidate_mask = np.ones(self._size, dtype=np.bool_)
+        if require_demo:
+            assert self._is_demo_buffer is not None
+            candidate_mask &= self._is_demo_buffer[: self._size].detach().cpu().numpy().astype(np.bool_, copy=False)
+        if require_pool_power_demo:
+            assert self._pool_power_demo_flag_buffer is not None
+            candidate_mask &= self._pool_power_demo_flag_buffer[: self._size].detach().cpu().numpy().astype(np.bool_, copy=False)
+        candidate_indices = np.flatnonzero(candidate_mask)
+        if candidate_indices.size <= 0:
+            return None
+        indices = self._sample_candidate_indices_up_to(
+            candidate_indices=candidate_indices,
+            batch_size=batch_size,
+            max_collapse_ratio=max_collapse_ratio,
+            strict_max_collapse_ratio=strict_max_collapse_ratio,
+        )
+        if indices.numel() == 0:
+            return None
+        obs = {key: buffer.index_select(0, indices) for key, buffer in self._obs_buffers.items()}
+        next_obs = {key: buffer.index_select(0, indices) for key, buffer in self._next_obs_buffers.items()}
+        assert self._reward_buffer is not None
+        assert self._done_buffer is not None
+        assert self._is_demo_buffer is not None
+        assert self._collapse_flag_buffer is not None
+        assert self._topology_id_buffer is not None
+        assert self._pool_power_demo_flag_buffer is not None
+        return TensorReplayBatch(
+            obs=obs,
+            action=TensorReplayActionRecord(
+                allocation=self._action_buffers["allocation"].index_select(0, indices),
+            ),
+            reward=self._reward_buffer.index_select(0, indices),
+            next_obs=next_obs,
+            done=self._done_buffer.index_select(0, indices),
+            is_demo=self._is_demo_buffer.index_select(0, indices),
+            collapse_flag=self._collapse_flag_buffer.index_select(0, indices),
+            topology_id=self._topology_id_buffer.index_select(0, indices),
+            pool_power_demo_flag=self._pool_power_demo_flag_buffer.index_select(0, indices),
+        )
+
+    def sample(
+        self,
+        batch_size: int,
+        device: torch.device | str | None = None,
+        max_collapse_ratio: float | None = None,
+    ) -> TensorReplayBatch:
+        batch = self.sample_up_to(
+            batch_size=batch_size,
+            max_collapse_ratio=max_collapse_ratio,
+            strict_max_collapse_ratio=False,
+        )
+        if batch is None:
+            raise ValueError("Cannot sample from an empty replay storage.")
+        if device is not None:
+            return batch.to(device)
+        return batch
+
+    def sample_demo(
+        self,
+        batch_size: int,
+        device: torch.device | str | None = None,
+        max_collapse_ratio: float | None = None,
+    ) -> TensorReplayBatch:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+
+        with self._lock:
+            if self.replay_strategy == "fifo":
+                assert self._fifo_storage is not None
+                batch = self._fifo_storage.sample_filtered_up_to(
+                    batch_size=batch_size,
+                    max_collapse_ratio=max_collapse_ratio,
+                    strict_max_collapse_ratio=False,
+                    require_demo=True,
+                    require_pool_power_demo=(self.demo_behavior_source == "pool_power_mix"),
+                )
+                if batch is None:
+                    raise ValueError("Cannot sample demo batch from an empty replay buffer.")
+                topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64, copy=False)
+                topology_counts: dict[str, int] = {}
+                for topology_id in np.unique(topology_ids):
+                    topology_name = self._resolve_topology_name(int(topology_id))
+                    topology_counts[topology_name] = int(np.sum(topology_ids == int(topology_id)))
+                sample_size = max(len(batch), 1)
+                self._last_sample_stats = {
+                    "replay_sample_size": float(len(batch)),
+                    "replay_source_frac_demo": 1.0,
+                    **{
+                        "replay_topology_frac_{0}".format(topology_name): float(count) / float(sample_size)
+                        for topology_name, count in sorted(topology_counts.items())
+                    },
+                }
+            else:
+                active_topologies = [
+                    topology_name
+                    for topology_name in self.topology_names
+                    if (
+                        (topology_name in self._demo_storages and len(self._demo_storages[topology_name]) > 0)
+                        or (topology_name in self._recent_storages and self._recent_storages[topology_name].demo_size() > 0)
+                        or (topology_name in self._long_term_storages and self._long_term_storages[topology_name].demo_size() > 0)
+                    )
+                ]
+                if not active_topologies:
+                    raise ValueError("Cannot sample demo batch from an empty replay buffer.")
+                topology_counts = _allocate_integer_counts(batch_size, [1.0 for _ in active_topologies])
+                sampled_batches: list[TensorReplayBatch] = []
+                actual_topology_counts: dict[str, int] = {}
+
+                for topology_name, requested in zip(active_topologies, topology_counts):
+                    if requested <= 0:
+                        continue
+                    remaining_for_topology = int(requested)
+                    topology_samples: list[TensorReplayBatch] = []
+                    preferred_storage = self._demo_storages.get(topology_name)
+                    if preferred_storage is not None and len(preferred_storage) > 0:
+                        sample = preferred_storage.sample_up_to(
+                            remaining_for_topology,
+                            max_collapse_ratio=max_collapse_ratio,
+                            strict_max_collapse_ratio=True,
+                        )
+                        if sample is not None:
+                            topology_samples.append(sample)
+                            remaining_for_topology -= len(sample)
+                    for fallback_storage in (
+                        self._recent_storages.get(topology_name),
+                        self._long_term_storages.get(topology_name),
+                    ):
+                        if remaining_for_topology <= 0 or fallback_storage is None or len(fallback_storage) <= 0:
+                            continue
+                        sample = fallback_storage.sample_filtered_up_to(
+                            remaining_for_topology,
+                            max_collapse_ratio=max_collapse_ratio,
+                            strict_max_collapse_ratio=True,
+                            require_demo=True,
+                            require_pool_power_demo=(self.demo_behavior_source == "pool_power_mix"),
+                        )
+                        if sample is None:
+                            continue
+                        topology_samples.append(sample)
+                        remaining_for_topology -= len(sample)
+                    if not topology_samples:
+                        continue
+                    combined_topology_batch = _concat_replay_batches(topology_samples)
+                    sampled_batches.append(combined_topology_batch)
+                    actual_topology_counts[topology_name] = (
+                        actual_topology_counts.get(topology_name, 0) + len(combined_topology_batch)
+                    )
+
+                remaining = batch_size - sum(len(batch_item) for batch_item in sampled_batches)
+                while remaining > 0:
+                    made_progress = False
+                    for topology_name in active_topologies:
+                        if remaining <= 0:
+                            break
+                        sample = None
+                        preferred_storage = self._demo_storages.get(topology_name)
+                        if preferred_storage is not None and len(preferred_storage) > 0:
+                            sample = preferred_storage.sample_up_to(
+                                1,
+                                max_collapse_ratio=max_collapse_ratio,
+                                strict_max_collapse_ratio=True,
+                            )
+                        if sample is None:
+                            for fallback_storage in (
+                                self._recent_storages.get(topology_name),
+                                self._long_term_storages.get(topology_name),
+                            ):
+                                if fallback_storage is None or len(fallback_storage) <= 0:
+                                    continue
+                                sample = fallback_storage.sample_filtered_up_to(
+                                    1,
+                                    max_collapse_ratio=max_collapse_ratio,
+                                    strict_max_collapse_ratio=True,
+                                    require_demo=True,
+                                    require_pool_power_demo=(self.demo_behavior_source == "pool_power_mix"),
+                                )
+                                if sample is not None:
+                                    break
+                        if sample is None:
+                            continue
+                        sampled_batches.append(sample)
+                        actual_topology_counts[topology_name] = actual_topology_counts.get(topology_name, 0) + len(sample)
+                        remaining -= len(sample)
+                        made_progress = True
+                    if not made_progress:
+                        break
+
+                if not sampled_batches:
+                    raise ValueError("Cannot sample demo batch from an empty replay buffer.")
+                batch = _shuffle_replay_batch(_concat_replay_batches(sampled_batches), self._rng)
+                sample_size = max(len(batch), 1)
+                self._last_sample_stats = {
+                    "replay_sample_size": float(len(batch)),
+                    "replay_source_frac_demo": 1.0,
+                    **{
+                        "replay_topology_frac_{0}".format(topology_name): float(count) / float(sample_size)
+                        for topology_name, count in sorted(actual_topology_counts.items())
+                    },
+                }
+
+        if device is not None:
+            return batch.to(device)
+        return batch
+
+    def demo_size(self, *, require_pool_power_demo: bool = False) -> int:
+        if self._size <= 0 or self._is_demo_buffer is None:
+            return 0
+        demo_mask = self._is_demo_buffer[: self._size].detach().cpu().numpy().astype(np.bool_, copy=False)
+        if require_pool_power_demo:
+            assert self._pool_power_demo_flag_buffer is not None
+            pool_power_mask = self._pool_power_demo_flag_buffer[: self._size].detach().cpu().numpy().astype(
+                np.bool_,
+                copy=False,
+            )
+            demo_mask = np.logical_and(demo_mask, pool_power_mask)
+        return int(np.sum(demo_mask))
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "capacity": int(self.capacity),
+            "replacement_policy": str(self.replacement_policy),
+            "next_index": int(self._next_index),
+            "size": int(self._size),
+            "seen_count": int(self._seen_count),
+            "rng_state": self._rng.bit_generator.state,
+            "initialized": self._is_initialized(),
+            "obs_buffers": {key: value.detach().cpu().clone() for key, value in self._obs_buffers.items()},
+            "next_obs_buffers": {key: value.detach().cpu().clone() for key, value in self._next_obs_buffers.items()},
+            "action_buffers": {key: value.detach().cpu().clone() for key, value in self._action_buffers.items()},
+            "reward_buffer": None if self._reward_buffer is None else self._reward_buffer.detach().cpu().clone(),
+            "done_buffer": None if self._done_buffer is None else self._done_buffer.detach().cpu().clone(),
+            "is_demo_buffer": None if self._is_demo_buffer is None else self._is_demo_buffer.detach().cpu().clone(),
+            "collapse_flag_buffer": (
+                None if self._collapse_flag_buffer is None else self._collapse_flag_buffer.detach().cpu().clone()
+            ),
+            "topology_id_buffer": (
+                None if self._topology_id_buffer is None else self._topology_id_buffer.detach().cpu().clone()
+            ),
+            "pool_power_demo_flag_buffer": (
+                None
+                if self._pool_power_demo_flag_buffer is None
+                else self._pool_power_demo_flag_buffer.detach().cpu().clone()
+            ),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if "buffer" in state_dict:
+            self._load_legacy_state_dict(state_dict)
+            return
+
+        self.capacity = int(state_dict["capacity"])
+        self.replacement_policy = str(state_dict.get("replacement_policy", "ring"))
+        self._next_index = int(state_dict["next_index"])
+        self._size = int(state_dict["size"])
+        self._seen_count = int(state_dict.get("seen_count", self._size))
+        self._rng = np.random.default_rng()
+        self._rng.bit_generator.state = state_dict["rng_state"]
+
+        initialized = bool(state_dict.get("initialized", False))
+        if not initialized:
+            self._obs_buffers = {}
+            self._next_obs_buffers = {}
+            self._action_buffers = {}
+            self._reward_buffer = None
+            self._done_buffer = None
+            self._is_demo_buffer = None
+            self._collapse_flag_buffer = None
+            self._topology_id_buffer = None
+            self._pool_power_demo_flag_buffer = None
+            return
+
+        self._obs_buffers = {
+            key: torch.as_tensor(value, device="cpu").detach().clone()
+            for key, value in dict(state_dict["obs_buffers"]).items()
+        }
+        self._next_obs_buffers = {
+            key: torch.as_tensor(value, device="cpu").detach().clone()
+            for key, value in dict(state_dict["next_obs_buffers"]).items()
+        }
+        self._action_buffers = {
+            key: torch.as_tensor(value, device="cpu").detach().clone()
+            for key, value in dict(state_dict["action_buffers"]).items()
+        }
+        reward_buffer = state_dict.get("reward_buffer")
+        done_buffer = state_dict.get("done_buffer")
+        is_demo_buffer = state_dict.get("is_demo_buffer")
+        collapse_flag_buffer = state_dict.get("collapse_flag_buffer")
+        topology_id_buffer = state_dict.get("topology_id_buffer")
+        pool_power_demo_flag_buffer = state_dict.get("pool_power_demo_flag_buffer")
+        self._reward_buffer = None if reward_buffer is None else torch.as_tensor(reward_buffer, device="cpu").detach().clone()
+        self._done_buffer = None if done_buffer is None else torch.as_tensor(done_buffer, device="cpu").detach().clone()
+        self._is_demo_buffer = (
+            torch.zeros(self.capacity, dtype=torch.bool, device="cpu")
+            if is_demo_buffer is None
+            else torch.as_tensor(is_demo_buffer, device="cpu").detach().clone()
+        )
+        self._collapse_flag_buffer = (
+            torch.zeros(self.capacity, dtype=torch.bool, device="cpu")
+            if collapse_flag_buffer is None
+            else torch.as_tensor(collapse_flag_buffer, device="cpu").detach().clone()
+        )
+        self._topology_id_buffer = (
+            torch.full(self.capacity, 6, dtype=torch.int64, device="cpu")
+            if topology_id_buffer is None
+            else torch.as_tensor(topology_id_buffer, device="cpu").detach().clone()
+        )
+        self._pool_power_demo_flag_buffer = (
+            torch.zeros(self.capacity, dtype=torch.bool, device="cpu")
+            if pool_power_demo_flag_buffer is None
+            else torch.as_tensor(pool_power_demo_flag_buffer, device="cpu").detach().clone()
+        )
+
+    def _load_legacy_state_dict(self, state_dict: dict[str, Any]) -> None:
+        capacity = int(state_dict["capacity"])
+        buffer_state = list(state_dict["buffer"])
+        if len(buffer_state) != capacity:
+            raise ValueError("Replay buffer checkpoint is inconsistent with its declared capacity.")
+
+        self.capacity = capacity
+        self.replacement_policy = "ring"
+        self._next_index = int(state_dict["next_index"])
+        self._size = int(state_dict["size"])
+        self._seen_count = int(self._size)
+        self._rng = np.random.default_rng()
+        self._rng.bit_generator.state = state_dict["rng_state"]
+        self._obs_buffers = {}
+        self._next_obs_buffers = {}
+        self._action_buffers = {}
+        self._reward_buffer = None
+        self._done_buffer = None
+        self._is_demo_buffer = None
+        self._collapse_flag_buffer = None
+        self._topology_id_buffer = None
+        self._pool_power_demo_flag_buffer = None
+
+        first_transition = next((item for item in buffer_state if item is not None), None)
+        if first_transition is None:
+            return
+
+        reference_transition = _coerce_transition(first_transition)
+        self._allocate_from_transition(reference_transition)
+        for index, transition in enumerate(buffer_state):
+            if transition is None:
+                continue
+            tensor_transition = _coerce_transition(transition)
+            self._validate_transition_structure(tensor_transition)
+            self._write_transition_at_index(index, tensor_transition)
+
+
+class ReplayBuffer:
+    def __init__(
+        self,
+        capacity: int,
+        seed: int | None = None,
+        replay_strategy: str = "fifo",
+        topology_names: Sequence[str] | None = None,
+        recent_fraction: float = 0.50,
+        long_term_fraction: float = 0.35,
+        demo_fraction: float = 0.15,
+        demo_behavior_source: str = "pool_power_mix",
+    ):
+        if capacity <= 0:
+            raise ValueError("capacity must be positive.")
+        if replay_strategy not in {"fifo", "topology_stratified_mixed"}:
+            raise ValueError("replay_strategy must be one of {'fifo', 'topology_stratified_mixed'}.")
+        if recent_fraction < 0.0 or long_term_fraction < 0.0 or demo_fraction < 0.0:
+            raise ValueError("Replay source fractions must be non-negative.")
+        if replay_strategy == "topology_stratified_mixed":
+            total_fraction = float(recent_fraction + long_term_fraction + demo_fraction)
+            if abs(total_fraction - 1.0) > 1e-6:
+                raise ValueError("For topology_stratified_mixed replay, recent/long_term/demo fractions must sum to 1.")
+
+        self.capacity = int(capacity)
+        self.replay_strategy = str(replay_strategy)
+        self.demo_behavior_source = str(demo_behavior_source)
+        self.recent_fraction = float(recent_fraction)
+        self.long_term_fraction = float(long_term_fraction)
+        self.demo_fraction = float(demo_fraction)
+        self._lock = threading.Lock()
+        self._rng = np.random.default_rng(seed)
+        self._seed = seed
+        self._last_sample_stats: dict[str, float] = {}
+
+        if topology_names is None:
+            normalized_topology_names = ["fixed"]
+        else:
+            normalized_topology_names = [str(item) for item in topology_names if str(item)]
+            if not normalized_topology_names:
+                normalized_topology_names = ["fixed"]
+        self.topology_names = tuple(dict.fromkeys(normalized_topology_names))
+
+        self._fifo_storage: _TensorReplayStorage | None = None
+        self._recent_storages: dict[str, _TensorReplayStorage] = {}
+        self._long_term_storages: dict[str, _TensorReplayStorage] = {}
+        self._demo_storages: dict[str, _TensorReplayStorage] = {}
+
+        self._initialize_storage()
+
+    def _initialize_storage(self) -> None:
+        if self.replay_strategy == "fifo":
+            self._fifo_storage = _TensorReplayStorage(self.capacity, seed=self._seed, replacement_policy="ring")
+            self._recent_storages = {}
+            self._long_term_storages = {}
+            self._demo_storages = {}
+            return
+
+        source_capacities = _allocate_integer_counts(
+            self.capacity,
+            [self.recent_fraction, self.long_term_fraction, self.demo_fraction],
+        )
+        recent_total, long_term_total, demo_total = source_capacities
+        recent_caps = _allocate_integer_counts(recent_total, [1.0 for _ in self.topology_names]) if recent_total > 0 else [0 for _ in self.topology_names]
+        long_caps = _allocate_integer_counts(long_term_total, [1.0 for _ in self.topology_names]) if long_term_total > 0 else [0 for _ in self.topology_names]
+        demo_caps = _allocate_integer_counts(demo_total, [1.0 for _ in self.topology_names]) if demo_total > 0 else [0 for _ in self.topology_names]
+
+        self._fifo_storage = None
+        self._recent_storages = {
+            name: _TensorReplayStorage(capacity=int(capacity), seed=self._seed, replacement_policy="ring")
+            for name, capacity in zip(self.topology_names, recent_caps)
+            if int(capacity) > 0
+        }
+        self._long_term_storages = {
+            name: _TensorReplayStorage(capacity=int(capacity), seed=self._seed, replacement_policy="reservoir")
+            for name, capacity in zip(self.topology_names, long_caps)
+            if int(capacity) > 0
+        }
+        self._demo_storages = {
+            name: _TensorReplayStorage(capacity=int(capacity), seed=self._seed, replacement_policy="ring")
+            for name, capacity in zip(self.topology_names, demo_caps)
+            if int(capacity) > 0
+        }
+
+    def _resolve_topology_name(self, topology_id: int) -> str:
+        topology_name = topology_id_to_name(int(topology_id))
+        if topology_name in self.topology_names:
+            return topology_name
+        return str(self.topology_names[0])
+
+    def _split_batch_by_topology(
+        self,
+        batch: TensorReplayBatch,
+        require_pool_power_demo: bool = False,
+    ) -> dict[str, TensorReplayBatch]:
+        grouped: dict[str, TensorReplayBatch] = {}
+        if len(batch) == 0:
+            return grouped
+        topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64, copy=False)
+        demo_flags = batch.pool_power_demo_flag.detach().cpu().numpy().astype(np.bool_, copy=False)
+        for topology_id in np.unique(topology_ids):
+            topology_mask = topology_ids == int(topology_id)
+            if require_pool_power_demo:
+                topology_mask = np.logical_and(topology_mask, demo_flags)
+            if not np.any(topology_mask):
+                continue
+            indices = torch.as_tensor(np.flatnonzero(topology_mask), dtype=torch.int64, device="cpu")
+            grouped[self._resolve_topology_name(int(topology_id))] = _slice_replay_batch(batch, indices)
+        return grouped
+
+    def _source_storages_for_topology(self, topology_name: str) -> list[tuple[str, _TensorReplayStorage, float]]:
+        storages: list[tuple[str, _TensorReplayStorage, float]] = []
+        demo_storage = self._demo_storages.get(topology_name)
+        if demo_storage is not None and len(demo_storage) > 0 and self.demo_fraction > 0.0:
+            storages.append(("demo", demo_storage, self.demo_fraction))
+        recent_storage = self._recent_storages.get(topology_name)
+        if recent_storage is not None and len(recent_storage) > 0 and self.recent_fraction > 0.0:
+            storages.append(("recent", recent_storage, self.recent_fraction))
+        long_term_storage = self._long_term_storages.get(topology_name)
+        if long_term_storage is not None and len(long_term_storage) > 0 and self.long_term_fraction > 0.0:
+            storages.append(("long_term", long_term_storage, self.long_term_fraction))
+        return storages
+
+    def _sample_from_topology(
+        self,
+        topology_name: str,
+        requested: int,
+        max_collapse_ratio: float | None,
+    ) -> tuple[TensorReplayBatch | None, dict[str, int]]:
+        if requested <= 0:
+            return None, {}
+        source_storages = self._source_storages_for_topology(topology_name)
+        if not source_storages:
+            return None, {}
+
+        target_counts = _allocate_integer_counts(requested, [weight for _, _, weight in source_storages])
+        sampled_batches: list[TensorReplayBatch] = []
+        sampled_count = 0
+        source_counts: dict[str, int] = {}
+
+        for (source_name, storage, _), target_count in zip(source_storages, target_counts):
+            if target_count <= 0:
+                continue
+            sample = storage.sample_up_to(
+                target_count,
+                max_collapse_ratio=max_collapse_ratio,
+                strict_max_collapse_ratio=True,
+            )
+            if sample is None:
+                continue
+            sampled_batches.append(sample)
+            sampled_count += len(sample)
+            source_counts[source_name] = source_counts.get(source_name, 0) + len(sample)
+
+        remaining = requested - sampled_count
+        if remaining > 0:
+            for source_name, storage, _ in source_storages:
+                if remaining <= 0:
+                    break
+                sample = storage.sample_up_to(
+                    remaining,
+                    max_collapse_ratio=max_collapse_ratio,
+                    strict_max_collapse_ratio=True,
+                )
+                if sample is None:
+                    continue
+                sampled_batches.append(sample)
+                source_counts[source_name] = source_counts.get(source_name, 0) + len(sample)
+                remaining -= len(sample)
+
+        if not sampled_batches:
+            return None, {}
+        return _concat_replay_batches(sampled_batches), source_counts
+
+    def get_last_sample_stats(self) -> dict[str, float]:
+        with self._lock:
+            return dict(self._last_sample_stats)
+
+    def add(self, transition: TensorTransition | Transition) -> None:
+        tensor_transition = _coerce_transition(transition)
+        with self._lock:
+            if self.replay_strategy == "fifo":
+                assert self._fifo_storage is not None
+                self._fifo_storage.add(tensor_transition)
+                return
+
+            topology_name = self._resolve_topology_name(int(tensor_transition.topology_id.item()))
+            recent_storage = self._recent_storages.get(topology_name)
+            if recent_storage is not None:
+                recent_storage.add(tensor_transition)
+            long_term_storage = self._long_term_storages.get(topology_name)
+            if long_term_storage is not None:
+                long_term_storage.add(tensor_transition)
+            if bool(tensor_transition.pool_power_demo_flag.item()):
+                demo_storage = self._demo_storages.get(topology_name)
+                if demo_storage is not None:
+                    demo_storage.add(tensor_transition)
 
     def extend(self, batch: TensorReplayBatch) -> None:
         if len(batch) == 0:
             return
-        cpu_batch = batch if self._batch_is_cpu(batch) else batch.to("cpu")
+        cpu_batch = batch if _TensorReplayStorage._batch_is_cpu(batch) else batch.to("cpu")
         with self._lock:
-            if not self._is_initialized():
-                self._allocate_from_batch(cpu_batch)
-            else:
-                self._validate_batch_structure(cpu_batch)
+            if self.replay_strategy == "fifo":
+                assert self._fifo_storage is not None
+                self._fifo_storage.extend(cpu_batch)
+                return
 
-            batch_size = len(cpu_batch)
-            indices = (torch.arange(batch_size, dtype=torch.int64, device="cpu") + int(self._next_index)) % int(self.capacity)
-            self._write_batch_at_indices(indices, cpu_batch)
-            self._next_index = int((self._next_index + batch_size) % self.capacity)
-            self._size = min(self._size + batch_size, self.capacity)
+            recent_groups = self._split_batch_by_topology(cpu_batch, require_pool_power_demo=False)
+            for topology_name, topology_batch in recent_groups.items():
+                recent_storage = self._recent_storages.get(topology_name)
+                if recent_storage is not None:
+                    recent_storage.extend(topology_batch)
+                long_term_storage = self._long_term_storages.get(topology_name)
+                if long_term_storage is not None:
+                    long_term_storage.extend(topology_batch)
+
+            demo_groups = self._split_batch_by_topology(cpu_batch, require_pool_power_demo=True)
+            for topology_name, topology_batch in demo_groups.items():
+                demo_storage = self._demo_storages.get(topology_name)
+                if demo_storage is not None:
+                    demo_storage.extend(topology_batch)
 
     def sample(
         self,
@@ -269,28 +1134,240 @@ class ReplayBuffer:
             raise ValueError("batch_size must be positive.")
 
         with self._lock:
-            if self._size == 0 or not self._is_initialized():
-                raise ValueError("Cannot sample from an empty replay buffer.")
+            if self.replay_strategy == "fifo":
+                assert self._fifo_storage is not None
+                batch = self._fifo_storage.sample(
+                    batch_size=batch_size,
+                    device=None,
+                    max_collapse_ratio=max_collapse_ratio,
+                )
+                topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64, copy=False)
+                topology_counts: dict[str, int] = {}
+                for topology_id in np.unique(topology_ids):
+                    topology_name = self._resolve_topology_name(int(topology_id))
+                    topology_counts[topology_name] = int(np.sum(topology_ids == int(topology_id)))
+                sample_size = max(len(batch), 1)
+                self._last_sample_stats = {
+                    "replay_sample_size": float(len(batch)),
+                    **{
+                        "replay_topology_frac_{0}".format(topology_name): float(count) / float(sample_size)
+                        for topology_name, count in sorted(topology_counts.items())
+                    },
+                }
+            else:
+                active_topologies = [
+                    topology_name
+                    for topology_name in self.topology_names
+                    if self._source_storages_for_topology(topology_name)
+                ]
+                if not active_topologies:
+                    raise ValueError("Cannot sample from an empty replay buffer.")
 
-            indices = self._sample_indices(batch_size=batch_size, max_collapse_ratio=max_collapse_ratio)
-            obs = {key: buffer.index_select(0, indices) for key, buffer in self._obs_buffers.items()}
-            next_obs = {key: buffer.index_select(0, indices) for key, buffer in self._next_obs_buffers.items()}
-            action = TensorReplayActionRecord(
-                allocation=self._action_buffers["allocation"].index_select(0, indices),
-            )
-            assert self._reward_buffer is not None
-            assert self._done_buffer is not None
-            assert self._is_demo_buffer is not None
-            assert self._collapse_flag_buffer is not None
-            batch = TensorReplayBatch(
-                obs=obs,
-                action=action,
-                reward=self._reward_buffer.index_select(0, indices),
-                next_obs=next_obs,
-                done=self._done_buffer.index_select(0, indices),
-                is_demo=self._is_demo_buffer.index_select(0, indices),
-                collapse_flag=self._collapse_flag_buffer.index_select(0, indices),
-            )
+                topology_counts = _allocate_integer_counts(batch_size, [1.0 for _ in active_topologies])
+                sampled_batches: list[TensorReplayBatch] = []
+                sampled_total = 0
+                source_counts: dict[str, int] = {}
+                actual_topology_counts: dict[str, int] = {}
+
+                for topology_name, requested in zip(active_topologies, topology_counts):
+                    topology_batch, topology_source_counts = self._sample_from_topology(
+                        topology_name=topology_name,
+                        requested=requested,
+                        max_collapse_ratio=max_collapse_ratio,
+                    )
+                    if topology_batch is None:
+                        continue
+                    sampled_batches.append(topology_batch)
+                    sampled_total += len(topology_batch)
+                    actual_topology_counts[topology_name] = actual_topology_counts.get(topology_name, 0) + len(topology_batch)
+                    for source_name, count in topology_source_counts.items():
+                        source_counts[source_name] = source_counts.get(source_name, 0) + int(count)
+
+                remaining = batch_size - sampled_total
+                while remaining > 0:
+                    made_progress = False
+                    for topology_name in active_topologies:
+                        topology_batch, topology_source_counts = self._sample_from_topology(
+                            topology_name=topology_name,
+                            requested=1,
+                            max_collapse_ratio=max_collapse_ratio,
+                        )
+                        if topology_batch is None:
+                            continue
+                        sampled_batches.append(topology_batch)
+                        sampled_total += len(topology_batch)
+                        actual_topology_counts[topology_name] = actual_topology_counts.get(topology_name, 0) + len(topology_batch)
+                        for source_name, count in topology_source_counts.items():
+                            source_counts[source_name] = source_counts.get(source_name, 0) + int(count)
+                        remaining -= len(topology_batch)
+                        made_progress = True
+                        if remaining <= 0:
+                            break
+                    if not made_progress:
+                        break
+
+                if not sampled_batches:
+                    raise ValueError("Cannot sample from an empty replay buffer.")
+                batch = _shuffle_replay_batch(_concat_replay_batches(sampled_batches), self._rng)
+                sample_size = max(len(batch), 1)
+                self._last_sample_stats = {
+                    "replay_sample_size": float(len(batch)),
+                    **{
+                        "replay_source_frac_{0}".format(source_name): float(count) / float(sample_size)
+                        for source_name, count in sorted(source_counts.items())
+                    },
+                    **{
+                        "replay_topology_frac_{0}".format(topology_name): float(count) / float(sample_size)
+                        for topology_name, count in sorted(actual_topology_counts.items())
+                    },
+                }
+
+        if device is not None:
+            return batch.to(device)
+        return batch
+
+    def sample_demo(
+        self,
+        batch_size: int,
+        device: torch.device | str | None = None,
+        max_collapse_ratio: float | None = None,
+    ) -> TensorReplayBatch:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+
+        with self._lock:
+            if self.replay_strategy == "fifo":
+                assert self._fifo_storage is not None
+                batch = self._fifo_storage.sample_filtered_up_to(
+                    batch_size=batch_size,
+                    max_collapse_ratio=max_collapse_ratio,
+                    strict_max_collapse_ratio=False,
+                    require_demo=True,
+                    require_pool_power_demo=(self.demo_behavior_source == "pool_power_mix"),
+                )
+                if batch is None:
+                    raise ValueError("Cannot sample demo batch from an empty replay buffer.")
+                topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64, copy=False)
+                topology_counts: dict[str, int] = {}
+                for topology_id in np.unique(topology_ids):
+                    topology_name = self._resolve_topology_name(int(topology_id))
+                    topology_counts[topology_name] = int(np.sum(topology_ids == int(topology_id)))
+                sample_size = max(len(batch), 1)
+                self._last_sample_stats = {
+                    "replay_sample_size": float(len(batch)),
+                    "replay_source_frac_demo": 1.0,
+                    **{
+                        "replay_topology_frac_{0}".format(topology_name): float(count) / float(sample_size)
+                        for topology_name, count in sorted(topology_counts.items())
+                    },
+                }
+            else:
+                active_topologies = [
+                    topology_name
+                    for topology_name in self.topology_names
+                    if (
+                        (topology_name in self._demo_storages and len(self._demo_storages[topology_name]) > 0)
+                        or (topology_name in self._recent_storages and self._recent_storages[topology_name].demo_size() > 0)
+                        or (topology_name in self._long_term_storages and self._long_term_storages[topology_name].demo_size() > 0)
+                    )
+                ]
+                if not active_topologies:
+                    raise ValueError("Cannot sample demo batch from an empty replay buffer.")
+                topology_counts = _allocate_integer_counts(batch_size, [1.0 for _ in active_topologies])
+                sampled_batches: list[TensorReplayBatch] = []
+                actual_topology_counts: dict[str, int] = {}
+
+                for topology_name, requested in zip(active_topologies, topology_counts):
+                    if requested <= 0:
+                        continue
+                    remaining_for_topology = int(requested)
+                    topology_samples: list[TensorReplayBatch] = []
+                    preferred_storage = self._demo_storages.get(topology_name)
+                    if preferred_storage is not None and len(preferred_storage) > 0:
+                        sample = preferred_storage.sample_up_to(
+                            remaining_for_topology,
+                            max_collapse_ratio=max_collapse_ratio,
+                            strict_max_collapse_ratio=True,
+                        )
+                        if sample is not None:
+                            topology_samples.append(sample)
+                            remaining_for_topology -= len(sample)
+                    for fallback_storage in (
+                        self._recent_storages.get(topology_name),
+                        self._long_term_storages.get(topology_name),
+                    ):
+                        if remaining_for_topology <= 0 or fallback_storage is None or len(fallback_storage) <= 0:
+                            continue
+                        sample = fallback_storage.sample_filtered_up_to(
+                            remaining_for_topology,
+                            max_collapse_ratio=max_collapse_ratio,
+                            strict_max_collapse_ratio=True,
+                            require_demo=True,
+                            require_pool_power_demo=(self.demo_behavior_source == "pool_power_mix"),
+                        )
+                        if sample is None:
+                            continue
+                        topology_samples.append(sample)
+                        remaining_for_topology -= len(sample)
+                    if not topology_samples:
+                        continue
+                    combined_topology_batch = _concat_replay_batches(topology_samples)
+                    sampled_batches.append(combined_topology_batch)
+                    actual_topology_counts[topology_name] = (
+                        actual_topology_counts.get(topology_name, 0) + len(combined_topology_batch)
+                    )
+
+                remaining = batch_size - sum(len(batch_item) for batch_item in sampled_batches)
+                while remaining > 0:
+                    made_progress = False
+                    for topology_name in active_topologies:
+                        if remaining <= 0:
+                            break
+                        sample = None
+                        preferred_storage = self._demo_storages.get(topology_name)
+                        if preferred_storage is not None and len(preferred_storage) > 0:
+                            sample = preferred_storage.sample_up_to(
+                                1,
+                                max_collapse_ratio=max_collapse_ratio,
+                                strict_max_collapse_ratio=True,
+                            )
+                        if sample is None:
+                            for fallback_storage in (
+                                self._recent_storages.get(topology_name),
+                                self._long_term_storages.get(topology_name),
+                            ):
+                                if fallback_storage is None or len(fallback_storage) <= 0:
+                                    continue
+                                sample = fallback_storage.sample_filtered_up_to(
+                                    1,
+                                    max_collapse_ratio=max_collapse_ratio,
+                                    strict_max_collapse_ratio=True,
+                                    require_demo=True,
+                                    require_pool_power_demo=(self.demo_behavior_source == "pool_power_mix"),
+                                )
+                                if sample is not None:
+                                    break
+                        if sample is None:
+                            continue
+                        sampled_batches.append(sample)
+                        actual_topology_counts[topology_name] = actual_topology_counts.get(topology_name, 0) + len(sample)
+                        remaining -= len(sample)
+                        made_progress = True
+                    if not made_progress:
+                        break
+
+                if not sampled_batches:
+                    raise ValueError("Cannot sample demo batch from an empty replay buffer.")
+                batch = _shuffle_replay_batch(_concat_replay_batches(sampled_batches), self._rng)
+                sample_size = max(len(batch), 1)
+                self._last_sample_stats = {
+                    "replay_sample_size": float(len(batch)),
+                    "replay_source_frac_demo": 1.0,
+                    **{
+                        "replay_topology_frac_{0}".format(topology_name): float(count) / float(sample_size)
+                        for topology_name, count in sorted(actual_topology_counts.items())
+                    },
+                }
 
         if device is not None:
             return batch.to(device)
@@ -298,107 +1375,93 @@ class ReplayBuffer:
 
     def state_dict(self) -> dict[str, Any]:
         with self._lock:
+            if self.replay_strategy == "fifo":
+                assert self._fifo_storage is not None
+                payload = self._fifo_storage.state_dict()
+                payload["replay_mode"] = "fifo"
+                return payload
+
             return {
+                "replay_mode": self.replay_strategy,
                 "capacity": int(self.capacity),
-                "next_index": int(self._next_index),
-                "size": int(self._size),
                 "rng_state": self._rng.bit_generator.state,
-                "initialized": self._is_initialized(),
-                "obs_buffers": {key: value.detach().cpu().clone() for key, value in self._obs_buffers.items()},
-                "next_obs_buffers": {key: value.detach().cpu().clone() for key, value in self._next_obs_buffers.items()},
-                "action_buffers": {key: value.detach().cpu().clone() for key, value in self._action_buffers.items()},
-                "reward_buffer": None if self._reward_buffer is None else self._reward_buffer.detach().cpu().clone(),
-                "done_buffer": None if self._done_buffer is None else self._done_buffer.detach().cpu().clone(),
-                "is_demo_buffer": None if self._is_demo_buffer is None else self._is_demo_buffer.detach().cpu().clone(),
-                "collapse_flag_buffer": (
-                    None if self._collapse_flag_buffer is None else self._collapse_flag_buffer.detach().cpu().clone()
-                ),
+                "topology_names": list(self.topology_names),
+                "recent_fraction": float(self.recent_fraction),
+                "long_term_fraction": float(self.long_term_fraction),
+                "demo_fraction": float(self.demo_fraction),
+                "demo_behavior_source": str(self.demo_behavior_source),
+                "recent_storages": {
+                    key: storage.state_dict() for key, storage in self._recent_storages.items()
+                },
+                "long_term_storages": {
+                    key: storage.state_dict() for key, storage in self._long_term_storages.items()
+                },
+                "demo_storages": {
+                    key: storage.state_dict() for key, storage in self._demo_storages.items()
+                },
             }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        if "buffer" in state_dict:
-            self._load_legacy_state_dict(state_dict)
-            return
-
-        capacity = int(state_dict["capacity"])
+        replay_mode = str(state_dict.get("replay_mode", "fifo"))
         with self._lock:
-            self.capacity = capacity
-            self._next_index = int(state_dict["next_index"])
-            self._size = int(state_dict["size"])
-            self._rng = np.random.default_rng()
-            self._rng.bit_generator.state = state_dict["rng_state"]
-
-            initialized = bool(state_dict.get("initialized", False))
-            if not initialized:
-                self._obs_buffers = {}
-                self._next_obs_buffers = {}
-                self._action_buffers = {}
-                self._reward_buffer = None
-                self._done_buffer = None
-                self._is_demo_buffer = None
-                self._collapse_flag_buffer = None
+            if replay_mode == "fifo" and "recent_storages" not in state_dict:
+                self.replay_strategy = "fifo"
+                self.capacity = int(state_dict["capacity"])
+                self._fifo_storage = _TensorReplayStorage(self.capacity, seed=self._seed, replacement_policy="ring")
+                self._fifo_storage.load_state_dict(state_dict)
+                self._recent_storages = {}
+                self._long_term_storages = {}
+                self._demo_storages = {}
                 return
 
-            self._obs_buffers = {
-                key: torch.as_tensor(value, device="cpu").detach().clone()
-                for key, value in dict(state_dict["obs_buffers"]).items()
-            }
-            self._next_obs_buffers = {
-                key: torch.as_tensor(value, device="cpu").detach().clone()
-                for key, value in dict(state_dict["next_obs_buffers"]).items()
-            }
-            self._action_buffers = {
-                key: torch.as_tensor(value, device="cpu").detach().clone()
-                for key, value in dict(state_dict["action_buffers"]).items()
-            }
-            reward_buffer = state_dict.get("reward_buffer")
-            done_buffer = state_dict.get("done_buffer")
-            is_demo_buffer = state_dict.get("is_demo_buffer")
-            collapse_flag_buffer = state_dict.get("collapse_flag_buffer")
-            self._reward_buffer = None if reward_buffer is None else torch.as_tensor(reward_buffer, device="cpu").detach().clone()
-            self._done_buffer = None if done_buffer is None else torch.as_tensor(done_buffer, device="cpu").detach().clone()
-            if is_demo_buffer is None:
-                self._is_demo_buffer = torch.zeros(self.capacity, dtype=torch.bool, device="cpu")
-            else:
-                self._is_demo_buffer = torch.as_tensor(is_demo_buffer, device="cpu").detach().clone()
-            if collapse_flag_buffer is None:
-                self._collapse_flag_buffer = torch.zeros(self.capacity, dtype=torch.bool, device="cpu")
-            else:
-                self._collapse_flag_buffer = torch.as_tensor(collapse_flag_buffer, device="cpu").detach().clone()
-
-    def _load_legacy_state_dict(self, state_dict: dict[str, Any]) -> None:
-        capacity = int(state_dict["capacity"])
-        buffer_state = list(state_dict["buffer"])
-        if len(buffer_state) != capacity:
-            raise ValueError("Replay buffer checkpoint is inconsistent with its declared capacity.")
-
-        with self._lock:
-            self.capacity = capacity
-            self._next_index = int(state_dict["next_index"])
-            self._size = int(state_dict["size"])
+            self.replay_strategy = replay_mode
+            self.capacity = int(state_dict["capacity"])
             self._rng = np.random.default_rng()
-            self._rng.bit_generator.state = state_dict["rng_state"]
-            self._obs_buffers = {}
-            self._next_obs_buffers = {}
-            self._action_buffers = {}
-            self._reward_buffer = None
-            self._done_buffer = None
-            self._is_demo_buffer = None
-            self._collapse_flag_buffer = None
+            if "rng_state" in state_dict:
+                self._rng.bit_generator.state = state_dict["rng_state"]
+            self.topology_names = tuple(str(item) for item in state_dict.get("topology_names", ["fixed"]))
+            self.recent_fraction = float(state_dict.get("recent_fraction", 0.50))
+            self.long_term_fraction = float(state_dict.get("long_term_fraction", 0.35))
+            self.demo_fraction = float(state_dict.get("demo_fraction", 0.15))
+            self.demo_behavior_source = str(state_dict.get("demo_behavior_source", "pool_power_mix"))
+            self._fifo_storage = None
+            self._recent_storages = {}
+            self._long_term_storages = {}
+            self._demo_storages = {}
 
-            first_transition = next((item for item in buffer_state if item is not None), None)
-            if first_transition is None:
-                return
-
-            reference_transition = self._coerce_transition(first_transition)
-            self._allocate_from_transition(reference_transition)
-            for index, transition in enumerate(buffer_state):
-                if transition is None:
-                    continue
-                tensor_transition = self._coerce_transition(transition)
-                self._validate_transition_structure(tensor_transition)
-                self._write_transition_at_index(index, tensor_transition)
+            for key, storage_state in dict(state_dict.get("recent_storages", {})).items():
+                storage = _TensorReplayStorage(int(storage_state["capacity"]), seed=self._seed, replacement_policy="ring")
+                storage.load_state_dict(dict(storage_state))
+                self._recent_storages[str(key)] = storage
+            for key, storage_state in dict(state_dict.get("long_term_storages", {})).items():
+                storage = _TensorReplayStorage(
+                    int(storage_state["capacity"]),
+                    seed=self._seed,
+                    replacement_policy="reservoir",
+                )
+                storage.load_state_dict(dict(storage_state))
+                self._long_term_storages[str(key)] = storage
+            for key, storage_state in dict(state_dict.get("demo_storages", {})).items():
+                storage = _TensorReplayStorage(int(storage_state["capacity"]), seed=self._seed, replacement_policy="ring")
+                storage.load_state_dict(dict(storage_state))
+                self._demo_storages[str(key)] = storage
 
     def __len__(self) -> int:
         with self._lock:
-            return self._size
+            if self.replay_strategy == "fifo":
+                assert self._fifo_storage is not None
+                return len(self._fifo_storage)
+            recent_size = int(sum(len(storage) for storage in self._recent_storages.values()))
+            if recent_size > 0:
+                return recent_size
+            long_term_size = int(sum(len(storage) for storage in self._long_term_storages.values()))
+            if long_term_size > 0:
+                return long_term_size
+            return int(sum(len(storage) for storage in self._demo_storages.values()))
+
+    def demo_size(self) -> int:
+        with self._lock:
+            if self.replay_strategy == "fifo":
+                assert self._fifo_storage is not None
+                return int(self._fifo_storage.demo_size(require_pool_power_demo=self.demo_behavior_source == "pool_power_mix"))
+            return int(sum(len(storage) for storage in self._demo_storages.values()))

@@ -116,3 +116,156 @@ class TensorReplayTests(unittest.TestCase):
         self.assertTrue(torch.equal(original_batch.done, restored_batch.done))
         self.assertTrue(torch.equal(original_batch.obs["resource_norm"], restored_batch.obs["resource_norm"]))
         self.assertTrue(torch.equal(original_batch.action.allocation, restored_batch.action.allocation))
+
+    def test_topology_stratified_sampling_enforces_collapse_cap_per_topology(self) -> None:
+        buffer = ReplayBuffer(
+            capacity=48,
+            seed=5,
+            replay_strategy="topology_stratified_mixed",
+            topology_names=("regular", "scale_free"),
+            recent_fraction=1.0,
+            long_term_fraction=0.0,
+            demo_fraction=0.0,
+        )
+
+        for topology_name in ("regular", "scale_free"):
+            for index in range(12):
+                collapse_flag = index < 4
+                buffer.add(
+                    TensorTransition.from_step(
+                        obs=self._make_observation(offset=0.01 * index),
+                        action=self._make_action(offset=0.01 * index),
+                        reward=float(index),
+                        next_obs=self._make_observation(offset=0.01 * (index + 1)),
+                        done=False,
+                        collapse_flag=collapse_flag,
+                        topology_name=topology_name,
+                    )
+                )
+
+        batch = buffer.sample(batch_size=12, max_collapse_ratio=0.20)
+        sample_stats = buffer.get_last_sample_stats()
+        topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64)
+        collapse_flags = batch.collapse_flag.detach().cpu().numpy().astype(np.bool_)
+
+        self.assertGreaterEqual(len(np.unique(topology_ids)), 2)
+        for topology_id in np.unique(topology_ids):
+            topology_mask = topology_ids == int(topology_id)
+            topology_collapse_ratio = float(np.mean(collapse_flags[topology_mask]))
+            self.assertLessEqual(topology_collapse_ratio, 0.20 + 1e-8)
+        self.assertIn("replay_source_frac_recent", sample_stats)
+        self.assertIn("replay_topology_frac_regular", sample_stats)
+        self.assertIn("replay_topology_frac_scale_free", sample_stats)
+
+    def test_pool_power_demo_buffer_keeps_pool_power_mix_samples(self) -> None:
+        buffer = ReplayBuffer(
+            capacity=24,
+            seed=17,
+            replay_strategy="topology_stratified_mixed",
+            topology_names=("regular",),
+            recent_fraction=0.0,
+            long_term_fraction=0.0,
+            demo_fraction=1.0,
+        )
+
+        for index in range(6):
+            buffer.add(
+                TensorTransition.from_step(
+                    obs=self._make_observation(offset=0.02 * index),
+                    action=self._make_action(offset=0.02 * index),
+                    reward=float(index),
+                    next_obs=self._make_observation(offset=0.02 * (index + 1)),
+                    done=False,
+                    is_demo=True,
+                    topology_name="regular",
+                    pool_power_demo_flag=(index % 2 == 0),
+                )
+            )
+
+        batch = buffer.sample(batch_size=4)
+        sample_stats = buffer.get_last_sample_stats()
+        self.assertTrue(torch.all(batch.pool_power_demo_flag))
+        self.assertAlmostEqual(sample_stats.get("replay_source_frac_demo", 0.0), 1.0)
+
+    def test_sample_demo_fifo_returns_only_demo_transitions(self) -> None:
+        buffer = ReplayBuffer(capacity=16, seed=23)
+        for index in range(8):
+            buffer.add(
+                TensorTransition.from_step(
+                    obs=self._make_observation(offset=0.03 * index),
+                    action=self._make_action(offset=0.03 * index),
+                    reward=float(index),
+                    next_obs=self._make_observation(offset=0.03 * (index + 1)),
+                    done=False,
+                    is_demo=(index % 2 == 0),
+                    topology_name="regular",
+                    pool_power_demo_flag=(index % 2 == 0),
+                )
+            )
+
+        batch = buffer.sample_demo(batch_size=4)
+        self.assertTrue(torch.all(batch.is_demo))
+        self.assertTrue(torch.all(batch.pool_power_demo_flag))
+
+    def test_sample_demo_topology_stratified_covers_multiple_topologies(self) -> None:
+        buffer = ReplayBuffer(
+            capacity=40,
+            seed=31,
+            replay_strategy="topology_stratified_mixed",
+            topology_names=("regular", "scale_free"),
+            recent_fraction=0.0,
+            long_term_fraction=0.0,
+            demo_fraction=1.0,
+        )
+        for topology_name in ("regular", "scale_free"):
+            for index in range(6):
+                buffer.add(
+                    TensorTransition.from_step(
+                        obs=self._make_observation(offset=0.01 * index),
+                        action=self._make_action(offset=0.01 * index),
+                        reward=float(index),
+                        next_obs=self._make_observation(offset=0.01 * (index + 1)),
+                        done=False,
+                        is_demo=True,
+                        collapse_flag=(index == 0),
+                        topology_name=topology_name,
+                        pool_power_demo_flag=True,
+                    )
+                )
+
+        batch = buffer.sample_demo(batch_size=8, max_collapse_ratio=0.20)
+        sample_stats = buffer.get_last_sample_stats()
+        topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64)
+        collapse_flags = batch.collapse_flag.detach().cpu().numpy().astype(np.bool_)
+
+        self.assertTrue(torch.all(batch.is_demo))
+        self.assertGreaterEqual(len(np.unique(topology_ids)), 2)
+        for topology_id in np.unique(topology_ids):
+            topology_mask = topology_ids == int(topology_id)
+            self.assertLessEqual(float(np.mean(collapse_flags[topology_mask])), 0.20 + 1e-8)
+        self.assertAlmostEqual(sample_stats.get("replay_source_frac_demo", 0.0), 1.0)
+
+    def test_state_dict_round_trip_preserves_new_replay_metadata(self) -> None:
+        buffer = ReplayBuffer(capacity=8, seed=123)
+        for index in range(5):
+            buffer.add(
+                TensorTransition.from_step(
+                    obs=self._make_observation(offset=0.05 * index),
+                    action=self._make_action(offset=0.05 * index),
+                    reward=float(index) + 0.5,
+                    next_obs=self._make_observation(offset=0.05 * (index + 1)),
+                    done=False,
+                    topology_name="regular" if index % 2 == 0 else "scale_free",
+                    pool_power_demo_flag=(index % 2 == 0),
+                )
+            )
+
+        state_dict = buffer.state_dict()
+        restored = ReplayBuffer(capacity=1, seed=0)
+        restored.load_state_dict(state_dict)
+
+        original_batch = buffer.sample(batch_size=4)
+        restored_batch = restored.sample(batch_size=4)
+
+        self.assertTrue(torch.equal(original_batch.topology_id, restored_batch.topology_id))
+        self.assertTrue(torch.equal(original_batch.pool_power_demo_flag, restored_batch.pool_power_demo_flag))

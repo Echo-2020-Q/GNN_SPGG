@@ -129,6 +129,64 @@ class TrainerSmokeTests(unittest.TestCase):
         self.assertIn("eval_return_mean", history[0])
         trainer.close()
 
+    def test_demo_pretrain_config_rejects_unsupported_behavior_source(self) -> None:
+        with self.assertRaises(ValueError):
+            TrainerConfig(
+                total_updates=1,
+                steps_per_update=4,
+                eval_interval=1,
+                eval_episodes=1,
+                demo_collection_behavior_source="uniform",
+                seed=0,
+            )
+
+    def test_demo_pretrain_training_smoke(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.5,
+                p_max=5.0,
+                beta=1.0,
+                episode_length=4,
+                reward=RewardConfig(lambda_payoff=1.0, lambda_cooperation=0.5, lambda_gini=0.1),
+            ),
+            make_grid_graph(2, 2),
+        )
+        policy = GNNAllocationPolicy(GNNPolicyConfig(hidden_dim=16, num_message_passing_layers=2))
+        trainer = CentralizedActorCriticTrainer(
+            env=env,
+            policy=policy,
+            config=TrainerConfig(
+                total_updates=1,
+                steps_per_update=4,
+                eval_interval=1,
+                eval_episodes=1,
+                demo_pretrain_enabled=True,
+                demo_collection_env_steps=4,
+                actor_bc_pretrain_updates=1,
+                critic_pretrain_updates=1,
+                demo_pretrain_batch_size=2,
+                replay_strategy="topology_stratified_mixed",
+                replay_topology_names=("fixed",),
+                replay_recent_fraction=0.50,
+                replay_long_term_fraction=0.35,
+                replay_demo_fraction=0.15,
+                warmup_steps=0,
+                seed=0,
+            ),
+        )
+
+        try:
+            history = trainer.train(num_updates=1)
+            self.assertEqual(len(history), 1)
+            self.assertTrue(np.isfinite(history[0]["loss"]))
+            self.assertIsNotNone(trainer.demo_pretrain_summary)
+            self.assertGreater(float(trainer.demo_pretrain_summary["demo_replay_size_after_collection"]), 0.0)
+            self.assertEqual(int(trainer.demo_pretrain_summary["actor_bc_updates"]), 1)
+            self.assertEqual(int(trainer.demo_pretrain_summary["critic_pretrain_updates"]), 1)
+        finally:
+            trainer.close()
+
     def test_parallel_worker_training_smoke(self) -> None:
         env = SPGGEnv(
             SPGGConfig(

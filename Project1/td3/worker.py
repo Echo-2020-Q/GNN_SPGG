@@ -29,7 +29,14 @@ from Project1.policies.rule_based import (
 )
 
 from .config import DomainRandomizationConfig, GraphTD3Config, WorkerConfig
-from .data import REPLAY_OBSERVATION_DTYPES, TensorActionRecord, TensorReplayActionRecord, TensorReplayBatch, TensorTransition, stack_tensor_transitions
+from .data import (
+    REPLAY_OBSERVATION_DTYPES,
+    TensorActionRecord,
+    TensorReplayActionRecord,
+    TensorReplayBatch,
+    TensorTransition,
+    stack_tensor_transitions,
+)
 from .exploration import LogitSpaceExplorer
 
 
@@ -304,6 +311,8 @@ def _serialize_replay_batch_to_shared_memory(batch: TensorReplayBatch) -> tuple[
             "done": _store_tensor(batch.done),
             "is_demo": _store_tensor(batch.is_demo),
             "collapse_flag": _store_tensor(batch.collapse_flag),
+            "topology_id": _store_tensor(batch.topology_id),
+            "pool_power_demo_flag": _store_tensor(batch.pool_power_demo_flag),
         },
         handles,
     )
@@ -330,6 +339,8 @@ def _deserialize_replay_batch_from_shared_memory(
             done=_load_tensor(payload["done"]),
             is_demo=_load_tensor(payload["is_demo"]),
             collapse_flag=_load_tensor(payload["collapse_flag"]),
+            topology_id=_load_tensor(payload["topology_id"]),
+            pool_power_demo_flag=_load_tensor(payload["pool_power_demo_flag"]),
         )
     except Exception:
         _close_shared_memory_handles(handles, unlink=False)
@@ -555,7 +566,14 @@ class RolloutWorker:
                 self.envs.append(env)
         self.current_warmup_behavior_sources = list(current_warmup_behavior_source_list)
 
-    def collect(self, num_steps: int, global_warmup_steps: int = 0) -> RolloutResult:
+    def collect(
+        self,
+        num_steps: int,
+        global_warmup_steps: int = 0,
+        forced_behavior_source: str | None = None,
+        mark_as_demo: bool | None = None,
+        count_env_steps: bool = True,
+    ) -> RolloutResult:
         collect_start = perf_counter()
         rewards: list[float] = []
         completed_episodes = 0
@@ -584,6 +602,7 @@ class RolloutWorker:
 
             actions_by_slot: dict[int, TensorActionRecord] = {}
             is_demo_by_slot: dict[int, bool] = {}
+            behavior_source_by_slot: dict[int, str] = {}
             actor_slots: list[int] = []
             actor_observations: list[dict[str, np.ndarray]] = []
             actor_behavior_sources: list[str] = []
@@ -592,11 +611,20 @@ class RolloutWorker:
             for batch_offset, slot_index in enumerate(batch_slots):
                 observation = self.observations[slot_index]
                 assert observation is not None
+                if forced_behavior_source is not None:
+                    actions_by_slot[slot_index] = self._sample_warmup_action(observation, str(forced_behavior_source))
+                    is_demo_by_slot[slot_index] = True if mark_as_demo is None else bool(mark_as_demo)
+                    behavior_source_by_slot[slot_index] = str(forced_behavior_source)
+                    behavior_source_counts[str(forced_behavior_source)] = (
+                        behavior_source_counts.get(str(forced_behavior_source), 0) + 1
+                    )
+                    continue
                 is_warmup = (collected_steps + batch_offset) < warmup_budget
                 if is_warmup:
                     behavior_source = self._resolve_warmup_behavior_source(slot_index)
                     actions_by_slot[slot_index] = self._sample_warmup_action(observation, behavior_source)
                     is_demo_by_slot[slot_index] = True
+                    behavior_source_by_slot[slot_index] = behavior_source
                     behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
                     continue
                 actor_slots.append(slot_index)
@@ -673,6 +701,7 @@ class RolloutWorker:
                     actions_by_slot[slot_index] = _slice_action_record(batched_action, actor_batch_index)
                     is_demo_by_slot[slot_index] = False
                     behavior_source = actor_behavior_sources[actor_batch_index]
+                    behavior_source_by_slot[slot_index] = behavior_source
                     behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
 
             for slot_index in batch_slots:
@@ -702,6 +731,11 @@ class RolloutWorker:
                     done=bool(done),
                     is_demo=bool(is_demo_by_slot.get(slot_index, False)),
                     collapse_flag=collapse_flag,
+                    topology_name=str(self.env_metadatas[slot_index].get("network_type", "unknown")),
+                    pool_power_demo_flag=bool(
+                        is_demo_by_slot.get(slot_index, False)
+                        and behavior_source_by_slot.get(slot_index) == "pool_power_mix"
+                    ),
                 )
                 transition_encode_seconds += perf_counter() - transition_encode_start
                 transitions.append(transition)
@@ -713,7 +747,8 @@ class RolloutWorker:
                 mean_payoffs.append(float(np.asarray(info.get("payoff", np.zeros_like(next_observation["resources"]))).mean()))
                 mean_pool_growns.append(float(np.asarray(next_observation["pool_grown"]).mean()))
                 mean_pool_raws.append(float(np.asarray(next_observation["pool_raw"]).mean()))
-                self.total_env_steps += 1
+                if count_env_steps:
+                    self.total_env_steps += 1
                 collected_steps += 1
                 self.observations[slot_index] = next_observation
                 if done:
@@ -1118,6 +1153,9 @@ def _parallel_rollout_worker_main(
                     collect_result = worker.collect(
                         num_steps=int(message["num_steps"]),
                         global_warmup_steps=int(message.get("global_warmup_steps", 0)),
+                        forced_behavior_source=message.get("forced_behavior_source"),
+                        mark_as_demo=message.get("mark_as_demo"),
+                        count_env_steps=bool(message.get("count_env_steps", True)),
                     )
                     shared_memory_serialize_start = perf_counter()
                     serialized_result, shared_memory_handles = _serialize_rollout_result(collect_result)
@@ -1244,7 +1282,14 @@ class ParallelRolloutWorker:
             }
         )
 
-    def start_collect(self, num_steps: int, global_warmup_steps: int = 0) -> None:
+    def start_collect(
+        self,
+        num_steps: int,
+        global_warmup_steps: int = 0,
+        forced_behavior_source: str | None = None,
+        mark_as_demo: bool | None = None,
+        count_env_steps: bool = True,
+    ) -> None:
         if self._collect_inflight:
             raise RuntimeError("Collect request already in flight for worker {0}.".format(self.config.worker_id))
         self._connection.send(
@@ -1252,6 +1297,9 @@ class ParallelRolloutWorker:
                 "command": "collect",
                 "num_steps": int(num_steps),
                 "global_warmup_steps": int(global_warmup_steps),
+                "forced_behavior_source": forced_behavior_source,
+                "mark_as_demo": mark_as_demo,
+                "count_env_steps": bool(count_env_steps),
             }
         )
         self._collect_inflight = True
@@ -1280,8 +1328,21 @@ class ParallelRolloutWorker:
         finally:
             self._collect_inflight = False
 
-    def collect(self, num_steps: int, global_warmup_steps: int = 0) -> RolloutResult:
-        self.start_collect(num_steps=num_steps, global_warmup_steps=global_warmup_steps)
+    def collect(
+        self,
+        num_steps: int,
+        global_warmup_steps: int = 0,
+        forced_behavior_source: str | None = None,
+        mark_as_demo: bool | None = None,
+        count_env_steps: bool = True,
+    ) -> RolloutResult:
+        self.start_collect(
+            num_steps=num_steps,
+            global_warmup_steps=global_warmup_steps,
+            forced_behavior_source=forced_behavior_source,
+            mark_as_demo=mark_as_demo,
+            count_env_steps=count_env_steps,
+        )
         return self.finish_collect()
 
     def state_dict(self) -> dict[str, Any]:

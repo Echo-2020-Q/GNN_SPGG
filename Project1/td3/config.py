@@ -32,6 +32,12 @@ class GraphTD3Config:
     batch_size: int = 32
     graph_batch_chunk_size: int = 16
     replay_capacity: int = 200_000
+    replay_strategy: str = "fifo"
+    replay_topology_names: tuple[str, ...] = ("fixed",)
+    replay_recent_fraction: float = 0.50
+    replay_long_term_fraction: float = 0.35
+    replay_demo_fraction: float = 0.15
+    replay_demo_behavior_source: str = "pool_power_mix"
     warmup_steps: int = 1_000
     warmup_behavior_mode: str = "random_only"
     warmup_selection_granularity: str = "per_episode"
@@ -48,6 +54,15 @@ class GraphTD3Config:
     warmup_actor_bc_coef: float = 1.0
     actor_demo_bc_coef: float = 0.25
     actor_demo_bc_decay_end_fraction: float = 0.50
+    demo_pretrain_enabled: bool = False
+    demo_collection_env_steps: int = 0
+    demo_collection_behavior_source: str = "pool_power_mix"
+    demo_collection_use_domain_randomization: bool = True
+    demo_collection_network_types: tuple[str, ...] = ()
+    actor_bc_pretrain_updates: int = 0
+    critic_pretrain_updates: int = 0
+    demo_pretrain_batch_size: int | None = None
+    demo_dataset_save_path: str | None = None
     train_every: int = 1
     gradient_steps_per_update: int = 1
     policy_delay: int = 2
@@ -126,6 +141,29 @@ class GraphTD3Config:
             raise ValueError("graph_batch_chunk_size must be positive.")
         if self.replay_capacity <= 0:
             raise ValueError("replay_capacity must be positive.")
+        if self.replay_strategy not in {"fifo", "topology_stratified_mixed"}:
+            raise ValueError("replay_strategy must be one of {'fifo', 'topology_stratified_mixed'}.")
+        if not self.replay_topology_names:
+            raise ValueError("replay_topology_names must contain at least one entry.")
+        if self.replay_recent_fraction < 0.0:
+            raise ValueError("replay_recent_fraction must be non-negative.")
+        if self.replay_long_term_fraction < 0.0:
+            raise ValueError("replay_long_term_fraction must be non-negative.")
+        if self.replay_demo_fraction < 0.0:
+            raise ValueError("replay_demo_fraction must be non-negative.")
+        if self.replay_strategy == "topology_stratified_mixed":
+            total_replay_fraction = (
+                float(self.replay_recent_fraction)
+                + float(self.replay_long_term_fraction)
+                + float(self.replay_demo_fraction)
+            )
+            if abs(total_replay_fraction - 1.0) > 1e-6:
+                raise ValueError(
+                    "For topology_stratified_mixed replay, replay_recent_fraction + "
+                    "replay_long_term_fraction + replay_demo_fraction must sum to 1."
+                )
+        if self.replay_demo_behavior_source not in {"pool_power_mix"}:
+            raise ValueError("replay_demo_behavior_source currently only supports 'pool_power_mix'.")
         if self.warmup_steps < 0:
             raise ValueError("warmup_steps must be non-negative.")
         if self.warmup_behavior_mode not in {"random_only", "heuristic_mix"}:
@@ -158,6 +196,21 @@ class GraphTD3Config:
             raise ValueError("actor_demo_bc_coef must be non-negative.")
         if self.actor_demo_bc_decay_end_fraction < 0.0 or self.actor_demo_bc_decay_end_fraction > 1.0:
             raise ValueError("actor_demo_bc_decay_end_fraction must be in [0, 1].")
+        if not isinstance(self.demo_pretrain_enabled, bool):
+            raise ValueError("demo_pretrain_enabled must be a bool.")
+        if self.demo_collection_env_steps < 0:
+            raise ValueError("demo_collection_env_steps must be non-negative.")
+        if self.demo_collection_behavior_source not in {"pool_power_mix"}:
+            raise ValueError("demo_collection_behavior_source currently only supports 'pool_power_mix'.")
+        if not isinstance(self.demo_collection_use_domain_randomization, bool):
+            raise ValueError("demo_collection_use_domain_randomization must be a bool.")
+        self.demo_collection_network_types = tuple(str(item) for item in self.demo_collection_network_types if str(item))
+        if self.actor_bc_pretrain_updates < 0:
+            raise ValueError("actor_bc_pretrain_updates must be non-negative.")
+        if self.critic_pretrain_updates < 0:
+            raise ValueError("critic_pretrain_updates must be non-negative.")
+        if self.demo_pretrain_batch_size is not None and self.demo_pretrain_batch_size <= 0:
+            raise ValueError("demo_pretrain_batch_size must be positive when provided.")
         if self.warmup_behavior_mode == "heuristic_mix":
             warmup_mix_total = (
                 self.warmup_uniform_prob

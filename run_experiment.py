@@ -192,7 +192,7 @@ BASE_EXPERIMENT = {
 
         # P_max：资源池增长后的饱和上限。
         # 仅当 p_mode == "constant" 时使用。
-        "p_max": 100.0,#40
+        "p_max": 250.0,#40
 
         # 动态公共池容量系数 p_c。
         # 仅当 p_mode == "dynamic" 时使用。
@@ -339,7 +339,7 @@ BASE_EXPERIMENT = {
         # 程序内部会按：
         #   total_updates = ceil((warmup_env_steps + total_env_steps) / (num_workers * effective_steps_per_update))
         # 自动换算成 update 次数。
-        "total_env_steps": 30_000_000,#episode需要用总的steps除以episode_length=150
+        "total_env_steps": 20_000_000,#episode需要用总的steps除以episode_length=150
 
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
@@ -356,7 +356,7 @@ BASE_EXPERIMENT = {
 
         # 每个 worker 在每次训练迭代中收集多少个环境步。
         # 这是“每个 worker 每个 update”的采样粒度，不是全局总步数。
-        "steps_per_update": 800,  # episode_length=100
+        "steps_per_update": 400,  # episode_length=100
 
         # 是否强制把每次训练迭代的采样长度设为一个完整 episode。
         # 为 True 时，会忽略上面的 steps_per_update，改为使用 dynamics.episode_length。
@@ -459,7 +459,33 @@ BASE_EXPERIMENT = {
         "critic_q_hidden_dim": 64,
 
         # replay buffer 容量。
-        "replay_capacity": 600_000, # 300k 步=0.3M 步
+        "replay_capacity": 1_000_000, # 300k 步=0.3M 步
+
+        # replay 采样策略：
+        # - "fifo"                     ：原始单一 FIFO replay
+        # - "topology_stratified_mixed": 按拓扑分层，并混合 recent / long_term / demo 三类样本
+        "replay_strategy": "topology_stratified_mixed",
+
+        # replay 中允许显式分层的拓扑类型集合。
+        # 设为 None 时，自动继承 domain_randomization.network_types；
+        # 若 domain_randomization 未开启，则自动退回到 ["fixed"]。
+        "replay_topology_names": None,
+
+        # topology_stratified_mixed 下，recent 缓冲区容量占比。
+        # recent 用普通 FIFO，负责跟踪当前训练分布。
+        "replay_recent_fraction": 0.50,
+
+        # topology_stratified_mixed 下，long_term 缓冲区容量占比。
+        # long_term 用 reservoir 保留全历史代表样本，负责减轻遗忘。
+        "replay_long_term_fraction": 0.35,
+
+        # topology_stratified_mixed 下，demo 缓冲区容量占比。
+        # 当前 demo 缓冲区专门保留 pool_power_mix 产生的样本。
+        "replay_demo_fraction": 0.15,
+
+        # demo 缓冲区收集哪类 demo 行为源。
+        # 当前只支持 "pool_power_mix"。
+        "replay_demo_behavior_source": "pool_power_mix",
 
         # learner 每次更新采样的 batch 大小。
         "batch_size": 512,
@@ -490,18 +516,18 @@ BASE_EXPERIMENT = {
 
         # warm-up 中常数混合启发式的采样权重。
         # 行为形式：omega * uniform + (1 - omega) * proportional。
-        "warmup_constant_mix_prob": 0.55,
+        "warmup_constant_mix_prob": 0.05,
 
         # warm-up 中 pool 驱动混合启发式的采样权重。
         # 行为形式：omega_i * uniform + (1 - omega_i) * proportional，
         # 其中 omega_i = (clip(pool_raw_i, 0, p_max) / p_max) ^ k。
-        "warmup_pool_power_mix_prob": 0.5,
+        "warmup_pool_power_mix_prob": 0.8,
 
         # warm-up 中随机 logits 行为的采样权重。
-        "warmup_random_logits_prob": 0.15,
+        "warmup_random_logits_prob": 0.05,
 
         # 常数混合启发式中的 omega。
-        "warmup_constant_mix_omega": 0.2,
+        "warmup_constant_mix_omega": 0.5,
 
         # pool 驱动混合启发式中的幂指数 k。
         "warmup_pool_power_k": 19.0,
@@ -526,11 +552,48 @@ BASE_EXPERIMENT = {
         # 例如 0.50 表示到总 rollout 步数的 20% 时衰减到 0。
         "actor_demo_bc_decay_end_fraction": 0.50,
 
+        # 是否在正式 online TD3 训练前，先执行 demo 预训练三阶段：
+        # 1) 固定专家轨迹收集
+        # 2) actor BC 预训练
+        # 3) critic 预训练
+        "demo_pretrain_enabled": True,
+
+        # demo 预收集的总环境步数。
+        # 这些步数不会计入 online warm-up，也不会计入 total_env_steps。
+        "demo_collection_env_steps": 800_000,
+
+        # demo 预收集使用的行为源。
+        # 当前 v1 只支持 "pool_power_mix"。
+        "demo_collection_behavior_source": "pool_power_mix",
+
+        # demo 预收集时是否启用 domain randomization。
+        # True 时默认覆盖 domain_randomization.network_types 的全域拓扑；
+        # False 时退回到当前 base env 的固定图。
+        "demo_collection_use_domain_randomization": True,
+
+        # demo 预收集允许覆盖的拓扑类型子集。
+        # 设为 None 时，自动继承 domain_randomization.network_types。
+        "demo_collection_network_types": None,
+
+        # demo 预收集结束后，纯 BC 预训练 actor 的更新次数。
+        "actor_bc_pretrain_updates": 2000,
+
+        # actor BC 预训练完成后，critic 仅用 demo transition 做 TD 回归的更新次数。
+        "critic_pretrain_updates": 2000,
+
+        # demo 预训练的 batch 大小。
+        # 设为 None 时，回退到 training.batch_size。
+        "demo_pretrain_batch_size": 512,
+
+        # 可选：把 demo 预收集得到的 replay batch 落盘成一个 .pt 文件。
+        # 设为 None 时，只放进 replay，不额外保存到磁盘。
+        "demo_dataset_save_path": None,
+
         # 每隔多少个外层训练迭代做一次 learner 更新。
         "train_every": 1,
 
         # 每个外层训练迭代做多少次梯度更新。
-        "gradient_steps_per_update": 16,
+        "gradient_steps_per_update": 24,
 
         # TD3 delayed policy update 频率。
         "policy_delay": 4,
@@ -539,6 +602,7 @@ BASE_EXPERIMENT = {
         "replay_collapse_fc_threshold": 0.10,
 
         # replay 采样时允许的塌缩样本最大占比。
+        # 在 topology_stratified_mixed 模式下，这个上限会落实到“每个拓扑单独采样时”。
         "replay_max_collapse_sample_ratio": 0.20,
 
         # target network soft update 系数 tau。
@@ -733,9 +797,9 @@ BASE_EXPERIMENT = {
             {
                 "label": "regular__small_world",
                 "portion": 0.15,
-                "train_network_types": ["regular","small_world"],
-                "train_network_type_weights": [0.5, 0.5],
-                "eval_network_types": ["regular", "small_world"],
+                "train_network_types": ["regular","small_world","erdos_renyi"],
+                "train_network_type_weights": [0.4, 0.4,0.2],
+                "eval_network_types": ["regular", "small_world","erdos_renyi"],
             },
             {
                 "label": "regular__scale_free__erdos_renyi",
@@ -1541,6 +1605,15 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
 
     training = spec["training"]
     training_schedule = _resolve_training_schedule(spec)
+    replay_topology_names_override = training.get("replay_topology_names")
+    if replay_topology_names_override is None:
+        randomization = spec.get("domain_randomization", {})
+        if bool(randomization.get("enabled", False)):
+            replay_topology_names = tuple(str(item) for item in randomization.get("network_types", ("fixed",)))
+        else:
+            replay_topology_names = ("fixed",)
+    else:
+        replay_topology_names = tuple(str(item) for item in replay_topology_names_override)
     return TrainerConfig(
         total_updates=training_schedule["total_updates"],
         steps_per_update=training_schedule["effective_steps_per_update"],
@@ -1561,6 +1634,12 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         critic_pool_hidden_dim=training.get("critic_pool_hidden_dim"),
         critic_q_hidden_dim=training.get("critic_q_hidden_dim"),
         replay_capacity=training["replay_capacity"],
+        replay_strategy=training.get("replay_strategy", "fifo"),
+        replay_topology_names=replay_topology_names,
+        replay_recent_fraction=training.get("replay_recent_fraction", 0.50),
+        replay_long_term_fraction=training.get("replay_long_term_fraction", 0.35),
+        replay_demo_fraction=training.get("replay_demo_fraction", 0.15),
+        replay_demo_behavior_source=training.get("replay_demo_behavior_source", "pool_power_mix"),
         batch_size=training["batch_size"],
         graph_batch_chunk_size=training.get("graph_batch_chunk_size", 16),
         warmup_steps=training_schedule["warmup_env_steps"],
@@ -1579,6 +1658,15 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         warmup_actor_bc_coef=training.get("warmup_actor_bc_coef", 1.0),
         actor_demo_bc_coef=training.get("actor_demo_bc_coef", 0.25),
         actor_demo_bc_decay_end_fraction=training.get("actor_demo_bc_decay_end_fraction", 0.50),
+        demo_pretrain_enabled=training.get("demo_pretrain_enabled", False),
+        demo_collection_env_steps=training.get("demo_collection_env_steps", 0),
+        demo_collection_behavior_source=training.get("demo_collection_behavior_source", "pool_power_mix"),
+        demo_collection_use_domain_randomization=training.get("demo_collection_use_domain_randomization", True),
+        demo_collection_network_types=tuple(str(item) for item in (training.get("demo_collection_network_types") or ())),
+        actor_bc_pretrain_updates=training.get("actor_bc_pretrain_updates", 0),
+        critic_pretrain_updates=training.get("critic_pretrain_updates", 0),
+        demo_pretrain_batch_size=training.get("demo_pretrain_batch_size"),
+        demo_dataset_save_path=training.get("demo_dataset_save_path"),
         train_every=training["train_every"],
         gradient_steps_per_update=training["gradient_steps_per_update"],
         policy_delay=training["policy_delay"],
@@ -2427,6 +2515,7 @@ def _format_console_recent_stats_lines(
         ("critic_lr", "critic_lr"),
         ("replay_size", "replay_size"),
         ("replay_demo_frac", "replay_demo"),
+        ("replay_pool_power_demo_frac", "replay_pool_demo"),
         ("replay_collapse_frac", "replay_collapse"),
         ("profile_rollout_steps_per_second", "rollout_sps"),
         ("profile_rollout_collect_seconds", "rollout_collect_s"),
@@ -2470,6 +2559,23 @@ def _format_console_recent_stats_lines(
         if value is None:
             continue
         metric_rows.append((label, value))
+    dynamic_replay_keys = sorted(
+        {
+            str(key)
+            for metrics in recent_metrics
+            for key in metrics.keys()
+            if str(key).startswith("replay_source_frac_") or str(key).startswith("replay_topology_frac_")
+        }
+    )
+    for metric_key in dynamic_replay_keys:
+        value = _mean_of_recent_metrics(recent_metrics, metric_key)
+        if value is None:
+            continue
+        if metric_key.startswith("replay_source_frac_"):
+            label = "src_{0}".format(metric_key[len("replay_source_frac_"):])
+        else:
+            label = "topo_{0}".format(metric_key[len("replay_topology_frac_"):])
+        metric_rows.append((label, value))
 
     lines = [_console_info(header)]
     if not metric_rows:
@@ -2502,6 +2608,17 @@ def _tensorboard_tag_for_metric(metric_name: str) -> Optional[str]:
         return None
     if metric_name.startswith("behavior_frac_"):
         return "behavior/{0}".format(metric_name[len("behavior_frac_"):])
+    if metric_name.startswith("replay_source_frac_"):
+        return "replay/source_frac/{0}".format(metric_name[len("replay_source_frac_"):])
+    if metric_name.startswith("replay_topology_frac_"):
+        return "replay/topology_frac/{0}".format(metric_name[len("replay_topology_frac_"):])
+    if metric_name in {
+        "replay_demo_frac",
+        "replay_pool_power_demo_frac",
+        "replay_collapse_frac",
+        "replay_sample_size",
+    }:
+        return "replay/{0}".format(metric_name)
     if metric_name.startswith("rollout_"):
         return "train_global/{0}".format(metric_name[len("rollout_"):])
     if metric_name.startswith("profile_"):
@@ -2598,6 +2715,18 @@ def _log_tensorboard_static_metadata(
         "static/training/batch_size": float(spec["training"]["batch_size"]),
         "static/training/graph_batch_chunk_size": float(spec["training"].get("graph_batch_chunk_size", 16)),
         "static/training/replay_capacity": float(spec["training"]["replay_capacity"]),
+        "static/training/replay_recent_fraction": float(spec["training"].get("replay_recent_fraction", 0.50)),
+        "static/training/replay_long_term_fraction": float(spec["training"].get("replay_long_term_fraction", 0.35)),
+        "static/training/replay_demo_fraction": float(spec["training"].get("replay_demo_fraction", 0.15)),
+        "static/training/replay_max_collapse_sample_ratio": float(
+            spec["training"].get("replay_max_collapse_sample_ratio", 0.20)
+        ),
+        "static/training/demo_pretrain_enabled": float(
+            1.0 if spec["training"].get("demo_pretrain_enabled", False) else 0.0
+        ),
+        "static/training/demo_collection_env_steps": float(spec["training"].get("demo_collection_env_steps", 0)),
+        "static/training/actor_bc_pretrain_updates": float(spec["training"].get("actor_bc_pretrain_updates", 0)),
+        "static/training/critic_pretrain_updates": float(spec["training"].get("critic_pretrain_updates", 0)),
         "static/training/rollout_inference_batch_timeout_ms": float(
             spec["training"].get("rollout_inference_batch_timeout_ms", 2.0)
         ),
@@ -2619,6 +2748,41 @@ def _log_tensorboard_static_metadata(
         str(spec["training"].get("rollout_inference_mode", "local")),
         0,
     )
+    writer.add_text("static/training/replay_strategy", str(spec["training"].get("replay_strategy", "fifo")), 0)
+    writer.add_text(
+        "static/training/replay_demo_behavior_source",
+        str(spec["training"].get("replay_demo_behavior_source", "pool_power_mix")),
+        0,
+    )
+    writer.add_text(
+        "static/training/demo_collection_behavior_source",
+        str(spec["training"].get("demo_collection_behavior_source", "pool_power_mix")),
+        0,
+    )
+    replay_topology_names_value = spec["training"].get("replay_topology_names")
+    if replay_topology_names_value is None:
+        randomization = spec.get("domain_randomization", {})
+        if bool(randomization.get("enabled", False)):
+            replay_topology_names_text = ",".join(str(item) for item in randomization.get("network_types", ("fixed",)))
+        else:
+            replay_topology_names_text = "fixed"
+    else:
+        replay_topology_names_text = ",".join(str(item) for item in replay_topology_names_value)
+    writer.add_text("static/training/replay_topology_names", replay_topology_names_text, 0)
+    demo_collection_network_types_value = spec["training"].get("demo_collection_network_types")
+    if demo_collection_network_types_value is None:
+        randomization = spec.get("domain_randomization", {})
+        if bool(spec["training"].get("demo_collection_use_domain_randomization", True)) and bool(
+            randomization.get("enabled", False)
+        ):
+            demo_collection_network_types_text = ",".join(
+                str(item) for item in randomization.get("network_types", ("fixed",))
+            )
+        else:
+            demo_collection_network_types_text = "fixed"
+    else:
+        demo_collection_network_types_text = ",".join(str(item) for item in demo_collection_network_types_value)
+    writer.add_text("static/training/demo_collection_network_types", demo_collection_network_types_text, 0)
 
 
 def _log_tensorboard_custom_layout(writer: Any) -> None:
@@ -2634,6 +2798,30 @@ def _log_tensorboard_custom_layout(writer: Any) -> None:
             }
         }
     )
+
+
+def _log_tensorboard_demo_pretrain_summary(
+    writer: Any,
+    summary: Mapping[str, Any],
+) -> None:
+    scalar_keys = {
+        "demo_collection_env_steps": "demo_pretrain/demo_collection_env_steps",
+        "demo_replay_size_after_collection": "demo_pretrain/demo_replay_size_after_collection",
+        "actor_bc_updates": "demo_pretrain/actor_bc_updates",
+        "critic_pretrain_updates": "demo_pretrain/critic_pretrain_updates",
+        "actor_bc_loss_last": "demo_pretrain/actor_bc_loss_last",
+        "critic_loss_last": "demo_pretrain/critic_loss_last",
+        "seconds_collection": "demo_pretrain/seconds_collection",
+        "seconds_actor_bc": "demo_pretrain/seconds_actor_bc",
+        "seconds_critic": "demo_pretrain/seconds_critic",
+    }
+    for key, tag in scalar_keys.items():
+        if key in summary and summary[key] is not None:
+            writer.add_scalar(tag, float(summary[key]), 0)
+    if "behavior_source" in summary and summary["behavior_source"] is not None:
+        writer.add_text("demo_pretrain/behavior_source", str(summary["behavior_source"]), 0)
+    if "dataset_path" in summary and summary["dataset_path"] is not None:
+        writer.add_text("demo_pretrain/dataset_path", str(summary["dataset_path"]), 0)
 
 
 def _log_tensorboard_update_metrics(
@@ -2936,6 +3124,42 @@ def run_gnn_training_mode(
             )
         )
         print(
+            "Replay CFG: strategy={0}, capacity={1}, topology_names={2}, recent={3:.2f}, long_term={4:.2f}, demo={5:.2f}, demo_source={6}, collapse_cap_per_topology={7:.2f}".format(
+                trainer_config.replay_strategy,
+                trainer_config.replay_capacity,
+                ",".join(trainer_config.replay_topology_names),
+                trainer_config.replay_recent_fraction,
+                trainer_config.replay_long_term_fraction,
+                trainer_config.replay_demo_fraction,
+                trainer_config.replay_demo_behavior_source,
+                trainer_config.replay_max_collapse_sample_ratio,
+            )
+        )
+        if bool(trainer_config.demo_pretrain_enabled):
+            demo_collection_network_types = (
+                ",".join(trainer_config.demo_collection_network_types)
+                if trainer_config.demo_collection_network_types
+                else (
+                    ",".join(randomization_config.network_types)
+                    if bool(trainer_config.demo_collection_use_domain_randomization) and bool(randomization_config.enabled)
+                    else "fixed"
+                )
+            )
+            print(
+                "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, actor_bc_updates={4}, critic_pretrain_updates={5}, batch_size={6}, dataset_path={7}".format(
+                    trainer_config.demo_collection_env_steps,
+                    trainer_config.demo_collection_behavior_source,
+                    trainer_config.demo_collection_use_domain_randomization,
+                    demo_collection_network_types,
+                    trainer_config.actor_bc_pretrain_updates,
+                    trainer_config.critic_pretrain_updates,
+                    trainer_config.demo_pretrain_batch_size
+                    if trainer_config.demo_pretrain_batch_size is not None
+                    else trainer_config.batch_size,
+                    trainer_config.demo_dataset_save_path or "None",
+                )
+            )
+        print(
             "Eval CFG  : mode={0}, periodic_eval_episodes={1}, eval_interval_env_steps={2} ({3}), eval_interval_updates={4}".format(
                 "custom_env_families({0})".format(len(eval_env_factories))
                 if eval_env_factories is not None
@@ -3124,6 +3348,26 @@ def run_gnn_training_mode(
             num_updates=trainer_config.total_updates,
             on_update=_on_update,
         )
+        demo_pretrain_summary = (
+            dict(trainer.demo_pretrain_summary)
+            if getattr(trainer, "demo_pretrain_summary", None) is not None
+            else None
+        )
+        if demo_pretrain_summary is not None:
+            print(
+                "Demo Summary: replay={0:.0f}, actor_bc_updates={1:.0f}, critic_pretrain_updates={2:.0f}, actor_bc_loss_last={3:.6f}, critic_loss_last={4:.6f}, seconds={{collection:{5:.3f}, actor_bc:{6:.3f}, critic:{7:.3f}}}".format(
+                    float(demo_pretrain_summary.get("demo_replay_size_after_collection", 0.0)),
+                    float(demo_pretrain_summary.get("actor_bc_updates", 0.0)),
+                    float(demo_pretrain_summary.get("critic_pretrain_updates", 0.0)),
+                    float(demo_pretrain_summary.get("actor_bc_loss_last", 0.0)),
+                    float(demo_pretrain_summary.get("critic_loss_last", 0.0)),
+                    float(demo_pretrain_summary.get("seconds_collection", 0.0)),
+                    float(demo_pretrain_summary.get("seconds_actor_bc", 0.0)),
+                    float(demo_pretrain_summary.get("seconds_critic", 0.0)),
+                )
+            )
+            if writer is not None:
+                _log_tensorboard_demo_pretrain_summary(writer, demo_pretrain_summary)
         if history and save_final_checkpoint:
             final_metrics = history[-1]
             _save_checkpoint(
@@ -3177,6 +3421,7 @@ def run_gnn_training_mode(
             "run_mode": spec["run_mode"],
             "network_type": spec["network"]["type"],
             "trainer_config": asdict(trainer_config),
+            "demo_pretrain_summary": demo_pretrain_summary,
             "history": history,
             "post_training_eval_model_source": post_training_eval_model_source,
             "post_training_eval_checkpoint": post_training_eval_checkpoint,

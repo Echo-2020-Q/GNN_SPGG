@@ -12,6 +12,17 @@ from Project1.env import Observation
 
 TensorObservation = dict[str, Tensor]
 
+TOPOLOGY_NAME_TO_ID: dict[str, int] = {
+    "regular": 0,
+    "erdos_renyi": 1,
+    "small_world": 2,
+    "scale_free": 3,
+    "grid": 4,
+    "fixed": 5,
+    "unknown": 6,
+}
+TOPOLOGY_ID_TO_NAME: dict[int, str] = {value: key for key, value in TOPOLOGY_NAME_TO_ID.items()}
+
 # First-stage tensor replay stores only the observation fields consumed by the
 # actor/critic training path. This keeps semantics unchanged while removing
 # unnecessary CPU memory traffic from unused observation arrays.
@@ -46,6 +57,16 @@ def observation_to_replay_tensors(observation: Mapping[str, Any]) -> TensorObser
             device="cpu",
         ).detach().clone()
     return tensor_observation
+
+
+def topology_name_to_id(name: str | None) -> int:
+    if name is None:
+        return int(TOPOLOGY_NAME_TO_ID["unknown"])
+    return int(TOPOLOGY_NAME_TO_ID.get(str(name), TOPOLOGY_NAME_TO_ID["unknown"]))
+
+
+def topology_id_to_name(topology_id: int) -> str:
+    return str(TOPOLOGY_ID_TO_NAME.get(int(topology_id), "unknown"))
 
 
 @dataclass
@@ -164,6 +185,8 @@ class TensorTransition:
     done: Tensor
     is_demo: Tensor
     collapse_flag: Tensor
+    topology_id: Tensor
+    pool_power_demo_flag: Tensor
 
     @classmethod
     def from_step(
@@ -175,6 +198,8 @@ class TensorTransition:
         done: bool,
         is_demo: bool = False,
         collapse_flag: bool = False,
+        topology_name: str | None = None,
+        pool_power_demo_flag: bool = False,
     ) -> "TensorTransition":
         if isinstance(action, TensorActionRecord):
             replay_action = TensorReplayActionRecord(
@@ -190,6 +215,8 @@ class TensorTransition:
             done=torch.tensor(float(done), dtype=torch.float32, device="cpu"),
             is_demo=torch.tensor(bool(is_demo), dtype=torch.bool, device="cpu"),
             collapse_flag=torch.tensor(bool(collapse_flag), dtype=torch.bool, device="cpu"),
+            topology_id=torch.tensor(topology_name_to_id(topology_name), dtype=torch.int64, device="cpu"),
+            pool_power_demo_flag=torch.tensor(bool(pool_power_demo_flag), dtype=torch.bool, device="cpu"),
         )
 
     @classmethod
@@ -202,6 +229,8 @@ class TensorTransition:
             done=bool(transition.done),
             is_demo=bool(transition.metadata.get("is_demo", False)),
             collapse_flag=bool(transition.metadata.get("collapse_flag", False)),
+            topology_name=str(transition.metadata.get("topology_name", "unknown")),
+            pool_power_demo_flag=bool(transition.metadata.get("pool_power_demo_flag", False)),
         )
 
     def clone(self) -> "TensorTransition":
@@ -213,6 +242,8 @@ class TensorTransition:
             done=self.done.detach().cpu().clone(),
             is_demo=self.is_demo.detach().cpu().clone(),
             collapse_flag=self.collapse_flag.detach().cpu().clone(),
+            topology_id=self.topology_id.detach().cpu().clone(),
+            pool_power_demo_flag=self.pool_power_demo_flag.detach().cpu().clone(),
         )
 
 
@@ -225,6 +256,8 @@ class TensorReplayBatch:
     done: Tensor
     is_demo: Tensor
     collapse_flag: Tensor
+    topology_id: Tensor
+    pool_power_demo_flag: Tensor
 
     def to(self, device: torch.device | str) -> "TensorReplayBatch":
         return TensorReplayBatch(
@@ -235,6 +268,8 @@ class TensorReplayBatch:
             done=self.done.to(device=device),
             is_demo=self.is_demo.to(device=device),
             collapse_flag=self.collapse_flag.to(device=device),
+            topology_id=self.topology_id.to(device=device),
+            pool_power_demo_flag=self.pool_power_demo_flag.to(device=device),
         )
 
     def __len__(self) -> int:
@@ -249,6 +284,8 @@ class TensorReplayBatch:
             done=self.done.detach().cpu().clone(),
             is_demo=self.is_demo.detach().cpu().clone(),
             collapse_flag=self.collapse_flag.detach().cpu().clone(),
+            topology_id=self.topology_id.detach().cpu().clone(),
+            pool_power_demo_flag=self.pool_power_demo_flag.detach().cpu().clone(),
         )
 
 
@@ -272,6 +309,8 @@ def stack_tensor_transitions(transitions: Sequence[TensorTransition]) -> TensorR
     done = torch.stack([transition.done for transition in transitions], dim=0)
     is_demo = torch.stack([transition.is_demo for transition in transitions], dim=0)
     collapse_flag = torch.stack([transition.collapse_flag for transition in transitions], dim=0)
+    topology_id = torch.stack([transition.topology_id for transition in transitions], dim=0)
+    pool_power_demo_flag = torch.stack([transition.pool_power_demo_flag for transition in transitions], dim=0)
     return TensorReplayBatch(
         obs=obs,
         action=action,
@@ -280,4 +319,6 @@ def stack_tensor_transitions(transitions: Sequence[TensorTransition]) -> TensorR
         done=done,
         is_demo=is_demo,
         collapse_flag=collapse_flag,
+        topology_id=topology_id,
+        pool_power_demo_flag=pool_power_demo_flag,
     )

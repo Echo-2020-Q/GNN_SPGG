@@ -132,6 +132,7 @@ class GraphTD3Learner:
         self.last_actor_bc_loss = 0.0
         self.last_actor_bc_coef = 0.0
         self.last_replay_demo_frac = 0.0
+        self.last_replay_pool_power_demo_frac = 0.0
         self.last_replay_collapse_frac = 0.0
 
         self.target_actor.load_state_dict(self.actor.state_dict())
@@ -245,6 +246,7 @@ class GraphTD3Learner:
             "last_actor_bc_loss": float(self.last_actor_bc_loss),
             "last_actor_bc_coef": float(self.last_actor_bc_coef),
             "last_replay_demo_frac": float(self.last_replay_demo_frac),
+            "last_replay_pool_power_demo_frac": float(self.last_replay_pool_power_demo_frac),
             "last_replay_collapse_frac": float(self.last_replay_collapse_frac),
         }
 
@@ -266,6 +268,7 @@ class GraphTD3Learner:
         self.last_actor_bc_loss = float(state_dict.get("last_actor_bc_loss", 0.0))
         self.last_actor_bc_coef = float(state_dict.get("last_actor_bc_coef", 0.0))
         self.last_replay_demo_frac = float(state_dict.get("last_replay_demo_frac", 0.0))
+        self.last_replay_pool_power_demo_frac = float(state_dict.get("last_replay_pool_power_demo_frac", 0.0))
         self.last_replay_collapse_frac = float(state_dict.get("last_replay_collapse_frac", 0.0))
 
     def _current_demo_bc_coef(self, global_env_steps: int | None) -> float:
@@ -291,6 +294,80 @@ class GraphTD3Learner:
         decay_progress = min(max(decay_progress, 0.0), 1.0)
         return float(self.config.actor_demo_bc_coef) * (1.0 - decay_progress)
 
+    def _resolve_pretrain_batch_size(self, batch_size: int | None) -> int:
+        if batch_size is not None:
+            resolved = int(batch_size)
+        elif self.config.demo_pretrain_batch_size is not None:
+            resolved = int(self.config.demo_pretrain_batch_size)
+        else:
+            resolved = int(self.config.batch_size)
+        if resolved <= 0:
+            raise ValueError("Pretrain batch size must be positive.")
+        return resolved
+
+    def actor_bc_pretrain_step(self, batch_size: int | None = None) -> dict[str, float]:
+        resolved_batch_size = self._resolve_pretrain_batch_size(batch_size)
+        cpu_batch = self.replay_buffer.sample_demo(
+            resolved_batch_size,
+            device=None,
+            max_collapse_ratio=self.config.replay_max_collapse_sample_ratio,
+        )
+        replay_sample_stats = self.replay_buffer.get_last_sample_stats()
+        self.last_replay_demo_frac = float(cpu_batch.is_demo.float().mean().item()) if len(cpu_batch) > 0 else 0.0
+        self.last_replay_pool_power_demo_frac = (
+            float(cpu_batch.pool_power_demo_flag.float().mean().item()) if len(cpu_batch) > 0 else 0.0
+        )
+        self.last_replay_collapse_frac = (
+            float(cpu_batch.collapse_flag.float().mean().item()) if len(cpu_batch) > 0 else 0.0
+        )
+        batch = cpu_batch if self.device.type == "cpu" else cpu_batch.to(self.device)
+        self.last_actor_bc_coef = float(self.config.warmup_actor_bc_coef)
+        actor_metrics = self.update_actor(
+            batch,
+            actor_q_enabled=False,
+            bc_coef=self.last_actor_bc_coef,
+        )
+        self.target_actor.load_state_dict(self.actor.state_dict())
+        return {
+            **actor_metrics,
+            "replay_size": float(len(self.replay_buffer)),
+            "replay_demo_frac": self.last_replay_demo_frac,
+            "replay_pool_power_demo_frac": self.last_replay_pool_power_demo_frac,
+            "replay_collapse_frac": self.last_replay_collapse_frac,
+            "actor_lr": self._current_actor_lr(),
+            "critic_lr": self._current_critic_lr(),
+            **replay_sample_stats,
+        }
+
+    def critic_pretrain_step(self, batch_size: int | None = None) -> dict[str, float]:
+        resolved_batch_size = self._resolve_pretrain_batch_size(batch_size)
+        cpu_batch = self.replay_buffer.sample_demo(
+            resolved_batch_size,
+            device=None,
+            max_collapse_ratio=self.config.replay_max_collapse_sample_ratio,
+        )
+        replay_sample_stats = self.replay_buffer.get_last_sample_stats()
+        self.last_replay_demo_frac = float(cpu_batch.is_demo.float().mean().item()) if len(cpu_batch) > 0 else 0.0
+        self.last_replay_pool_power_demo_frac = (
+            float(cpu_batch.pool_power_demo_flag.float().mean().item()) if len(cpu_batch) > 0 else 0.0
+        )
+        self.last_replay_collapse_frac = (
+            float(cpu_batch.collapse_flag.float().mean().item()) if len(cpu_batch) > 0 else 0.0
+        )
+        batch = cpu_batch if self.device.type == "cpu" else cpu_batch.to(self.device)
+        critic_metrics = self.update_critics(batch)
+        self.soft_update_targets()
+        return {
+            **critic_metrics,
+            "replay_size": float(len(self.replay_buffer)),
+            "replay_demo_frac": self.last_replay_demo_frac,
+            "replay_pool_power_demo_frac": self.last_replay_pool_power_demo_frac,
+            "replay_collapse_frac": self.last_replay_collapse_frac,
+            "actor_lr": self._current_actor_lr(),
+            "critic_lr": self._current_critic_lr(),
+            **replay_sample_stats,
+        }
+
     def train_step(self, global_env_steps: int | None = None) -> dict[str, float]:
         if len(self.replay_buffer) < max(1, self.config.batch_size):
             return {
@@ -307,6 +384,7 @@ class GraphTD3Learner:
                 "loss": 0.0,
                 "replay_size": float(len(self.replay_buffer)),
                 "replay_demo_frac": self.last_replay_demo_frac,
+                "replay_pool_power_demo_frac": self.last_replay_pool_power_demo_frac,
                 "replay_collapse_frac": self.last_replay_collapse_frac,
                 "actor_lr": self._current_actor_lr(),
                 "critic_lr": self._current_critic_lr(),
@@ -315,6 +393,7 @@ class GraphTD3Learner:
                 "profile_critic_update_seconds": 0.0,
                 "profile_actor_update_seconds": 0.0,
                 "profile_target_soft_update_seconds": 0.0,
+                **self.replay_buffer.get_last_sample_stats(),
             }
 
         actor_lr = self._current_actor_lr()
@@ -325,8 +404,12 @@ class GraphTD3Learner:
             device=None,
             max_collapse_ratio=self.config.replay_max_collapse_sample_ratio,
         )
+        replay_sample_stats = self.replay_buffer.get_last_sample_stats()
         replay_sample_seconds = float(perf_counter() - replay_sample_start)
         self.last_replay_demo_frac = float(cpu_batch.is_demo.float().mean().item()) if len(cpu_batch) > 0 else 0.0
+        self.last_replay_pool_power_demo_frac = (
+            float(cpu_batch.pool_power_demo_flag.float().mean().item()) if len(cpu_batch) > 0 else 0.0
+        )
         self.last_replay_collapse_frac = (
             float(cpu_batch.collapse_flag.float().mean().item()) if len(cpu_batch) > 0 else 0.0
         )
@@ -387,6 +470,7 @@ class GraphTD3Learner:
             "loss": critic_metrics["critic_loss"] + actor_metrics["actor_loss"],
             "replay_size": float(len(self.replay_buffer)),
             "replay_demo_frac": self.last_replay_demo_frac,
+            "replay_pool_power_demo_frac": self.last_replay_pool_power_demo_frac,
             "replay_collapse_frac": self.last_replay_collapse_frac,
             "actor_bc_coef": self.last_actor_bc_coef,
             "actor_lr": actor_lr,
@@ -396,6 +480,7 @@ class GraphTD3Learner:
             "profile_critic_update_seconds": critic_update_seconds,
             "profile_actor_update_seconds": actor_update_seconds,
             "profile_target_soft_update_seconds": target_soft_update_seconds,
+            **replay_sample_stats,
         }
 
     def update_critics(self, batch: TensorReplayBatch) -> dict[str, float]:
