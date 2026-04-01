@@ -576,10 +576,10 @@ BASE_EXPERIMENT = {
         "demo_collection_network_types": None,
 
         # demo 预收集结束后，纯 BC 预训练 actor 的更新次数。
-        "actor_bc_pretrain_updates": 2000,
+        "actor_bc_pretrain_updates": 3000,
 
         # actor BC 预训练完成后，critic 仅用 demo transition 做 TD 回归的更新次数。
-        "critic_pretrain_updates": 2000,
+        "critic_pretrain_updates": 3000,
 
         # demo 预训练的 batch 大小。
         # 设为 None 时，回退到 training.batch_size。
