@@ -278,10 +278,10 @@ BASE_EXPERIMENT = {
         #   # 为了方便正则化，我们将这些标量奖励规范化，每项为10，规范化的分母为对应项的理论稳态最大值，
 
         # 平均净收益项的权重。
-        "lambda_payoff": 0.5,
+        "lambda_payoff":0.0,
 
         # 下一时刻实际合作比例项的权重。
-        "lambda_cooperation": 0.0,
+        "lambda_cooperation": 5.0,
 
         # 下一时刻全局平均资源项的权重。
         # 单步使用 mean(next_resources)；跨时间平均后对应评估里的 mean_resource 口径。
@@ -290,7 +290,7 @@ BASE_EXPERIMENT = {
 
         # 下一时刻“低资源/塌缩个体比例”惩罚项的权重。
         # 口径：mean(next_resources < degree + 1)。
-        "lambda_collapse": 10,
+        "lambda_collapse": 1,
 
         # Gini 不平等惩罚项的权重。
         "lambda_gini": 5.0,
@@ -495,13 +495,13 @@ BASE_EXPERIMENT = {
         # warm-up 中 pool 驱动混合启发式的采样权重。
         # 行为形式：omega_i * uniform + (1 - omega_i) * proportional，
         # 其中 omega_i = (clip(pool_raw_i, 0, p_max) / p_max) ^ k。
-        "warmup_pool_power_mix_prob": 0.2,
+        "warmup_pool_power_mix_prob": 0.5,
 
         # warm-up 中随机 logits 行为的采样权重。
         "warmup_random_logits_prob": 0.15,
 
         # 常数混合启发式中的 omega。
-        "warmup_constant_mix_omega": 0.5,
+        "warmup_constant_mix_omega": 0.2,
 
         # pool 驱动混合启发式中的幂指数 k。
         "warmup_pool_power_k": 19.0,
@@ -520,11 +520,11 @@ BASE_EXPERIMENT = {
         "warmup_actor_bc_coef": 1.0,
 
         # warm-up 结束后，继续在 demo 样本上保留一个较轻的行为克隆锚点。
-        "actor_demo_bc_coef": 0.25,
+        "actor_demo_bc_coef": 0.6,
 
         # warm-up 结束后，demo BC 系数线性衰减到 0 的总 rollout 步数比例。
         # 例如 0.50 表示到总 rollout 步数的 20% 时衰减到 0。
-        "actor_demo_bc_decay_end_fraction": 0.20,
+        "actor_demo_bc_decay_end_fraction": 0.50,
 
         # 每隔多少个外层训练迭代做一次 learner 更新。
         "train_every": 1,
@@ -731,24 +731,24 @@ BASE_EXPERIMENT = {
         # - 最后 30%：训练 / 评估 regular + scale_free + erdos_renyi + small_world
         "stages": [
             {
-                "label": "regular_only",
-                "portion": 0.30,
-                "train_network_types": ["regular"],
-                "train_network_type_weights": [1.0],
-                "eval_network_types": ["regular"],
+                "label": "regular__small_world",
+                "portion": 0.15,
+                "train_network_types": ["regular","small_world"],
+                "train_network_type_weights": [0.5, 0.5],
+                "eval_network_types": ["regular", "small_world"],
             },
             {
-                "label": "regular_plus_scale_free",
-                "portion": 0.30,
-                "train_network_types": ["regular", "scale_free"],
-                "train_network_type_weights": [0.7, 0.3],
-                "eval_network_types": ["regular", "scale_free"],
+                "label": "regular__scale_free__erdos_renyi",
+                "portion": 0.40,
+                "train_network_types": ["regular", "small_world", "erdos_renyi"],
+                "train_network_type_weights": [0.4, 0.2, 0.4],
+                "eval_network_types": ["regular", "small_world", "erdos_renyi"],
             },
             {
                 "label": "all_topologies",
-                "portion": 0.40,
+                "portion": 0.45,
                 "train_network_types": ["regular", "scale_free", "erdos_renyi", "small_world"],
-                "train_network_type_weights": [0.4, 0.3, 0.15, 0.15],
+                "train_network_type_weights": [0.2, 0.5, 0.15, 0.15],
                 "eval_network_types": ["regular", "scale_free", "erdos_renyi", "small_world"],
             },
         ],
