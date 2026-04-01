@@ -102,7 +102,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "spgg_GNN_12workers_warmupBC_30M_PoolPowerMix_collapse_penalty",
+    "experiment_name": "spgg_GNN_12workers_TureFermi_20M_DemoPretain_BetterBuffer",
 
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -237,7 +237,7 @@ BASE_EXPERIMENT = {
         # - "q_learning_2x2"：每个节点使用 2状态×2动作 Q-learning，
         #                     状态=自己上一轮动作，动作=本轮选 C/D
         # - "imitate_best" ：最优邻居模仿 / Best-takes-over
-        "strategy_update_rule": "q_learning",
+        "strategy_update_rule": "fermi",
 
         # beta：同步 Fermi 更新的选择强度。
         # 仅当 strategy_update_rule == "fermi" 时使用。
@@ -649,7 +649,7 @@ BASE_EXPERIMENT = {
         # 默认建议先用 "cpu"，让 worker 侧保持最简单、最稳定的本地 CPU rollout。
         # 如果后面要专门做 rollout 推理加速，再改成某张 GPU 或多张 GPU 列表。
         # learner 训练设备仍由下面的 device 单独控制。
-        "rollout_device": "cuda:1",
+        "rollout_device": "cuda:0",
 
         # rollout 推理模式：
         # - "local"       ：每个 worker 自己持有 actor，并在本地前向
@@ -664,7 +664,7 @@ BASE_EXPERIMENT = {
 
         # learner 训练设备：cpu / cuda / cuda:0 等。
         # 这只控制主进程里的 actor/critic 训练，不控制 rollout worker 的推理设备。
-        "device": "cuda:2",
+        "device": "cuda:3",
 
         # 并行 rollout worker 进程内的 PyTorch CPU 线程数。
         # 仅对多进程 worker 生效，用于减少小图前向时的线程争抢。

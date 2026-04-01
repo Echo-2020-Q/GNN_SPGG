@@ -1,0 +1,20 @@
+Console Log: /home/QinYiHang/Code/GNN_SPGG/outputs/Pool_dynamic/spgg_GNN_12workers_TureFermi_20M_DemoPretain_BetterBuffer/train.log
+================================================================================
+Experiment: spgg_GNN_12workers_TureFermi_20M_DemoPretain_BetterBuffer
+Run mode  : gnn_train
+Network   : regular
+Graph     : nodes=50, edges=100, degree_min=4, degree_max=4, degree_mean=4.000
+Dynamics  : alpha=0.5, r=0.75, p_mode=dynamic, p_c=50.0, episode_length=200
+Consume   : mode=piecewise_linear, fixed_mode=degree_scaled, degree_multiplier=1.0, rate=0.05, threshold=4.0
+Strategy  : rule=fermi, beta=1.0
+Reward    : lambda_payoff=0.0, lambda_cooperation=5.0, lambda_total_resource=0.04043126684636118, lambda_collapse=1, lambda_gini=5.0
+Reg       : actor_wd=0.0, critic_wd=0.0, actor_entropy_coef=0.0005, actor_logit_l2_coef=5e-05
+================================================================================
+Train CFG : steps_per_update=400, source=training.steps_per_update, total_env_steps=20001600 (training.total_env_steps, excludes warmup), warmup_env_steps=307200 (training.warmup_env_steps), total_rollout_env_steps=20308800, total_updates=4231
+Train DEV : learner_device=cuda:3, rollout_device=cuda:0, rollout_mode=local, rollout_batch_timeout_ms=2.0, rollout_num_threads=1, num_envs_per_worker=4, overlap_rollout_update=True
+Replay CFG: strategy=topology_stratified_mixed, capacity=1000000, topology_names=regular,erdos_renyi,small_world,scale_free, recent=0.50, long_term=0.35, demo=0.15, demo_source=pool_power_mix, collapse_cap_per_topology=0.20
+Demo CFG : collection_steps=800000, behavior=pool_power_mix, use_domain_randomization=True, network_types=regular,erdos_renyi,small_world,scale_free, actor_bc_updates=3000, critic_pretrain_updates=3000, batch_size=512, dataset_path=None
+Eval CFG  : mode=custom_env_families(4), periodic_eval_episodes=8, eval_interval_env_steps=2000000 (training.eval_interval_env_steps), eval_interval_updates=417
+Curriculum: regular__small_world@1[regular:0.40,small_world:0.40,erdos_renyi:0.20] | regular__scale_free__erdos_renyi@635[regular:0.40,small_world:0.20,erdos_renyi:0.40] | all_topologies@2328[regular:0.20,scale_free:0.50,erdos_renyi:0.15,small_world:0.15]
+TensorBoard: log_dir=/home/QinYiHang/Code/GNN_SPGG/outputs/Pool_dynamic/spgg_GNN_12workers_TureFermi_20M_DemoPretain_BetterBuffer/tensorboard/0401_224536
+Demo Pretrain | collection start | env_steps=800000 | behavior=pool_power_mix
