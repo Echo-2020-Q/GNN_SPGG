@@ -24,6 +24,7 @@ import math
 from pathlib import Path
 from statistics import mean
 import sys
+from time import perf_counter
 from typing import Any, Dict, Optional
 
 
@@ -266,6 +267,7 @@ def _build_summary(
     results: Mapping[str, Any],
     output_dir: Path,
     recent_window: int,
+    wall_seconds: float,
 ) -> Dict[str, Any]:
     history = list(results.get("history", []))
     metric_stats: Dict[str, Dict[str, float]] = {}
@@ -316,6 +318,12 @@ def _build_summary(
         "rollout_device": training["rollout_device"],
         "rollout_inference_mode": str(training["rollout_inference_mode"]),
         "overlap_rollout_and_update": bool(training["overlap_rollout_and_update"]),
+        "demo_pretrain_enabled": bool(training.get("demo_pretrain_enabled", False)),
+        "demo_collection_env_steps": int(training.get("demo_collection_env_steps", 0)),
+        "actor_bc_pretrain_updates": int(training.get("actor_bc_pretrain_updates", 0)),
+        "critic_pretrain_updates": int(training.get("critic_pretrain_updates", 0)),
+        "teacher_takeover_enabled": bool(training.get("teacher_takeover_enabled", False)),
+        "replay_strategy": str(training.get("replay_strategy", "fifo")),
         "domain_randomization_enabled": bool(spec["domain_randomization"]["enabled"]),
         "curriculum_enabled": bool(spec["curriculum"]["enabled"]),
         "custom_eval_families_enabled": bool(spec["evaluation"]["use_custom_env_families"]),
@@ -325,7 +333,19 @@ def _build_summary(
 
     return {
         "config": config_summary,
+        "wall_seconds": float(wall_seconds),
         "history_length": int(len(history)),
+        "stopped_after_demo_pretrain": bool(results.get("stopped_after_demo_pretrain", False)),
+        "demo_pretrain_summary": (
+            dict(results["demo_pretrain_summary"])
+            if isinstance(results.get("demo_pretrain_summary"), Mapping)
+            else None
+        ),
+        "demo_pretrain_eval_summary": (
+            dict(results["demo_pretrain_eval_summary"])
+            if isinstance(results.get("demo_pretrain_eval_summary"), Mapping)
+            else None
+        ),
         "selected_profile_metrics": metric_stats,
         "derived_ratios": derived,
         "final_metrics_subset": {
@@ -466,12 +486,15 @@ def main() -> None:
     spec_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
     print("Baseline spec saved to: {0}".format(spec_path))
 
+    run_start = perf_counter()
     results = run_one_experiment(spec)
+    wall_seconds = float(perf_counter() - run_start)
     summary = _build_summary(
         spec=spec,
         results=results,
         output_dir=output_dir,
         recent_window=max(1, int(args.recent_window_updates)),
+        wall_seconds=wall_seconds,
     )
     summary_path = output_dir / "baseline_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
