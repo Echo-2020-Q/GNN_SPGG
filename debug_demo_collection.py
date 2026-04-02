@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import faulthandler
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ from run_experiment import (
     build_output_dir,
     build_trainer_config,
     build_training_curriculum,
+    run_external_demo_collection,
 )
 
 
@@ -82,11 +84,6 @@ def _print_system_info() -> None:
     print("PID        :", os.getpid())
     print("CWD        :", os.getcwd())
     print("Torch      :", torch.__version__)
-    print("CUDA avail :", torch.cuda.is_available())
-    print("CUDA count :", torch.cuda.device_count())
-    if torch.cuda.is_available():
-        for index in range(torch.cuda.device_count()):
-            print("CUDA[{0}]   : {1}".format(index, torch.cuda.get_device_name(index)))
     print("========================================")
 
 
@@ -116,27 +113,50 @@ def main() -> None:
         trainer_config = build_trainer_config(spec)
         print("Step 6     : build_domain_randomization_config")
         randomization_config = build_domain_randomization_config(spec)
-        print("Step 7     : build_evaluation_env_factories")
+        print("Step 7     : external demo collection")
+        external_demo_replay = None
+        external_demo_summary = None
+        effective_trainer_config = trainer_config
+        if int(trainer_config.demo_collection_env_steps) > 0 and str(trainer_config.demo_collection_runtime) in {
+            "parallel_cpu",
+            "isolated_cpu",
+        }:
+            external_demo_replay, external_demo_summary = run_external_demo_collection(
+                spec=spec,
+                graph=graph,
+                env_config=env_config,
+                trainer_config=trainer_config,
+                randomization_config=randomization_config,
+            )
+            effective_trainer_config = replace(trainer_config, demo_collection_env_steps=0)
+        if bool(DEBUG_CONFIG["collection_only"]):
+            print("External demo summary:", external_demo_summary)
+            print("Done.")
+            return
+        print("Step 8     : build_evaluation_env_factories")
         eval_env_factories = build_evaluation_env_factories(spec)
-        print("Step 8     : build_training_curriculum")
+        print("Step 9     : build_training_curriculum")
         curriculum_stages = build_training_curriculum(spec)
-        print("Step 9     : construct GraphTD3Trainer")
+        print("Step 10    : construct GraphTD3Trainer")
         trainer = GraphTD3Trainer(
             env=env,
             policy=policy,
-            config=trainer_config,
+            config=effective_trainer_config,
             eval_env=env,
             randomization=randomization_config,
             eval_env_factories=eval_env_factories,
             curriculum_stages=curriculum_stages,
         )
         try:
+            if external_demo_replay is not None:
+                print("Step 11    : trainer.preload_demo_replay()")
+                trainer.preload_demo_replay(external_demo_replay, external_demo_summary)
             if bool(DEBUG_CONFIG["pretrain_only"]):
-                print("Step 10    : trainer._run_demo_pretrain()")
+                print("Step 12    : trainer._run_demo_pretrain()")
                 summary = trainer._run_demo_pretrain()
                 print("Pretrain summary:", summary)
             else:
-                print("Step 10    : trainer.train()")
+                print("Step 12    : trainer.train()")
                 history = trainer.train(num_updates=1)
                 print("Train history length:", len(history))
         except BaseException:
@@ -144,7 +164,7 @@ def main() -> None:
             traceback.print_exc()
             raise
         finally:
-            print("Step 11    : trainer.close()")
+            print("Step 13    : trainer.close()")
             try:
                 trainer.close()
             except Exception:

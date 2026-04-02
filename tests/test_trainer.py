@@ -13,6 +13,9 @@ if NUMPY_AVAILABLE and TORCH_AVAILABLE:
 
     from Project1.env import RewardConfig, SPGGConfig, SPGGEnv, make_grid_graph
     from Project1.policies.gnn_rl import GNNAllocationPolicy, GNNPolicyConfig
+    from Project1.policies.rule_based import UniformAllocationPolicy
+    from Project1.td3.data import TensorReplayActionRecord, TensorTransition
+    from Project1.td3.replay import ReplayBuffer
     from Project1.td3.critic import GraphActionCritic, GraphActionCriticConfig
     from Project1.trainer import CentralizedActorCriticTrainer, TrainerConfig
 
@@ -187,6 +190,100 @@ class TrainerSmokeTests(unittest.TestCase):
             self.assertEqual(str(trainer.demo_pretrain_summary["critic_target_mode"]), "n_step")
             self.assertIn("demo_return_target_mean", trainer.demo_pretrain_summary)
             self.assertIn("demo_return_target_std", trainer.demo_pretrain_summary)
+        finally:
+            trainer.close()
+
+    def test_preloaded_demo_replay_skips_internal_collection(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.5,
+                p_max=5.0,
+                beta=1.0,
+                episode_length=4,
+                reward=RewardConfig(lambda_payoff=1.0, lambda_cooperation=0.5, lambda_gini=0.1),
+            ),
+            make_grid_graph(2, 2),
+        )
+        observation = env.reset(seed=0)
+        allocation = UniformAllocationPolicy().allocate(observation).astype(np.float32, copy=False)
+        next_observation, reward, done, _ = env.step(allocation)
+        transition = TensorTransition.from_step(
+            obs=observation,
+            action=TensorReplayActionRecord(allocation=torch.as_tensor(allocation, dtype=torch.float32)),
+            reward=float(reward),
+            next_obs=next_observation,
+            done=bool(done),
+            is_demo=True,
+            collapse_flag=False,
+            topology_name="fixed",
+            pool_power_demo_flag=True,
+            demo_return_target=1.0,
+            demo_return_valid=True,
+        )
+        replay_buffer = ReplayBuffer(
+            capacity=32,
+            seed=0,
+            replay_strategy="topology_stratified_mixed",
+            topology_names=("fixed",),
+            recent_fraction=0.50,
+            long_term_fraction=0.35,
+            demo_fraction=0.15,
+            demo_behavior_source="pool_power_mix",
+        )
+        replay_buffer.add(transition)
+
+        policy = GNNAllocationPolicy(GNNPolicyConfig(hidden_dim=16, num_message_passing_layers=2))
+        trainer = CentralizedActorCriticTrainer(
+            env=env,
+            policy=policy,
+            config=TrainerConfig(
+                total_updates=1,
+                steps_per_update=4,
+                eval_interval=1,
+                eval_episodes=1,
+                demo_pretrain_enabled=True,
+                demo_collection_env_steps=0,
+                actor_bc_pretrain_updates=1,
+                critic_pretrain_updates=1,
+                demo_pretrain_batch_size=1,
+                replay_strategy="topology_stratified_mixed",
+                replay_topology_names=("fixed",),
+                replay_recent_fraction=0.50,
+                replay_long_term_fraction=0.35,
+                replay_demo_fraction=0.15,
+                warmup_steps=0,
+                seed=0,
+            ),
+        )
+
+        try:
+            trainer.preload_demo_replay(
+                replay_buffer,
+                {
+                    "enabled": True,
+                    "demo_collection_env_steps": 4.0,
+                    "demo_replay_size_after_collection": 1.0,
+                    "actor_bc_updates": 0.0,
+                    "critic_pretrain_updates": 0.0,
+                    "actor_bc_loss_last": 0.0,
+                    "critic_loss_last": 0.0,
+                    "seconds_collection": 0.5,
+                    "seconds_actor_bc": 0.0,
+                    "seconds_critic": 0.0,
+                    "dataset_path": None,
+                    "behavior_source": "pool_power_mix",
+                    "critic_target_mode": "n_step",
+                    "demo_return_target_mean": 1.0,
+                    "demo_return_target_std": 0.0,
+                },
+            )
+            summary = trainer._run_demo_pretrain()
+            self.assertEqual(int(summary["actor_bc_updates"]), 1)
+            self.assertEqual(int(summary["critic_pretrain_updates"]), 1)
+            self.assertEqual(float(summary["demo_collection_env_steps"]), 4.0)
+            self.assertEqual(float(summary["demo_replay_size_after_collection"]), 1.0)
+            self.assertEqual(float(summary["seconds_collection"]), 0.5)
         finally:
             trainer.close()
 

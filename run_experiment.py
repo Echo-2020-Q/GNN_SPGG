@@ -25,6 +25,7 @@ from dataclasses import asdict, replace
 from datetime import datetime
 import json
 from math import ceil
+from multiprocessing.connection import wait
 import os
 from pathlib import Path
 from statistics import mean
@@ -2030,6 +2031,386 @@ def build_training_curriculum(spec: Mapping[str, Any]) -> Optional[List[Dict[str
     return stages
 
 
+def _should_use_external_demo_collection(
+    trainer_config: Any,
+    *,
+    resume_from_checkpoint: Any,
+) -> bool:
+    return (
+        bool(getattr(trainer_config, "demo_pretrain_enabled", False))
+        and int(getattr(trainer_config, "demo_collection_env_steps", 0)) > 0
+        and str(getattr(trainer_config, "demo_collection_runtime", "parallel_cpu")) in {"parallel_cpu", "isolated_cpu"}
+        and not bool(resume_from_checkpoint)
+    )
+
+
+def _progress_interval(total: int) -> int:
+    return max(1, int(ceil(float(max(1, total)) / 20.0)))
+
+
+def _format_progress_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return "{0}h {1:02d}m {2:02d}s".format(hours, minutes, secs)
+    if minutes > 0:
+        return "{0}m {1:02d}s".format(minutes, secs)
+    return "{0}s".format(secs)
+
+
+def _print_demo_progress(stage_label: str, completed: int, total: int, started_at: float) -> None:
+    if total <= 0:
+        return
+    elapsed = float(time.perf_counter() - started_at)
+    progress = min(max(float(completed) / float(total), 0.0), 1.0)
+    eta_seconds = None
+    if completed > 0 and progress > 0.0:
+        eta_seconds = max(0.0, elapsed * (1.0 - progress) / progress)
+    eta_text = _format_progress_duration(eta_seconds) if eta_seconds is not None else "unavailable"
+    print(
+        "Demo Pretrain | {0} progress | {1}/{2} ({3:.1f}%) | ETA={4} | elapsed={5}".format(
+            stage_label,
+            int(completed),
+            int(total),
+            progress * 100.0,
+            eta_text,
+            _format_progress_duration(elapsed),
+        )
+    )
+
+
+def _resolve_external_demo_collection_factory(
+    env_config: SPGGConfig,
+    graph: Mapping[int, Sequence[int]],
+    randomization_config: Any,
+    trainer_config: Any,
+):
+    from Project1.td3 import DomainRandomizationConfig
+    from Project1.td3.worker import RandomizedEnvFactory
+
+    base_randomization = randomization_config
+    if not isinstance(base_randomization, DomainRandomizationConfig):
+        raise TypeError("randomization_config must be a DomainRandomizationConfig.")
+
+    if not bool(trainer_config.demo_collection_use_domain_randomization) or not bool(base_randomization.enabled):
+        demo_randomization = replace(base_randomization, enabled=False)
+        return RandomizedEnvFactory(env_config, graph, randomization=demo_randomization)
+
+    configured_network_types = tuple(
+        str(item) for item in getattr(trainer_config, "demo_collection_network_types", ()) if str(item)
+    )
+    if configured_network_types:
+        supported_types = set(str(item) for item in base_randomization.network_types)
+        selected_network_types = tuple(item for item in configured_network_types if item in supported_types)
+        if not selected_network_types:
+            raise ValueError("demo_collection_network_types must overlap domain_randomization.network_types.")
+    else:
+        selected_network_types = tuple(str(item) for item in base_randomization.network_types)
+
+    selected_weights = None
+    if base_randomization.network_type_weights is not None:
+        weight_by_type = {
+            str(network_type): float(weight)
+            for network_type, weight in zip(base_randomization.network_types, base_randomization.network_type_weights)
+        }
+        selected_weights = tuple(weight_by_type[item] for item in selected_network_types)
+
+    demo_randomization = replace(
+        base_randomization,
+        enabled=True,
+        network_types=selected_network_types,
+        network_type_weights=selected_weights,
+    )
+    return RandomizedEnvFactory(env_config, graph, randomization=demo_randomization)
+
+
+def _global_step_allocations_for_workers(workers: Sequence[Any], total_steps: int) -> List[int]:
+    remaining_steps = max(0, int(total_steps))
+    if remaining_steps <= 0:
+        return [0 for _ in workers]
+
+    allocations: List[int] = []
+    remaining_workers = len(workers)
+    for worker in workers:
+        per_worker_steps = int(worker.config.rollout_steps_per_sync)
+        if remaining_workers <= 1:
+            allocation = min(per_worker_steps, remaining_steps)
+        else:
+            fair_share = int(ceil(float(remaining_steps) / float(remaining_workers)))
+            allocation = min(per_worker_steps, fair_share, remaining_steps)
+        allocations.append(allocation)
+        remaining_steps -= allocation
+        remaining_workers -= 1
+    return allocations
+
+
+def _save_demo_dataset_external(replay_batches: Sequence[Any], demo_dataset_save_path: Optional[str]) -> Optional[str]:
+    if not demo_dataset_save_path:
+        return None
+
+    import torch
+
+    dataset_path = Path(str(demo_dataset_save_path)).expanduser()
+    if not dataset_path.is_absolute():
+        dataset_path = Path.cwd() / dataset_path
+    dataset_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "source": "pool_power_mix_demo_collection_external",
+            "num_batches": int(len(replay_batches)),
+            "replay_batches": [batch.clone() for batch in replay_batches],
+        },
+        dataset_path,
+    )
+    return str(dataset_path)
+
+
+def run_external_demo_collection(
+    spec: Mapping[str, Any],
+    graph: Mapping[int, Sequence[int]],
+    env_config: SPGGConfig,
+    trainer_config: Any,
+    randomization_config: Any,
+) -> tuple[Any, Dict[str, Any]]:
+    from Project1.policies.gnn_rl import GNNAllocationPolicy
+    from Project1.td3.replay import ReplayBuffer
+    from Project1.td3.worker import ParallelRolloutWorker, RolloutWorker, WorkerConfig
+    from Project1.td3.exploration import LogitSpaceExplorer
+
+    demo_collection_steps = max(0, int(trainer_config.demo_collection_env_steps))
+    if demo_collection_steps <= 0:
+        raise ValueError("External demo collection requires demo_collection_env_steps > 0.")
+
+    runtime = str(trainer_config.demo_collection_runtime)
+    if runtime == "parallel_cpu" and int(trainer_config.num_workers) <= 1:
+        runtime = "isolated_cpu"
+
+    print(
+        "Demo Pretrain | external collection start | env_steps={0} | behavior={1}".format(
+            demo_collection_steps,
+            trainer_config.demo_collection_behavior_source,
+        )
+    )
+
+    replay_buffer = ReplayBuffer(
+        int(trainer_config.replay_capacity),
+        seed=int(trainer_config.seed or 0),
+        replay_strategy=str(trainer_config.replay_strategy),
+        topology_names=tuple(str(item) for item in trainer_config.replay_topology_names),
+        recent_fraction=float(trainer_config.replay_recent_fraction),
+        long_term_fraction=float(trainer_config.replay_long_term_fraction),
+        demo_fraction=float(trainer_config.replay_demo_fraction),
+        demo_behavior_source=str(trainer_config.replay_demo_behavior_source),
+    )
+    demo_factory = _resolve_external_demo_collection_factory(
+        env_config=env_config,
+        graph=graph,
+        randomization_config=randomization_config,
+        trainer_config=trainer_config,
+    )
+    actor_template = build_gnn_policy(spec)
+    demo_batches_to_save: List[Any] = []
+    demo_return_targets: List[np.ndarray] = []
+    started_at = time.perf_counter()
+    log_interval = _progress_interval(demo_collection_steps)
+    next_log_at = min(demo_collection_steps, log_interval)
+    last_logged_completed = 0
+
+    def _record_result(result: Any) -> int:
+        nonlocal next_log_at, last_logged_completed
+        collected_now = len(result.replay_batch)
+        if collected_now <= 0:
+            raise RuntimeError("Demo collection produced zero transitions.")
+        replay_buffer.extend(result.replay_batch)
+        if trainer_config.demo_dataset_save_path:
+            demo_batches_to_save.append(result.replay_batch.clone())
+        valid_mask = result.replay_batch.demo_return_valid.detach().cpu().numpy().astype(np.bool_, copy=False)
+        if np.any(valid_mask):
+            demo_return_targets.append(
+                result.replay_batch.demo_return_target.detach().cpu().numpy().astype(np.float32, copy=False)[valid_mask]
+            )
+        return collected_now
+
+    if runtime == "parallel_cpu":
+        print(
+            "Demo Pretrain | runtime=parallel_cpu | envs={0} | steps_per_sync={1}".format(
+                max(1, int(trainer_config.num_workers)) * max(1, int(trainer_config.num_envs_per_worker)),
+                max(1, int(trainer_config.steps_per_update)),
+            )
+        )
+        demo_workers: List[Any] = []
+        try:
+            for worker_id in range(int(trainer_config.num_workers)):
+                worker_config = WorkerConfig(
+                    worker_id=worker_id,
+                    seed=(int(trainer_config.seed or 0) + 2_000_000 + worker_id),
+                    rollout_steps_per_sync=int(trainer_config.steps_per_update),
+                    num_envs_per_worker=int(trainer_config.num_envs_per_worker),
+                )
+                demo_workers.append(
+                    ParallelRolloutWorker(
+                        actor=GNNAllocationPolicy(deepcopy(actor_template.config)),
+                        env_factory=demo_factory,
+                        config=worker_config,
+                        train_config=trainer_config,
+                        device="cpu",
+                    )
+                )
+            remaining_steps = int(demo_collection_steps)
+            while remaining_steps > 0:
+                step_allocations = _global_step_allocations_for_workers(demo_workers, remaining_steps)
+                positive_requests = [
+                    (worker, int(num_steps))
+                    for worker, num_steps in zip(demo_workers, step_allocations)
+                    if int(num_steps) > 0
+                ]
+                if not positive_requests:
+                    break
+                started_workers: List[Any] = []
+                pending_workers: Dict[Any, Any] = {}
+                rollout_results: List[Any] = []
+                try:
+                    for worker, num_steps in positive_requests:
+                        worker.start_collect(
+                            num_steps=num_steps,
+                            global_warmup_steps=0,
+                            forced_behavior_source=str(trainer_config.demo_collection_behavior_source),
+                            mark_as_demo=True,
+                            count_env_steps=False,
+                            global_env_start_step=0,
+                            demo_return_target_mode=str(trainer_config.demo_critic_pretrain_target_mode),
+                            demo_return_n_step=int(trainer_config.demo_critic_pretrain_n_step),
+                        )
+                        started_workers.append(worker)
+                        pending_workers[worker.connection] = worker
+
+                    while pending_workers:
+                        ready_connections = wait(
+                            list(pending_workers.keys()),
+                            timeout=float(trainer_config.worker_rpc_timeout_seconds),
+                        )
+                        if not ready_connections:
+                            raise TimeoutError(
+                                "Timed out waiting for external demo workers: {0}".format(
+                                    [worker.config.worker_id for worker in pending_workers.values()]
+                                )
+                            )
+                        for ready_connection in ready_connections:
+                            worker = pending_workers.pop(ready_connection)
+                            rollout_results.append(worker.finish_collect_ready())
+                except Exception:
+                    for worker in started_workers:
+                        if getattr(worker, "_collect_inflight", False):
+                            try:
+                                worker.finish_collect()
+                            except Exception:
+                                pass
+                    raise
+
+                try:
+                    collected_now = 0
+                    for result in rollout_results:
+                        collected_now += _record_result(result)
+                    remaining_steps -= collected_now
+                    completed_steps = int(demo_collection_steps) - int(remaining_steps)
+                    if completed_steps >= next_log_at:
+                        _print_demo_progress("collection", completed_steps, int(demo_collection_steps), started_at)
+                        last_logged_completed = completed_steps
+                        next_log_at += log_interval
+                finally:
+                    for result in rollout_results:
+                        result.release_shared_memory()
+        finally:
+            for worker in demo_workers:
+                worker.close()
+    else:
+        total_parallel_envs = max(1, int(trainer_config.num_workers)) * max(1, int(trainer_config.num_envs_per_worker))
+        total_parallel_steps = max(1, int(trainer_config.num_workers)) * max(1, int(trainer_config.steps_per_update))
+        print(
+            "Demo Pretrain | runtime=isolated_cpu | envs={0} | steps_per_sync={1}".format(
+                total_parallel_envs,
+                total_parallel_steps,
+            )
+        )
+        worker_config = WorkerConfig(
+            worker_id=-1,
+            seed=int(trainer_config.seed or 0) + 1_000_000,
+            rollout_steps_per_sync=total_parallel_steps,
+            num_envs_per_worker=total_parallel_envs,
+        )
+        demo_worker = RolloutWorker(
+            actor=GNNAllocationPolicy(deepcopy(actor_template.config)),
+            explorer=LogitSpaceExplorer(),
+            env_factory=demo_factory,
+            config=worker_config,
+            train_config=trainer_config,
+            device="cpu",
+        )
+        try:
+            remaining_steps = int(demo_collection_steps)
+            while remaining_steps > 0:
+                batch_steps = min(int(demo_worker.config.rollout_steps_per_sync), remaining_steps)
+                result = demo_worker.collect(
+                    num_steps=batch_steps,
+                    global_warmup_steps=0,
+                    forced_behavior_source=str(trainer_config.demo_collection_behavior_source),
+                    mark_as_demo=True,
+                    count_env_steps=False,
+                    global_env_start_step=0,
+                    demo_return_target_mode=str(trainer_config.demo_critic_pretrain_target_mode),
+                    demo_return_n_step=int(trainer_config.demo_critic_pretrain_n_step),
+                )
+                try:
+                    collected_now = _record_result(result)
+                    remaining_steps -= collected_now
+                    completed_steps = int(demo_collection_steps) - int(remaining_steps)
+                    if completed_steps >= next_log_at:
+                        _print_demo_progress("collection", completed_steps, int(demo_collection_steps), started_at)
+                        last_logged_completed = completed_steps
+                        next_log_at += log_interval
+                finally:
+                    result.release_shared_memory()
+        finally:
+            if hasattr(demo_worker, "close"):
+                demo_worker.close()
+
+    if last_logged_completed < int(demo_collection_steps):
+        _print_demo_progress("collection", int(demo_collection_steps), int(demo_collection_steps), started_at)
+
+    summary: Dict[str, Any] = {
+        "enabled": True,
+        "demo_collection_env_steps": float(demo_collection_steps),
+        "demo_replay_size_after_collection": float(replay_buffer.demo_size()),
+        "actor_bc_updates": 0.0,
+        "critic_pretrain_updates": 0.0,
+        "actor_bc_loss_last": 0.0,
+        "critic_loss_last": 0.0,
+        "seconds_collection": float(time.perf_counter() - started_at),
+        "seconds_actor_bc": 0.0,
+        "seconds_critic": 0.0,
+        "dataset_path": _save_demo_dataset_external(demo_batches_to_save, trainer_config.demo_dataset_save_path),
+        "behavior_source": str(trainer_config.demo_collection_behavior_source),
+        "critic_target_mode": str(trainer_config.demo_critic_pretrain_target_mode),
+        "demo_return_target_mean": 0.0,
+        "demo_return_target_std": 0.0,
+    }
+    if demo_return_targets:
+        concatenated_demo_returns = np.concatenate(demo_return_targets, axis=0)
+        summary["demo_return_target_mean"] = float(np.mean(concatenated_demo_returns))
+        summary["demo_return_target_std"] = float(np.std(concatenated_demo_returns))
+    print(
+        "Demo Pretrain | external collection done | demo_replay_size={0:.0f} | return_mode={1} | target_mean={2:.6f} | target_std={3:.6f} | seconds={4:.3f}".format(
+            float(summary["demo_replay_size_after_collection"]),
+            str(summary["critic_target_mode"]),
+            float(summary["demo_return_target_mean"]),
+            float(summary["demo_return_target_std"]),
+            float(summary["seconds_collection"]),
+        )
+    )
+    return replay_buffer, summary
+
+
 def graph_summary(graph: Mapping[int, Sequence[int]]) -> Dict[str, float]:
     degrees = [len(neighbors) for neighbors in graph.values()]
     num_edges = sum(degrees) // 2
@@ -3180,7 +3561,6 @@ def run_gnn_training_mode(
 
     env = SPGGEnv(env_config, graph)
     eval_env = SPGGEnv(env_config, graph)
-    policy = build_gnn_policy(spec)
     trainer_config = build_trainer_config(spec)
     training_schedule = _resolve_training_schedule(spec)
     randomization_config = build_domain_randomization_config(spec)
@@ -3190,20 +3570,15 @@ def run_gnn_training_mode(
     training = spec["training"]
     tensorboard = spec.get("tensorboard", {})
     resume_from_checkpoint = training.get("resume_from_checkpoint")
+    external_demo_replay = None
+    external_demo_summary = None
+    effective_trainer_config = trainer_config
+    policy: Any = None
+    trainer: Any = None
     steps_source = (
         "dynamics.episode_length"
         if training.get("use_episode_length_as_steps_per_update", False)
         else "training.steps_per_update"
-    )
-
-    trainer = CentralizedActorCriticTrainer(
-        env=env,
-        policy=policy,
-        eval_env=eval_env,
-        config=trainer_config,
-        randomization=randomization_config,
-        eval_env_factories=eval_env_factories,
-        curriculum_stages=curriculum_stages,
     )
     writer: Any = None
     try:
@@ -3317,6 +3692,32 @@ def run_gnn_training_mode(
                 for stage in curriculum_stages
             ]
             print("Curriculum: {0}".format(" | ".join(stage_parts)))
+
+        if _should_use_external_demo_collection(
+            trainer_config,
+            resume_from_checkpoint=resume_from_checkpoint,
+        ):
+            external_demo_replay, external_demo_summary = run_external_demo_collection(
+                spec=spec,
+                graph=graph,
+                env_config=env_config,
+                trainer_config=trainer_config,
+                randomization_config=randomization_config,
+            )
+            effective_trainer_config = replace(trainer_config, demo_collection_env_steps=0)
+
+        policy = build_gnn_policy(spec)
+        trainer = CentralizedActorCriticTrainer(
+            env=env,
+            policy=policy,
+            eval_env=eval_env,
+            config=effective_trainer_config,
+            randomization=randomization_config,
+            eval_env_factories=eval_env_factories,
+            curriculum_stages=curriculum_stages,
+        )
+        if external_demo_replay is not None:
+            trainer.preload_demo_replay(external_demo_replay, external_demo_summary)
 
         checkpoint_dir = output_dir / "checkpoints"
         should_save_checkpoints = bool(training.get("save_checkpoints", False))
@@ -3476,7 +3877,7 @@ def run_gnn_training_mode(
                     print(line)
 
         history = trainer.train(
-            num_updates=trainer_config.total_updates,
+            num_updates=effective_trainer_config.total_updates,
             on_update=_on_update,
         )
         demo_pretrain_summary = (
@@ -3565,7 +3966,8 @@ def run_gnn_training_mode(
     finally:
         if writer is not None:
             writer.close()
-        trainer.close()
+        if trainer is not None:
+            trainer.close()
 
 
 def save_results_json(

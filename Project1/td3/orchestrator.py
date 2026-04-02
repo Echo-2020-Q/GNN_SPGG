@@ -130,6 +130,20 @@ class GraphTD3Trainer:
         self.demo_pretrain_completed = False
         self.demo_pretrain_summary: dict[str, float | str | bool | None] | None = None
 
+    def preload_demo_replay(
+        self,
+        replay_state: ReplayBuffer | Mapping[str, Any],
+        summary: Mapping[str, float | str | bool | None] | None = None,
+    ) -> None:
+        if isinstance(replay_state, ReplayBuffer):
+            self.replay_buffer = replay_state
+        else:
+            self.replay_buffer.load_state_dict(dict(replay_state))
+        self.learner.replay_buffer = self.replay_buffer
+        self.demo_pretrain_completed = False
+        if summary is not None:
+            self.demo_pretrain_summary = dict(summary)
+
     def close(self) -> None:
         self._shutdown_rollout_runtime()
 
@@ -762,6 +776,10 @@ class GraphTD3Trainer:
             "demo_return_target_mean": 0.0,
             "demo_return_target_std": 0.0,
         }
+        if self.demo_pretrain_summary is not None:
+            summary.update(dict(self.demo_pretrain_summary))
+            summary["enabled"] = bool(self.config.demo_pretrain_enabled)
+            summary["demo_replay_size_after_collection"] = float(self.replay_buffer.demo_size())
         if not bool(self.config.demo_pretrain_enabled):
             self.demo_pretrain_completed = False
             self.demo_pretrain_summary = dict(summary)
