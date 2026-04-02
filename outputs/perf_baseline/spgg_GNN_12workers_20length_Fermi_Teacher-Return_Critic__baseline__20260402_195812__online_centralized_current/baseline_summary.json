@@ -1,0 +1,291 @@
+{
+  "config": {
+    "experiment_name": "spgg_GNN_12workers_20length_Fermi_Teacher-Return_Critic__baseline__20260402_195812__online_centralized_current",
+    "output_dir": "/home/QinYiHang/Code/GNN_SPGG/outputs/perf_baseline/spgg_GNN_12workers_20length_Fermi_Teacher-Return_Critic__baseline__20260402_195812__online_centralized_current",
+    "output_root": "outputs/perf_baseline",
+    "total_updates": 8,
+    "global_env_steps_per_update": 4800,
+    "total_env_steps_effective": 38400,
+    "warmup_env_steps": 0,
+    "eval_interval_updates": 8,
+    "num_workers": 12,
+    "num_envs_per_worker": 4,
+    "steps_per_update": 400,
+    "gradient_steps_per_update": 24,
+    "batch_size": 256,
+    "graph_batch_chunk_size": 48,
+    "learner_device": "cuda:3",
+    "rollout_device": "cuda:2",
+    "rollout_inference_mode": "centralized",
+    "overlap_rollout_and_update": true,
+    "demo_pretrain_enabled": false,
+    "demo_collection_env_steps": 100000,
+    "actor_bc_pretrain_updates": 3000,
+    "critic_pretrain_updates": 3000,
+    "teacher_takeover_enabled": false,
+    "replay_strategy": "topology_stratified_mixed",
+    "domain_randomization_enabled": true,
+    "curriculum_enabled": true,
+    "custom_eval_families_enabled": true,
+    "eval_episodes": 2,
+    "post_training_eval_episodes": 0
+  },
+  "wall_seconds": 130.35335829295218,
+  "history_length": 8,
+  "stopped_after_demo_pretrain": false,
+  "demo_pretrain_summary": null,
+  "demo_pretrain_eval_summary": null,
+  "selected_profile_metrics": {
+    "profile_rollout_collect_seconds": {
+      "count": 8.0,
+      "last": 13.569128561764956,
+      "mean": 11.561799984890968,
+      "min": 4.291645554825664,
+      "max": 13.569128561764956,
+      "recent_mean": 13.04812662564218,
+      "recent_count": 5.0
+    },
+    "profile_learner_update_seconds": {
+      "count": 8.0,
+      "last": 11.231470366939902,
+      "mean": 10.708099349634722,
+      "min": 8.685541866347194,
+      "max": 11.659970099106431,
+      "recent_mean": 11.310107357427478,
+      "recent_count": 5.0
+    },
+    "profile_actor_sync_seconds": {
+      "count": 8.0,
+      "last": 0.10651385970413685,
+      "mean": 0.11665407218970358,
+      "min": 0.1039464883506298,
+      "max": 0.14876592718064785,
+      "recent_mean": 0.10728344470262527,
+      "recent_count": 5.0
+    },
+    "profile_rollout_env_step_seconds": {
+      "count": 8.0,
+      "last": 0.7888336111791432,
+      "mean": 0.8349983701482415,
+      "min": 0.7888336111791432,
+      "max": 0.8810349875129759,
+      "recent_mean": 0.8286545827053488,
+      "recent_count": 5.0
+    },
+    "profile_rollout_transition_encode_seconds": {
+      "count": 8.0,
+      "last": 0.20668062412490448,
+      "mean": 0.22616712475428358,
+      "min": 0.20668062412490448,
+      "max": 0.29321062844246626,
+      "recent_mean": 0.21507821880901853,
+      "recent_count": 5.0
+    },
+    "profile_replay_extend_seconds": {
+      "count": 8.0,
+      "last": 2.283791149035096,
+      "mean": 1.5261015831492841,
+      "min": 1.1443862244486809,
+      "max": 2.283791149035096,
+      "recent_mean": 1.6747866131365299,
+      "recent_count": 5.0
+    },
+    "profile_replay_sample_seconds": {
+      "count": 8.0,
+      "last": 0.4539889730513096,
+      "mean": 0.5041622968856245,
+      "min": 0.3014630451798439,
+      "max": 0.7712495438754559,
+      "recent_mean": 0.5522096458822489,
+      "recent_count": 5.0
+    },
+    "profile_batch_to_device_seconds": {
+      "count": 8.0,
+      "last": 0.03741138242185116,
+      "mean": 0.04495247779414058,
+      "min": 0.032741786912083626,
+      "max": 0.0891408734023571,
+      "recent_mean": 0.05032440796494484,
+      "recent_count": 5.0
+    },
+    "profile_eval_seconds": {
+      "count": 8.0,
+      "last": 1.4343981631100178,
+      "mean": 0.17929977038875222,
+      "min": 0.0,
+      "max": 1.4343981631100178,
+      "recent_mean": 0.28687963262200356,
+      "recent_count": 5.0
+    },
+    "profile_on_update_seconds": {
+      "count": 8.0,
+      "last": 0.0013853199779987335,
+      "mean": 0.0051232329569756985,
+      "min": 0.0010448377579450607,
+      "max": 0.011398456990718842,
+      "recent_mean": 0.0056703008711338045,
+      "recent_count": 5.0
+    },
+    "profile_rollout_action_to_numpy_seconds": {
+      "count": 8.0,
+      "last": 0.006483607615033786,
+      "mean": 0.006645588941561679,
+      "min": 0.006349112372845411,
+      "max": 0.006912798620760441,
+      "recent_mean": 0.006606226321309805,
+      "recent_count": 5.0
+    },
+    "profile_rollout_stack_transitions_seconds": {
+      "count": 8.0,
+      "last": 0.015134258661419153,
+      "mean": 0.01628175686346367,
+      "min": 0.014036810801674923,
+      "max": 0.021788096986711025,
+      "recent_mean": 0.015403222572058438,
+      "recent_count": 5.0
+    },
+    "profile_rollout_shared_memory_serialize_seconds": {
+      "count": 8.0,
+      "last": 0.007484553847461939,
+      "mean": 0.008062638303575417,
+      "min": 0.007405776530504227,
+      "max": 0.009308634791523218,
+      "recent_mean": 0.007984164512405793,
+      "recent_count": 5.0
+    },
+    "profile_rollout_shared_memory_deserialize_seconds": {
+      "count": 8.0,
+      "last": 0.000700483409066995,
+      "mean": 0.0012466678163036704,
+      "min": 0.000501520000398159,
+      "max": 0.005734139898171027,
+      "recent_mean": 0.0006185691182812055,
+      "recent_count": 5.0
+    },
+    "profile_rollout_collect_worker_seconds": {
+      "count": 8.0,
+      "last": 4.224451652107139,
+      "mean": 3.7177172178441347,
+      "min": 2.8703804610607526,
+      "max": 4.224451652107139,
+      "recent_mean": 3.793651913354794,
+      "recent_count": 5.0
+    },
+    "profile_rollout_inference_wait_seconds": {
+      "count": 8.0,
+      "last": 2.9826765029380717,
+      "mean": 2.4011076124734245,
+      "min": 1.5987237111354868,
+      "max": 2.9826765029380717,
+      "recent_mean": 2.500902689186235,
+      "recent_count": 5.0
+    },
+    "profile_rollout_inference_request_build_seconds": {
+      "count": 8.0,
+      "last": 0.017029056635995705,
+      "mean": 0.01718251946537445,
+      "min": 0.016116778676708538,
+      "max": 0.018612475134432316,
+      "recent_mean": 0.01710406250009934,
+      "recent_count": 5.0
+    },
+    "profile_rollout_local_policy_forward_seconds": {
+      "count": 8.0,
+      "last": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "recent_mean": 0.0,
+      "recent_count": 5.0
+    },
+    "profile_rollout_finish_wait_seconds": {
+      "count": 8.0,
+      "last": 2.3302662931382656,
+      "mean": 1.4010184612125158,
+      "min": 0.0,
+      "max": 2.3302662931382656,
+      "recent_mean": 1.7229937799274921,
+      "recent_count": 5.0
+    },
+    "profile_rollout_overlap_seconds": {
+      "count": 8.0,
+      "last": 11.23886226862669,
+      "mean": 9.624325829325244,
+      "min": 0.0,
+      "max": 11.668179668486118,
+      "recent_mean": 11.325132845714688,
+      "recent_count": 5.0
+    },
+    "profile_rollout_inference_batch_size_mean": {
+      "count": 8.0,
+      "last": 28.620000000000005,
+      "mean": 27.121666666666666,
+      "min": 25.76,
+      "max": 29.013333333333332,
+      "recent_mean": 26.84133333333333,
+      "recent_count": 5.0
+    },
+    "profile_rollout_inference_batch_size_max": {
+      "count": 8.0,
+      "last": 48.0,
+      "mean": 48.0,
+      "min": 48.0,
+      "max": 48.0,
+      "recent_mean": 48.0,
+      "recent_count": 5.0
+    },
+    "profile_critic_update_seconds": {
+      "count": 8.0,
+      "last": 8.736441545188427,
+      "mean": 8.424092800822109,
+      "min": 7.013345954939723,
+      "max": 9.067697871476412,
+      "recent_mean": 8.822067984566093,
+      "recent_count": 5.0
+    },
+    "profile_actor_update_seconds": {
+      "count": 8.0,
+      "last": 1.957850631326437,
+      "mean": 1.6885554753243923,
+      "min": 1.1890643779188395,
+      "max": 1.957850631326437,
+      "recent_mean": 1.8382616490125656,
+      "recent_count": 5.0
+    },
+    "profile_target_soft_update_seconds": {
+      "count": 8.0,
+      "last": 0.03390498645603657,
+      "mean": 0.03522748639807105,
+      "min": 0.031189804896712303,
+      "max": 0.040117545053362846,
+      "recent_mean": 0.034803223609924314,
+      "recent_count": 5.0
+    },
+    "profile_rollout_steps_per_second": {
+      "count": 8.0,
+      "last": 353.74416110445173,
+      "mean": 476.5310773630454,
+      "min": 353.74416110445173,
+      "max": 1118.452103902832,
+      "recent_mean": 368.18141794043987,
+      "recent_count": 5.0
+    }
+  },
+  "derived_ratios": {
+    "rollout_collect_over_learner_update": 1.07972475855721,
+    "env_step_share_of_rollout_collect": 0.07222044761537326,
+    "transition_encode_share_of_rollout_collect": 0.019561584273196233,
+    "replay_extend_share_of_rollout_collect": 0.13199515517857108,
+    "replay_sample_share_of_learner_update": 0.047082332767376,
+    "batch_to_device_share_of_learner_update": 0.004197988487627733,
+    "eval_share_of_on_update": 34.99738776169079
+  },
+  "final_metrics_subset": {
+    "update": 8.0,
+    "global_env_steps": 38400.0,
+    "critic_loss": 1.2996035367250443,
+    "actor_loss": -0.035993494010111475,
+    "eval_return_mean": -44.38923328278427,
+    "eval_cooperation_mean": 0.0075
+  }
+}

@@ -103,7 +103,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "spgg_GNN_12workers_20length_Fermi_Teacher-Return_Critic",
+    "experiment_name": "0402_spgg_GNN_12workers_100length_Fermi_ThresholdTeacher",
 
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -254,7 +254,7 @@ BASE_EXPERIMENT = {
 
         # 每个 episode 的时间步上限。
         # 到达这个步数后，本 episode 结束。
-        "episode_length": 20, #150 10000
+        "episode_length": 200, #150 10000
 
         # 所有节点统一的初始资源。
         "initial_resource": 20.0,#10
@@ -340,7 +340,7 @@ BASE_EXPERIMENT = {
         # 程序内部会按：
         #   total_updates = ceil((warmup_env_steps + total_env_steps) / (num_workers * effective_steps_per_update))
         # 自动换算成 update 次数。
-        "total_env_steps": 20_000_000,#episode需要用总的steps除以episode_length=150
+        "total_env_steps": 30_000_000,#episode需要用总的steps除以episode_length=150
 
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
@@ -606,7 +606,7 @@ BASE_EXPERIMENT = {
 
         # demo 预训练的 batch 大小。
         # 设为 None 时，回退到 training.batch_size。
-        "demo_pretrain_batch_size": 512,
+        "demo_pretrain_batch_size": 256,
 
         # demo hold-out 验证集比例。
         # 这些样本不会进入 train replay，只用于 pretrain 阶段的验证与 early stopping。

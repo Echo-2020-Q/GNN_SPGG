@@ -1,0 +1,351 @@
+Console Log: /home/QinYiHang/Code/GNN_SPGG/outputs/perf_baseline/spgg_GNN_12workers_20length_Fermi_Teacher-Return_Critic__baseline__20260402_195812__online_centralized_current/train.log
+================================================================================
+Experiment: spgg_GNN_12workers_20length_Fermi_Teacher-Return_Critic__baseline__20260402_195812__online_centralized_current
+Run mode  : gnn_train
+Network   : regular
+Graph     : nodes=50, edges=100, degree_min=4, degree_max=4, degree_mean=4.000
+Dynamics  : alpha=0.5, r=0.75, p_mode=dynamic, p_c=50.0, episode_length=20
+Consume   : mode=piecewise_linear, fixed_mode=degree_scaled, degree_multiplier=1.0, rate=0.05, threshold=5.0
+Strategy  : rule=fermi, beta=1.0
+Reward    : lambda_payoff=0.0, lambda_cooperation=5.0, lambda_total_resource=0.04043126684636118, lambda_collapse=1, lambda_gini=5.0
+Reg       : actor_wd=0.0, critic_wd=0.0, actor_entropy_coef=0.0005, actor_logit_l2_coef=5e-05
+================================================================================
+Train CFG : steps_per_update=400, source=training.steps_per_update, total_env_steps=38400 (training.total_updates, excludes warmup), warmup_env_steps=0 (training.warmup_env_steps), total_rollout_env_steps=38400, total_updates=8
+Train DEV : learner_device=cuda:3, rollout_device=cuda:2, rollout_mode=centralized, rollout_batch_timeout_ms=2.0, rollout_num_threads=1, num_envs_per_worker=4, overlap_rollout_update=True
+Replay CFG: strategy=topology_stratified_mixed, capacity=1000000, topology_names=regular,erdos_renyi,small_world,scale_free, recent=0.50, long_term=0.35, demo=0.15, demo_source=pool_power_mix, collapse_cap_per_topology=0.20
+Stab CFG : teacher_takeover=False(0.8->0.0, end@0.3), actor_q_coef=0.05->1.0 end@0.5, critic_loss=huber, huber_delta=1.0, grad_clip(actor=5.0, critic=5.0)
+Eval CFG  : mode=custom_env_families(4), periodic_eval_episodes=2, eval_interval_env_steps=38400 (training.eval_interval), eval_interval_updates=8
+Curriculum: regular__small_world@1[regular:0.40,small_world:0.40,erdos_renyi:0.20] | regular__scale_free__erdos_renyi@2[regular:0.25,small_world:0.25,erdos_renyi:0.25,scale_free:0.25] | all_topologies@5[regular:0.20,scale_free:0.50,erdos_renyi:0.15,small_world:0.15]
+Curriculum: update=1, stage=regular__small_world, train=['regular', 'small_world', 'erdos_renyi'], train_weights=[0.4, 0.4, 0.2], eval=['regular', 'small_world', 'erdos_renyi']
+[INFO 19:58:47] train t_env: 4800 / 38400 | update: 1 / 8
+[INFO 19:58:47] train Estimated time left: 1 minutes, 33 seconds. Time passed: 13 seconds
+[INFO 19:58:47] train Recent Stats | update: 1 / 8 | t_env: 4800 / 38400 | stage: regular__small_world
+train_f_c:                     0.0238  train_gini:                    0.3656  train_R_mean:                  3.8828
+train_payoff_mean:             0.4220  train_pool_grown:              0.4927  train_pool:                    0.3074
+loss:                          1.2008  policy_loss:                   0.0193  value_loss:                    1.1815
+mean_rollout_reward:          -2.3164  entropy:                       1.5784  actor_logit_l2:                0.0014
+actor_bc_loss:                 0.0000  actor_bc_coef:                 0.0000  actor_q_coef:                  0.2875
+actor_grad_norm:               0.0000  critic_grad_norm:              1.0760  actor_lr:                      0.0001
+critic_lr:                     0.0000  replay_size:                4800.0000  replay_demo:                   0.0000
+replay_pool_demo:              0.0000  replay_teacher:                0.0000  replay_collapse:               0.0000
+teacher_takeover:              0.0000  rollout_sps:                1118.4521  rollout_collect_s:             4.2916
+worker_collect_s:              2.8704  env_step_s:                    0.8076  inference_wait_s:              1.5987
+infer_build_s:                 0.0162  local_forward_s:               0.0000  action_to_numpy_s:             0.0065
+transition_encode_s:           0.2109  stack_transitions_s:           0.0147  shm_serialize_s:               0.0074
+shm_deserialize_s:             0.0057  rollout_wait_s:                0.0000  overlap_s:                     0.0000
+actor_sync_s:                  0.1488  actor_publish_s:               0.0029  actor_sync_server_s:           0.0180
+actor_sync_worker_s:           0.1279  replay_extend_s:               1.3076  replay_sample_s:               0.3015
+to_device_s:                   0.0327  critic_update_s:               7.2014  actor_update_s:                1.1891
+target_update_s:               0.0365  learner_update_s:              8.7687  eval_s:                        0.0000
+infer_batch_mean:             29.0133  infer_batch_max:              48.0000  uniform:                       0.0000
+proportional:                  0.0000  constant_mix:                  0.0000  pool_power_mix:                0.0000
+random_logits:                 0.0000  actor_logits:                  1.0000  src_long_term:                 0.4102
+src_recent:                    0.5898  topo_erdos_renyi:              0.3320  topo_regular:                  0.3359
+topo_small_world:              0.3320
+Curriculum: update=2, stage=regular__scale_free__erdos_renyi, train=['regular', 'small_world', 'erdos_renyi', 'scale_free'], train_weights=[0.25, 0.25, 0.25, 0.25], eval=['regular', 'small_world', 'erdos_renyi', 'scale_free']
+[INFO 19:58:57] train t_env: 9600 / 38400 | update: 2 / 8
+[INFO 19:58:57] train Estimated time left: 1 minutes, 10 seconds. Time passed: 23 seconds
+[INFO 19:58:57] train Recent Stats | update: 2 / 8 | t_env: 9600 / 38400 | stage: regular__scale_free__erdos_renyi
+train_f_c:                     0.0291  train_gini:                    0.3857  train_R_mean:                  4.1225
+train_payoff_mean:             0.4674  train_pool_grown:              0.6001  train_pool:                    0.3697
+loss:                          1.1952  policy_loss:                   0.0175  value_loss:                    1.1777
+mean_rollout_reward:          -2.3652  entropy:                       1.5746  actor_logit_l2:                0.0010
+actor_bc_loss:                 0.0000  actor_bc_coef:                 0.0000  actor_q_coef:                  0.2875
+actor_grad_norm:               0.0000  critic_grad_norm:              1.0836  actor_lr:                      0.0001
+critic_lr:                     0.0000  replay_size:                7200.0000  replay_demo:                   0.0000
+replay_pool_demo:              0.0000  replay_teacher:                0.0000  replay_collapse:               0.0000
+teacher_takeover:              0.0000  rollout_sps:                 802.3112  rollout_collect_s:             7.0824
+worker_collect_s:              3.5303  env_step_s:                    0.8443  inference_wait_s:              2.2038
+infer_build_s:                 0.0174  local_forward_s:               0.0000  action_to_numpy_s:             0.0067
+transition_encode_s:           0.2204  stack_transitions_s:           0.0157  shm_serialize_s:               0.0079
+shm_deserialize_s:             0.0031  rollout_wait_s:                0.5862  overlap_s:                     4.3504
+actor_sync_s:                  0.1387  actor_publish_s:               0.0068  actor_sync_server_s:           0.0137
+actor_sync_worker_s:           0.1183  replay_extend_s:               1.2260  replay_sample_s:               0.3374
+to_device_s:                   0.0352  critic_update_s:               7.1074  actor_update_s:                1.2007
+target_update_s:               0.0383  learner_update_s:              8.7271  eval_s:                        0.0000
+infer_batch_mean:             28.2200  infer_batch_max:              48.0000  uniform:                       0.0000
+proportional:                  0.0000  constant_mix:                  0.0000  pool_power_mix:                0.0000
+random_logits:                 0.0000  actor_logits:                  1.0000  src_long_term:                 0.4102
+src_recent:                    0.5898  topo_erdos_renyi:              0.3320  topo_regular:                  0.3359
+topo_small_world:              0.3320
+[INFO 19:59:10] train t_env: 14400 / 38400 | update: 3 / 8
+[INFO 19:59:10] train Estimated time left: 1 minutes, 1 seconds. Time passed: 36 seconds
+[INFO 19:59:10] train Recent Stats | update: 3 / 8 | t_env: 14400 / 38400 | stage: regular__scale_free__erdos_renyi
+train_f_c:                     0.0327  train_gini:                    0.3969  train_R_mean:                  4.3026
+train_payoff_mean:             0.5007  train_pool_grown:              0.6898  train_pool:                    0.4248
+loss:                          1.2235  policy_loss:                   0.0195  value_loss:                    1.2039
+mean_rollout_reward:          -2.3883  entropy:                       1.5648  actor_logit_l2:                0.0014
+actor_bc_loss:                 0.0000  actor_bc_coef:                 0.0000  actor_q_coef:                  0.3667
+actor_grad_norm:               0.0000  critic_grad_norm:              1.0401  actor_lr:                      0.0001
+critic_lr:                     0.0000  replay_size:                9600.0000  replay_demo:                   0.0000
+replay_pool_demo:              0.0000  replay_teacher:                0.0000  replay_collapse:               0.0000
+teacher_takeover:              0.0000  rollout_sps:                 657.1138  rollout_collect_s:             9.0846
+worker_collect_s:              3.5912  env_step_s:                    0.8456  inference_wait_s:              2.2348
+infer_build_s:                 0.0173  local_forward_s:               0.0000  action_to_numpy_s:             0.0067
+transition_encode_s:           0.2446  stack_transitions_s:           0.0177  shm_serialize_s:               0.0082
+shm_deserialize_s:             0.0023  rollout_wait_s:                0.8644  overlap_s:                     6.7896
+actor_sync_s:                  0.1323  actor_publish_s:               0.0052  actor_sync_server_s:           0.0119
+actor_sync_worker_s:           0.1152  replay_extend_s:               1.2783  replay_sample_s:               0.4241
+to_device_s:                   0.0360  critic_update_s:               7.7608  actor_update_s:                1.4390
+target_update_s:               0.0359  learner_update_s:              9.7048  eval_s:                        0.0000
+infer_batch_mean:             27.5889  infer_batch_max:              48.0000  uniform:                       0.0000
+proportional:                  0.0000  constant_mix:                  0.0000  pool_power_mix:                0.0000
+random_logits:                 0.0000  actor_logits:                  1.0000  src_long_term:                 0.4089
+src_recent:                    0.5911  topo_erdos_renyi:              0.3047  topo_regular:                  0.3073
+topo_scale_free:               0.2500  topo_small_world:              0.3047
+[INFO 19:59:23] train t_env: 19200 / 38400 | update: 4 / 8
+[INFO 19:59:23] train Estimated time left: 49 seconds. Time passed: 49 seconds
+[INFO 19:59:23] train Recent Stats | update: 4 / 8 | t_env: 19200 / 38400 | stage: regular__scale_free__erdos_renyi
+train_f_c:                     0.0314  train_gini:                    0.3954  train_R_mean:                  4.2288
+train_payoff_mean:             0.4860  train_pool_grown:              0.6520  train_pool:                    0.4007
+loss:                          1.2410  policy_loss:                   0.0207  value_loss:                    1.2204
+mean_rollout_reward:          -2.3915  entropy:                       1.5601  actor_logit_l2:                0.0012
+actor_bc_loss:                 0.0000  actor_bc_coef:                 0.0000  actor_q_coef:                  0.4656
+actor_grad_norm:               0.0000  critic_grad_norm:              1.0289  actor_lr:                      0.0001
+critic_lr:                     0.0000  replay_size:               12000.0000  replay_demo:                   0.0000
+replay_pool_demo:              0.0000  replay_teacher:                0.0000  replay_collapse:               0.0000
+teacher_takeover:              0.0000  rollout_sps:                 588.0567  rollout_collect_s:             9.9640
+worker_collect_s:              3.6105  env_step_s:                    0.8481  inference_wait_s:              2.2633
+infer_build_s:                 0.0173  local_forward_s:               0.0000  action_to_numpy_s:             0.0067
+transition_encode_s:           0.2391  stack_transitions_s:           0.0168  shm_serialize_s:               0.0081
+shm_deserialize_s:             0.0018  rollout_wait_s:                0.9855  overlap_s:                     7.9056
+actor_sync_s:                  0.1280  actor_publish_s:               0.0045  actor_sync_server_s:           0.0112
+actor_sync_worker_s:           0.1123  replay_extend_s:               1.2857  replay_sample_s:               0.4414
+to_device_s:                   0.0493  critic_update_s:               8.0213  actor_update_s:                1.5315
+target_update_s:               0.0361  learner_update_s:             10.0898  eval_s:                        0.0000
+infer_batch_mean:             27.4700  infer_batch_max:              48.0000  uniform:                       0.0000
+proportional:                  0.0000  constant_mix:                  0.0000  pool_power_mix:                0.0000
+random_logits:                 0.0000  actor_logits:                  1.0000  src_long_term:                 0.4082
+src_recent:                    0.5918  topo_erdos_renyi:              0.2910  topo_regular:                  0.2930
+topo_scale_free:               0.2500  topo_small_world:              0.2910
+Curriculum: update=5, stage=all_topologies, train=['regular', 'scale_free', 'erdos_renyi', 'small_world'], train_weights=[0.2, 0.5, 0.15, 0.15], eval=['regular', 'scale_free', 'erdos_renyi', 'small_world']
+[INFO 19:59:36] train t_env: 24000 / 38400 | update: 5 / 8
+[INFO 19:59:36] train Estimated time left: 37 seconds. Time passed: 1 minutes, 2 seconds
+[INFO 19:59:36] train Recent Stats | update: 5 / 8 | t_env: 24000 / 38400 | stage: all_topologies
+train_f_c:                     0.0350  train_gini:                    0.3953  train_R_mean:                  4.3712
+train_payoff_mean:             0.5184  train_pool_grown:              0.7191  train_pool:                    0.4349
+loss:                          1.2700  policy_loss:                   0.0200  value_loss:                    1.2500
+mean_rollout_reward:          -2.3585  entropy:                       1.5563  actor_logit_l2:                0.0011
+actor_bc_loss:                 0.0000  actor_bc_coef:                 0.0000  actor_q_coef:                  0.5725
+actor_grad_norm:               0.0000  critic_grad_norm:              1.0418  actor_lr:                      0.0001
+critic_lr:                     0.0000  replay_size:               14400.0000  replay_demo:                   0.0000
+replay_pool_demo:              0.0000  replay_teacher:                0.0000  replay_collapse:               0.0000
+teacher_takeover:              0.0000  rollout_sps:                 544.3563  rollout_collect_s:            10.5689
+worker_collect_s:              3.6402  env_step_s:                    0.8496  inference_wait_s:              2.2937
+infer_build_s:                 0.0175  local_forward_s:               0.0000  action_to_numpy_s:             0.0067
+transition_encode_s:           0.2349  stack_transitions_s:           0.0165  shm_serialize_s:               0.0079
+shm_deserialize_s:             0.0016  rollout_wait_s:                1.1368  overlap_s:                     8.5738
+actor_sync_s:                  0.1232  actor_publish_s:               0.0041  actor_sync_server_s:           0.0108
+actor_sync_worker_s:           0.1083  replay_extend_s:               1.3675  replay_sample_s:               0.4386
+to_device_s:                   0.0489  critic_update_s:               8.1978  actor_update_s:                1.5800
+target_update_s:               0.0352  learner_update_s:             10.3114  eval_s:                        0.0000
+infer_batch_mean:             27.1613  infer_batch_max:              48.0000  uniform:                       0.0000
+proportional:                  0.0000  constant_mix:                  0.0000  pool_power_mix:                0.0000
+random_logits:                 0.0000  actor_logits:                  1.0000  src_long_term:                 0.4078
+src_recent:                    0.5922  topo_erdos_renyi:              0.2828  topo_regular:                  0.2844
+topo_scale_free:               0.2500  topo_small_world:              0.2828
+[INFO 19:59:49] train t_env: 28800 / 38400 | update: 6 / 8
+[INFO 19:59:49] train Estimated time left: 25 seconds. Time passed: 1 minutes, 16 seconds
+[INFO 19:59:49] train Recent Stats | update: 6 / 8 | t_env: 28800 / 38400 | stage: all_topologies
+train_f_c:                     0.0393  train_gini:                    0.4037  train_R_mean:                  4.5528
+train_payoff_mean:             0.5541  train_pool_grown:              0.8069  train_pool:                    0.4852
+loss:                          1.2693  policy_loss:                   0.0166  value_loss:                    1.2527
+mean_rollout_reward:          -2.3612  entropy:                       1.5493  actor_logit_l2:                0.0011
+actor_bc_loss:                 0.0000  actor_bc_coef:                 0.0000  actor_q_coef:                  0.7150
+actor_grad_norm:               0.0000  critic_grad_norm:              1.0359  actor_lr:                      0.0001
+critic_lr:                     0.0000  replay_size:               19200.0000  replay_demo:                   0.0000
+replay_pool_demo:              0.0000  replay_teacher:                0.0000  replay_collapse:               0.0000
+teacher_takeover:              0.0000  rollout_sps:                 392.3329  rollout_collect_s:            12.3896
+worker_collect_s:              3.8180  env_step_s:                    0.8542  inference_wait_s:              2.4661
+infer_build_s:                 0.0176  local_forward_s:               0.0000  action_to_numpy_s:             0.0068
+transition_encode_s:           0.2363  stack_transitions_s:           0.0173  shm_serialize_s:               0.0083
+shm_deserialize_s:             0.0006  rollout_wait_s:                1.4924  overlap_s:                    10.8972
+actor_sync_s:                  0.1148  actor_publish_s:               0.0041  actor_sync_server_s:           0.0097
+actor_sync_worker_s:           0.1010  replay_extend_s:               1.4463  replay_sample_s:               0.5326
+to_device_s:                   0.0503  critic_update_s:               8.5314  actor_update_s:                1.7184
+target_update_s:               0.0348  learner_update_s:             10.8792  eval_s:                        0.0000
+infer_batch_mean:             26.7160  infer_batch_max:              48.0000  uniform:                       0.0000
+proportional:                  0.0000  constant_mix:                  0.0000  pool_power_mix:                0.0000
+random_logits:                 0.0000  actor_logits:                  1.0000  src_long_term:                 0.4070
+src_recent:                    0.5930  topo_erdos_renyi:              0.2664  topo_regular:                  0.2672
+topo_scale_free:               0.2500  topo_small_world:              0.2664
+[INFO 20:00:02] train t_env: 33600 / 38400 | update: 7 / 8
+[INFO 20:00:02] train Estimated time left: 13 seconds. Time passed: 1 minutes, 29 seconds
+[INFO 20:00:02] train Recent Stats | update: 7 / 8 | t_env: 33600 / 38400 | stage: all_topologies
+train_f_c:                     0.0432  train_gini:                    0.4037  train_R_mean:                  4.8236
+train_payoff_mean:             0.6077  train_pool_grown:              0.9429  train_pool:                    0.5644
+loss:                          1.2689  policy_loss:                   0.0102  value_loss:                    1.2586
+mean_rollout_reward:          -2.3231  entropy:                       1.5441  actor_logit_l2:                0.0015
+actor_bc_loss:                 0.0000  actor_bc_coef:                 0.0000  actor_q_coef:                  0.8575
+actor_grad_norm:               0.0000  critic_grad_norm:              1.0445  actor_lr:                      0.0001
+critic_lr:                     0.0000  replay_size:               24000.0000  replay_demo:                   0.0000
+replay_pool_demo:              0.0000  replay_teacher:                0.0000  replay_collapse:               0.0000
+teacher_takeover:              0.0000  rollout_sps:                 370.7764  rollout_collect_s:            12.9521
+worker_collect_s:              3.6913  env_step_s:                    0.8405  inference_wait_s:              2.3637
+infer_build_s:                 0.0171  local_forward_s:               0.0000  action_to_numpy_s:             0.0067
+transition_encode_s:           0.2324  stack_transitions_s:           0.0167  shm_serialize_s:               0.0083
+shm_deserialize_s:             0.0006  rollout_wait_s:                1.5411  overlap_s:                    11.4110
+actor_sync_s:                  0.1099  actor_publish_s:               0.0033  actor_sync_server_s:           0.0097
+actor_sync_worker_s:           0.0969  replay_extend_s:               1.4946  replay_sample_s:               0.5809
+to_device_s:                   0.0504  critic_update_s:               8.8883  actor_update_s:                1.8298
+target_update_s:               0.0343  learner_update_s:             11.3958  eval_s:                        0.0000
+infer_batch_mean:             26.3827  infer_batch_max:              48.0000  uniform:                       0.0000
+proportional:                  0.0000  constant_mix:                  0.0000  pool_power_mix:                0.0000
+random_logits:                 0.0000  actor_logits:                  1.0000  src_long_term:                 0.4062
+src_recent:                    0.5938  topo_erdos_renyi:              0.2500  topo_regular:                  0.2500
+topo_scale_free:               0.2500  topo_small_world:              0.2500
+[INFO 20:00:17] train t_env: 38400 / 38400 | update: 8 / 8
+[INFO 20:00:17] train Estimated time left: 0 seconds. Time passed: 1 minutes, 44 seconds
+[INFO 20:00:17] train Recent Stats | update: 8 / 8 | t_env: 38400 / 38400 | stage: all_topologies
+train_f_c:                     0.0449  train_gini:                    0.3992  train_R_mean:                  4.9263
+train_payoff_mean:             0.6312  train_pool_grown:              0.9996  train_pool:                    0.5961
+f_c:                           0.0075  gini:                          0.3470  return_mean:                 -44.3892
+R_mean:                        8.9991  payoff_mean:                   1.2078  pool_grown_mean:               3.1825
+pool_mean:                     1.9747  R_total_mean:                449.9543  collapse_rate:                 0.6250
+loss:                          1.2656  policy_loss:                  -0.0017  value_loss:                    1.2673
+mean_rollout_reward:          -2.2830  entropy:                       1.5432  actor_logit_l2:                0.0033
+actor_bc_loss:                 0.0000  actor_bc_coef:                 0.0000  actor_q_coef:                  0.9525
+actor_grad_norm:               0.0003  critic_grad_norm:              1.0825  actor_lr:                      0.0001
+critic_lr:                     0.0000  replay_size:               28800.0000  replay_demo:                   0.0000
+replay_pool_demo:              0.0000  replay_teacher:                0.0000  replay_collapse:               0.0000
+teacher_takeover:              0.0000  rollout_sps:                 368.1814  rollout_collect_s:            13.0481
+worker_collect_s:              3.7937  env_step_s:                    0.8287  inference_wait_s:              2.5009
+infer_build_s:                 0.0171  local_forward_s:               0.0000  action_to_numpy_s:             0.0066
+transition_encode_s:           0.2151  stack_transitions_s:           0.0154  shm_serialize_s:               0.0080
+shm_deserialize_s:             0.0006  rollout_wait_s:                1.7230  overlap_s:                    11.3251
+actor_sync_s:                  0.1073  actor_publish_s:               0.0033  actor_sync_server_s:           0.0096
+actor_sync_worker_s:           0.0944  replay_extend_s:               1.6748  replay_sample_s:               0.5522
+to_device_s:                   0.0503  critic_update_s:               8.8221  actor_update_s:                1.8383
+target_update_s:               0.0348  learner_update_s:             11.3101  eval_s:                        0.2869
+infer_batch_mean:             26.8413  infer_batch_max:              48.0000  uniform:                       0.0000
+proportional:                  0.0000  constant_mix:                  0.0000  pool_power_mix:                0.0000
+random_logits:                 0.0000  actor_logits:                  1.0000  src_long_term:                 0.4062
+src_recent:                    0.5938  topo_erdos_renyi:              0.2500  topo_regular:                  0.2500
+topo_scale_free:               0.2500  topo_small_world:              0.2500
+[INFO 20:00:17] train Latest eval | f_c=0.0075, gini=0.3470, return=-44.3892, R=8.9991, payoff=1.2078, pool_grown=3.1825, pool=1.9747, collapse_rate=0.6250
+Final summary:
+{
+  "update": 8.0,
+  "loss": 1.2636100427149328,
+  "policy_loss": -0.035993494010111475,
+  "value_loss": 1.2996035367250443,
+  "entropy": 1.5404259586334228,
+  "critic1_loss": 0.6180809140205383,
+  "critic2_loss": 0.6815226227045059,
+  "critic_loss": 1.2996035367250443,
+  "actor_loss": -0.035993494010111475,
+  "actor_q_loss": -0.035223858430981636,
+  "actor_entropy": 1.5404259586334228,
+  "actor_logit_l2": 0.011548003737484845,
+  "actor_reg_loss": -0.0007696355791298371,
+  "actor_bc_loss": 0.0,
+  "actor_bc_coef": 0.0,
+  "replay_size": 38400.0,
+  "replay_demo_frac": 0.0,
+  "replay_pool_power_demo_frac": 0.0,
+  "replay_teacher_frac": 0.0,
+  "replay_collapse_frac": 0.0,
+  "teacher_takeover_prob": 0.0,
+  "mean_rollout_reward": -2.233769649941777,
+  "actor_lr": 9.44387710929423e-05,
+  "critic_lr": 9.44387710929423e-06,
+  "curriculum_stage": 2.0,
+  "rollout_f_c": 0.04851666666666667,
+  "rollout_R_mean": 5.176288049531318,
+  "rollout_gini": 0.39688237333586823,
+  "rollout_payoff_mean": 0.6845779642634664,
+  "rollout_pool_grown_mean": 1.1525889436850765,
+  "rollout_pool_mean": 0.6937814893644781,
+  "profile_rollout_collect_seconds": 13.569128561764956,
+  "profile_rollout_collect_worker_seconds": 4.224451652107139,
+  "profile_rollout_env_step_seconds": 0.7888336111791432,
+  "profile_rollout_inference_wait_seconds": 2.9826765029380717,
+  "profile_rollout_inference_request_build_seconds": 0.017029056635995705,
+  "profile_rollout_local_policy_forward_seconds": 0.0,
+  "profile_rollout_action_to_numpy_seconds": 0.006483607615033786,
+  "profile_rollout_transition_encode_seconds": 0.20668062412490448,
+  "profile_rollout_stack_transitions_seconds": 0.015134258661419153,
+  "profile_rollout_shared_memory_serialize_seconds": 0.007484553847461939,
+  "profile_rollout_shared_memory_deserialize_seconds": 0.000700483409066995,
+  "profile_rollout_finish_wait_seconds": 2.3302662931382656,
+  "profile_rollout_overlap_seconds": 11.23886226862669,
+  "profile_replay_extend_seconds": 2.283791149035096,
+  "profile_rollout_steps_per_second": 353.74416110445173,
+  "profile_rollout_inference_batch_size_mean": 28.620000000000005,
+  "profile_rollout_inference_batch_size_max": 48.0,
+  "profile_learner_update_seconds": 11.231470366939902,
+  "profile_replay_sample_seconds": 0.4539889730513096,
+  "profile_batch_to_device_seconds": 0.03741138242185116,
+  "profile_critic_update_seconds": 8.736441545188427,
+  "profile_actor_update_seconds": 1.957850631326437,
+  "profile_target_soft_update_seconds": 0.03390498645603657,
+  "actor_grad_norm": 0.0013454549480229616,
+  "critic_grad_norm": 1.1431474685668945,
+  "actor_q_coef": 1.0,
+  "profile_eval_seconds": 1.4343981631100178,
+  "global_env_steps": 38400.0,
+  "profile_actor_sync_seconds": 0.10651385970413685,
+  "profile_actor_publish_seconds": 0.0022504739463329315,
+  "profile_actor_sync_inference_server_seconds": 0.007437165826559067,
+  "profile_actor_sync_worker_rpc_seconds": 0.09682621993124485,
+  "replay_source_frac_long_term": 0.40625,
+  "replay_source_frac_recent": 0.59375,
+  "replay_topology_frac_erdos_renyi": 0.25,
+  "replay_topology_frac_regular": 0.25,
+  "replay_topology_frac_scale_free": 0.25,
+  "replay_topology_frac_small_world": 0.25,
+  "behavior_frac_uniform": 0.0,
+  "behavior_frac_proportional": 0.0,
+  "behavior_frac_constant_mix": 0.0,
+  "behavior_frac_pool_power_mix": 0.0,
+  "behavior_frac_random_logits": 0.0,
+  "behavior_frac_actor_logits": 1.0,
+  "eval_return_mean": -44.38923328278427,
+  "eval_cooperation_mean": 0.0075,
+  "eval_gini_mean": 0.3470080537173584,
+  "eval_mean_total_resource": 449.9543103586189,
+  "eval_collapse_rate": 0.625,
+  "eval_mean_resource": 8.999086207172379,
+  "eval_mean_payoff": 1.2077633509850554,
+  "eval_mean_pool_raw": 1.9747243089804856,
+  "eval_mean_pool_grown": 3.1824876682715004,
+  "eval_sustainability_rate": 0.375,
+  "eval_return_mean/regular": -40.49655586571464,
+  "eval_return_mean/erdos_renyi": -58.450208117198684,
+  "eval_return_mean/small_world": -50.84907024133682,
+  "eval_return_mean/scale_free": -27.761098906886936,
+  "eval_mean_resource/regular": 5.017592033051444,
+  "eval_mean_resource/erdos_renyi": 10.769713240996083,
+  "eval_mean_resource/small_world": 5.133517782056397,
+  "eval_mean_resource/scale_free": 15.075521772585592,
+  "eval_mean_total_resource/regular": 250.87960165257215,
+  "eval_mean_total_resource/erdos_renyi": 538.4856620498042,
+  "eval_mean_total_resource/small_world": 256.67588910281984,
+  "eval_mean_total_resource/scale_free": 753.7760886292795,
+  "eval_mean_payoff/regular": 0.4813990614383768,
+  "eval_mean_payoff/erdos_renyi": 1.222753213927849,
+  "eval_mean_payoff/small_world": 0.47554602781645033,
+  "eval_mean_payoff/scale_free": 2.651355100757545,
+  "eval_mean_pool_raw/regular": 0.6418654116307869,
+  "eval_mean_pool_raw/erdos_renyi": 3.082669747217459,
+  "eval_mean_pool_raw/small_world": 0.63406137517869,
+  "eval_mean_pool_raw/scale_free": 3.5403007018950063,
+  "eval_mean_pool_grown/regular": 1.1232644703538774,
+  "eval_mean_pool_grown/erdos_renyi": 4.305422991052523,
+  "eval_mean_pool_grown/small_world": 1.1096074065627075,
+  "eval_mean_pool_grown/scale_free": 6.191655805116893,
+  "eval_cooperation_mean/regular": 0.0,
+  "eval_cooperation_mean/erdos_renyi": 0.03,
+  "eval_cooperation_mean/small_world": 0.0,
+  "eval_cooperation_mean/scale_free": 0.0,
+  "eval_gini_mean/regular": 0.0,
+  "eval_gini_mean/erdos_renyi": 0.46559373701926543,
+  "eval_gini_mean/small_world": 0.0,
+  "eval_gini_mean/scale_free": 0.9224384778501681,
+  "eval_collapse_rate/regular": 1.0,
+  "eval_collapse_rate/erdos_renyi": 0.5,
+  "eval_collapse_rate/small_world": 1.0,
+  "eval_collapse_rate/scale_free": 0.0,
+  "profile_on_update_seconds": 0.0013853199779987335
+}
+Results saved to: /home/QinYiHang/Code/GNN_SPGG/outputs/perf_baseline/spgg_GNN_12workers_20length_Fermi_Teacher-Return_Critic__baseline__20260402_195812__online_centralized_current/results.json

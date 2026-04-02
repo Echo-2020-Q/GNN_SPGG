@@ -25,3 +25,22 @@ Demo Pretrain | collection progress | 19200/100000 (19.2%) | ETA=2m 17s | elapse
 Demo Pretrain | collection progress | 24000/100000 (24.0%) | ETA=1m 52s | elapsed=35s
 Demo Pretrain | collection progress | 28800/100000 (28.8%) | ETA=1m 35s | elapsed=38s
 Demo Pretrain | collection progress | 33600/100000 (33.6%) | ETA=1m 21s | elapsed=41s
+Demo Pretrain | collection progress | 38400/100000 (38.4%) | ETA=1m 10s | elapsed=44s
+Demo Pretrain | collection progress | 43200/100000 (43.2%) | ETA=1m 01s | elapsed=47s
+Demo Pretrain | collection progress | 48000/100000 (48.0%) | ETA=54s | elapsed=50s
+Demo Pretrain | collection progress | 52800/100000 (52.8%) | ETA=47s | elapsed=53s
+Demo Pretrain | collection progress | 57600/100000 (57.6%) | ETA=41s | elapsed=55s
+Demo Pretrain | collection progress | 62400/100000 (62.4%) | ETA=35s | elapsed=58s
+Demo Pretrain | collection progress | 67200/100000 (67.2%) | ETA=30s | elapsed=1m 01s
+Demo Pretrain | collection progress | 72000/100000 (72.0%) | ETA=25s | elapsed=1m 04s
+Demo Pretrain | collection progress | 76800/100000 (76.8%) | ETA=20s | elapsed=1m 07s
+Demo Pretrain | collection progress | 81600/100000 (81.6%) | ETA=16s | elapsed=1m 09s
+Demo Pretrain | collection progress | 86400/100000 (86.4%) | ETA=11s | elapsed=1m 12s
+Demo Pretrain | collection progress | 91200/100000 (91.2%) | ETA=7s | elapsed=1m 15s
+Demo Pretrain | collection progress | 96000/100000 (96.0%) | ETA=3s | elapsed=1m 18s
+Demo Pretrain | collection progress | 100000/100000 (100.0%) | ETA=0s | elapsed=1m 20s
+Demo Pretrain | external collection done | demo_replay_size=100000 | return_mode=n_step | target_mean=91.113617 | target_std=41.133602 | seconds=84.596
+Demo Pretrain | actor BC start | updates=3000
+Demo Pretrain | actor_bc progress | 150/3000 (5.0%) | ETA=21m 22s | elapsed=1m 07s
+Demo Pretrain | actor_bc progress | 300/3000 (10.0%) | ETA=20m 11s | elapsed=2m 15s
+Demo Pretrain | actor_bc progress | 450/3000 (15.0%) | ETA=19m 04s | elapsed=3m 22s
