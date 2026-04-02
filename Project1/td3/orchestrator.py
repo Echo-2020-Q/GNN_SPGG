@@ -104,7 +104,9 @@ class GraphTD3Trainer:
         self.rollout_explorer = LogitSpaceExplorer()
         self.rollout_inference_servers: list[ParallelRolloutInferenceServer] = []
         self.workers = []
-        self._initialize_rollout_runtime()
+        self._rollout_runtime_initialized = False
+        if not self._should_delay_rollout_runtime_initialization():
+            self._initialize_rollout_runtime()
 
         evaluator_factories = list(eval_env_factories) if eval_env_factories is not None else [
             RandomizedEnvFactory.from_env(eval_env or env)
@@ -194,8 +196,17 @@ class GraphTD3Trainer:
             if callable(close_method):
                 close_method()
         self.rollout_inference_servers = []
+        self._rollout_runtime_initialized = False
+
+    def _should_delay_rollout_runtime_initialization(self) -> bool:
+        return (
+            bool(self.config.demo_pretrain_enabled)
+            and str(self.config.demo_collection_runtime) != "reuse_workers"
+        )
 
     def _initialize_rollout_runtime(self) -> None:
+        if self._rollout_runtime_initialized:
+            return
         self._shutdown_rollout_runtime()
         actor_source = self.learner.actor
         centralized_rollout_inference = _should_use_centralized_rollout_inference(self.config)
@@ -243,6 +254,7 @@ class GraphTD3Trainer:
                     device=worker_device,
                 )
             self.workers.append(worker)
+        self._rollout_runtime_initialized = True
 
     def _resolve_curriculum_stage(self, update: int) -> tuple[int, Mapping[str, Any]] | None:
         if not self.curriculum_stages:
@@ -769,6 +781,9 @@ class GraphTD3Trainer:
             demo_factory = self._build_demo_collection_factory()
             demo_collection_runtime = str(self.config.demo_collection_runtime)
             if demo_collection_runtime == "reuse_workers":
+                if not self._rollout_runtime_initialized:
+                    print("Demo Pretrain | initializing rollout workers for reuse_workers collection")
+                    self._initialize_rollout_runtime()
                 print("Demo Pretrain | runtime=reuse_workers")
                 for worker in self.workers:
                     worker.set_env_factory(demo_factory, reset_environment=True)
@@ -812,8 +827,10 @@ class GraphTD3Trainer:
                         max(1, int(self.config.steps_per_update)),
                     )
                 )
-                print("Demo Pretrain | suspending online rollout workers during parallel_cpu collection")
-                self._shutdown_rollout_runtime()
+                had_active_rollout_runtime = bool(self._rollout_runtime_initialized)
+                if had_active_rollout_runtime:
+                    print("Demo Pretrain | suspending online rollout workers during parallel_cpu collection")
+                    self._shutdown_rollout_runtime()
                 try:
                     self._collect_demo_rollouts_with_parallel_workers(
                         demo_factory=demo_factory,
@@ -822,8 +839,9 @@ class GraphTD3Trainer:
                         demo_return_targets=demo_return_targets,
                     )
                 finally:
-                    print("Demo Pretrain | restoring online rollout workers after parallel_cpu collection")
-                    self._initialize_rollout_runtime()
+                    if had_active_rollout_runtime:
+                        print("Demo Pretrain | restoring online rollout workers after parallel_cpu collection")
+                        self._initialize_rollout_runtime()
             else:
                 print(
                     "Demo Pretrain | runtime=isolated_cpu | envs={0} | steps_per_sync={1}".format(
@@ -1034,6 +1052,9 @@ class GraphTD3Trainer:
             return [dict(item) for item in self.history]
         if self.completed_updates == 0 and not self.demo_pretrain_completed and bool(self.config.demo_pretrain_enabled):
             self._run_demo_pretrain()
+        if not self._rollout_runtime_initialized:
+            print("Rollout Runtime | initializing online rollout workers")
+            self._initialize_rollout_runtime()
 
         overlap_rollout_and_update = self._should_overlap_rollout_and_update()
         pending_collect_started_at: float | None = None
