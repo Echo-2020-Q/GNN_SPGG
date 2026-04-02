@@ -54,6 +54,10 @@ class GraphTD3Config:
     warmup_actor_bc_coef: float = 1.0
     actor_demo_bc_coef: float = 0.25
     actor_demo_bc_decay_end_fraction: float = 0.50
+    actor_bc_q_filter_enabled: bool = False
+    actor_bc_q_filter_margin: float = 0.0
+    actor_bc_q_filter_online_only: bool = True
+    actor_bc_q_filter_require_teacher_release: bool = True
     demo_pretrain_enabled: bool = False
     demo_collection_env_steps: int = 0
     demo_collection_behavior_source: str = "pool_power_mix"
@@ -75,6 +79,12 @@ class GraphTD3Config:
     teacher_takeover_start_prob: float = 0.8
     teacher_takeover_end_prob: float = 0.0
     teacher_takeover_decay_end_fraction: float = 0.30
+    adaptive_teacher_release_enabled: bool = False
+    adaptive_teacher_release_min_return_ratio: float = 0.90
+    adaptive_teacher_release_max_actor_bc_val_ratio: float = 1.20
+    adaptive_teacher_release_max_critic_val_ratio: float = 1.20
+    adaptive_teacher_release_required_evals: int = 3
+    adaptive_teacher_release_min_criteria: int = 2
     online_actor_q_coef_initial: float = 0.2
     online_actor_q_coef_final: float = 1.0
     online_actor_q_coef_ramp_end_fraction: float = 0.30
@@ -215,6 +225,14 @@ class GraphTD3Config:
             raise ValueError("actor_demo_bc_coef must be non-negative.")
         if self.actor_demo_bc_decay_end_fraction < 0.0 or self.actor_demo_bc_decay_end_fraction > 1.0:
             raise ValueError("actor_demo_bc_decay_end_fraction must be in [0, 1].")
+        if not isinstance(self.actor_bc_q_filter_enabled, bool):
+            raise ValueError("actor_bc_q_filter_enabled must be a bool.")
+        if self.actor_bc_q_filter_margin < 0.0:
+            raise ValueError("actor_bc_q_filter_margin must be non-negative.")
+        if not isinstance(self.actor_bc_q_filter_online_only, bool):
+            raise ValueError("actor_bc_q_filter_online_only must be a bool.")
+        if not isinstance(self.actor_bc_q_filter_require_teacher_release, bool):
+            raise ValueError("actor_bc_q_filter_require_teacher_release must be a bool.")
         if not isinstance(self.demo_pretrain_enabled, bool):
             raise ValueError("demo_pretrain_enabled must be a bool.")
         if self.demo_collection_env_steps < 0:
@@ -256,6 +274,18 @@ class GraphTD3Config:
             raise ValueError("teacher_takeover_end_prob must be in [0, 1].")
         if self.teacher_takeover_decay_end_fraction < 0.0 or self.teacher_takeover_decay_end_fraction > 1.0:
             raise ValueError("teacher_takeover_decay_end_fraction must be in [0, 1].")
+        if not isinstance(self.adaptive_teacher_release_enabled, bool):
+            raise ValueError("adaptive_teacher_release_enabled must be a bool.")
+        if self.adaptive_teacher_release_min_return_ratio < 0.0:
+            raise ValueError("adaptive_teacher_release_min_return_ratio must be non-negative.")
+        if self.adaptive_teacher_release_max_actor_bc_val_ratio <= 0.0:
+            raise ValueError("adaptive_teacher_release_max_actor_bc_val_ratio must be positive.")
+        if self.adaptive_teacher_release_max_critic_val_ratio <= 0.0:
+            raise ValueError("adaptive_teacher_release_max_critic_val_ratio must be positive.")
+        if self.adaptive_teacher_release_required_evals <= 0:
+            raise ValueError("adaptive_teacher_release_required_evals must be positive.")
+        if self.adaptive_teacher_release_min_criteria <= 0:
+            raise ValueError("adaptive_teacher_release_min_criteria must be positive.")
         if self.online_actor_q_coef_initial < 0.0:
             raise ValueError("online_actor_q_coef_initial must be non-negative.")
         if self.online_actor_q_coef_final < 0.0:

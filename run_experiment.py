@@ -553,6 +553,22 @@ BASE_EXPERIMENT = {
         # 例如 0.50 表示到总 rollout 步数的 20% 时衰减到 0。
         "actor_demo_bc_decay_end_fraction": 0.50,
 
+        # 是否启用 actor BC 的 Q-filter。
+        # 启用后，online 阶段只在 critic 认为 demo 动作优于当前 actor 动作时，才对该 demo transition 施加 BC。
+        "actor_bc_q_filter_enabled": True,
+
+        # Q-filter 的最小优势边际：
+        # 仅当 Q_demo > Q_actor + margin 时，该 demo transition 才参与 BC。
+        "actor_bc_q_filter_margin": 0.0,
+
+        # 是否只在 online 阶段启用 Q-filter。
+        # 设为 True 时，demo pretrain 仍使用纯 BC，不受 critic 过滤。
+        "actor_bc_q_filter_online_only": True,
+
+        # 是否要求 adaptive teacher release 已解锁后，Q-filter 才生效。
+        # 这样可以避免 critic 还未稳定时，过早用 Q-filter 削弱 BC。
+        "actor_bc_q_filter_require_teacher_release": True,
+
         # 是否在正式 online TD3 训练前，先执行 demo 预训练三阶段：
         # 1) 固定专家轨迹收集
         # 2) actor BC 预训练
@@ -646,6 +662,26 @@ BASE_EXPERIMENT = {
 
         # teacher takeover 线性衰减到 end_prob 的总 rollout 步数比例。
         "teacher_takeover_decay_end_fraction": 0.30,
+
+        # 是否启用“达标后再退场”的 adaptive teacher release。
+        # 启用后，teacher 会先保持在高权重，直到 online 评估显示 actor/critic 达到稳定阈值，再开始按 teacher_takeover_* 的 schedule 衰减。
+        "adaptive_teacher_release_enabled": True,
+
+        # online eval return 至少达到 pretrain best quick-eval 的多少比例，才允许 teacher 开始退场。
+        "adaptive_teacher_release_min_return_ratio": 0.90,
+
+        # online actor_bc_val_loss 最多放大到 pretrain best 的多少倍，仍视为稳定。
+        "adaptive_teacher_release_max_actor_bc_val_ratio": 1.20,
+
+        # online critic_val_loss 最多放大到 pretrain best 的多少倍，仍视为稳定。
+        "adaptive_teacher_release_max_critic_val_ratio": 1.20,
+
+        # 连续多少次 online eval 达标后，才真正解锁 teacher 退场。
+        "adaptive_teacher_release_required_evals": 3,
+
+        # 稳定条件至少满足多少条才算一次达标。
+        # 当前条件包括：eval return、actor_bc_val、critic_val。
+        "adaptive_teacher_release_min_criteria": 2,
 
         # online 阶段 actor 的 Q 项初始系数。
         # 早期让 actor loss 以 BC 为主，Q 为辅。
@@ -1739,6 +1775,10 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         warmup_actor_bc_coef=training.get("warmup_actor_bc_coef", 1.0),
         actor_demo_bc_coef=training.get("actor_demo_bc_coef", 0.25),
         actor_demo_bc_decay_end_fraction=training.get("actor_demo_bc_decay_end_fraction", 0.50),
+        actor_bc_q_filter_enabled=training.get("actor_bc_q_filter_enabled", False),
+        actor_bc_q_filter_margin=training.get("actor_bc_q_filter_margin", 0.0),
+        actor_bc_q_filter_online_only=training.get("actor_bc_q_filter_online_only", True),
+        actor_bc_q_filter_require_teacher_release=training.get("actor_bc_q_filter_require_teacher_release", True),
         demo_pretrain_enabled=training.get("demo_pretrain_enabled", False),
         demo_collection_env_steps=training.get("demo_collection_env_steps", 0),
         demo_collection_behavior_source=training.get("demo_collection_behavior_source", "pool_power_mix"),
@@ -1760,6 +1800,18 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         teacher_takeover_start_prob=training.get("teacher_takeover_start_prob", 0.8),
         teacher_takeover_end_prob=training.get("teacher_takeover_end_prob", 0.0),
         teacher_takeover_decay_end_fraction=training.get("teacher_takeover_decay_end_fraction", 0.30),
+        adaptive_teacher_release_enabled=training.get("adaptive_teacher_release_enabled", False),
+        adaptive_teacher_release_min_return_ratio=training.get("adaptive_teacher_release_min_return_ratio", 0.90),
+        adaptive_teacher_release_max_actor_bc_val_ratio=training.get(
+            "adaptive_teacher_release_max_actor_bc_val_ratio",
+            1.20,
+        ),
+        adaptive_teacher_release_max_critic_val_ratio=training.get(
+            "adaptive_teacher_release_max_critic_val_ratio",
+            1.20,
+        ),
+        adaptive_teacher_release_required_evals=training.get("adaptive_teacher_release_required_evals", 3),
+        adaptive_teacher_release_min_criteria=training.get("adaptive_teacher_release_min_criteria", 2),
         online_actor_q_coef_initial=training.get("online_actor_q_coef_initial", 0.2),
         online_actor_q_coef_final=training.get("online_actor_q_coef_final", 1.0),
         online_actor_q_coef_ramp_end_fraction=training.get("online_actor_q_coef_ramp_end_fraction", 0.30),
@@ -3058,6 +3110,10 @@ def _format_console_recent_stats_lines(
         ("actor_bc_loss", "actor_bc_loss"),
         ("actor_bc_coef", "actor_bc_coef"),
         ("actor_q_coef", "actor_q_coef"),
+        ("q_filter_pass_frac", "q_filter_pass"),
+        ("q_filter_demo_q_mean", "qf_demo_q"),
+        ("q_filter_actor_q_mean", "qf_actor_q"),
+        ("q_filter_margin_mean", "qf_margin"),
         ("actor_grad_norm", "actor_grad_norm"),
         ("critic_grad_norm", "critic_grad_norm"),
         ("actor_grad_norm_pre_clip", "actor_grad_pre"),
@@ -3072,6 +3128,10 @@ def _format_console_recent_stats_lines(
         ("replay_teacher_frac", "replay_teacher"),
         ("replay_collapse_frac", "replay_collapse"),
         ("teacher_takeover_prob", "teacher_takeover"),
+        ("online_actor_bc_val_loss", "online_actor_bc_val"),
+        ("online_critic_val_loss", "online_critic_val"),
+        ("teacher_release_unlocked", "teacher_release"),
+        ("teacher_release_stable_eval_count", "teacher_release_stable"),
         ("profile_rollout_steps_per_second", "rollout_sps"),
         ("profile_rollout_collect_seconds", "rollout_collect_s"),
         ("profile_rollout_collect_worker_seconds", "worker_collect_s"),
@@ -3820,11 +3880,21 @@ def run_gnn_training_mode(
                 )
             )
         print(
-            "Stab CFG : teacher_takeover={0}({1}->{2}, end@{3}), actor_q_coef={4}->{5} end@{6}, critic_loss={7}, huber_delta={8}, grad_clip(actor={9}, critic={10})".format(
+            "Stab CFG : teacher_takeover={0}({1}->{2}, end@{3}), adaptive_release={4}(return>={5:.2f}x, actor_bc<={6:.2f}x, critic<={7:.2f}x, need={8}/{9}), q_filter={10}(margin={11}, online_only={12}, require_release={13}), actor_q_coef={14}->{15} end@{16}, critic_loss={17}, huber_delta={18}, grad_clip(actor={19}, critic={20})".format(
                 trainer_config.teacher_takeover_enabled,
                 trainer_config.teacher_takeover_start_prob,
                 trainer_config.teacher_takeover_end_prob,
                 trainer_config.teacher_takeover_decay_end_fraction,
+                trainer_config.adaptive_teacher_release_enabled,
+                trainer_config.adaptive_teacher_release_min_return_ratio,
+                trainer_config.adaptive_teacher_release_max_actor_bc_val_ratio,
+                trainer_config.adaptive_teacher_release_max_critic_val_ratio,
+                trainer_config.adaptive_teacher_release_required_evals,
+                trainer_config.adaptive_teacher_release_min_criteria,
+                trainer_config.actor_bc_q_filter_enabled,
+                trainer_config.actor_bc_q_filter_margin,
+                trainer_config.actor_bc_q_filter_online_only,
+                trainer_config.actor_bc_q_filter_require_teacher_release,
                 trainer_config.online_actor_q_coef_initial,
                 trainer_config.online_actor_q_coef_final,
                 trainer_config.online_actor_q_coef_ramp_end_fraction,

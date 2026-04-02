@@ -167,6 +167,11 @@ class GraphTD3Learner:
         self.last_actor_grad_norm_post_clip = 0.0
         self.last_critic_grad_norm_pre_clip = 0.0
         self.last_critic_grad_norm_post_clip = 0.0
+        self.last_q_filter_enabled = 0.0
+        self.last_q_filter_pass_frac = 0.0
+        self.last_q_filter_demo_q_mean = 0.0
+        self.last_q_filter_actor_q_mean = 0.0
+        self.last_q_filter_margin_mean = 0.0
 
         self.target_actor.load_state_dict(self.actor.state_dict())
         self.target_critics.load_state_dict(self.critics.state_dict())
@@ -288,6 +293,11 @@ class GraphTD3Learner:
             "last_actor_grad_norm_post_clip": float(self.last_actor_grad_norm_post_clip),
             "last_critic_grad_norm_pre_clip": float(self.last_critic_grad_norm_pre_clip),
             "last_critic_grad_norm_post_clip": float(self.last_critic_grad_norm_post_clip),
+            "last_q_filter_enabled": float(self.last_q_filter_enabled),
+            "last_q_filter_pass_frac": float(self.last_q_filter_pass_frac),
+            "last_q_filter_demo_q_mean": float(self.last_q_filter_demo_q_mean),
+            "last_q_filter_actor_q_mean": float(self.last_q_filter_actor_q_mean),
+            "last_q_filter_margin_mean": float(self.last_q_filter_margin_mean),
         }
 
     def load_checkpoint_state(self, state_dict: dict[str, Any]) -> None:
@@ -325,6 +335,11 @@ class GraphTD3Learner:
         self.last_critic_grad_norm_post_clip = float(
             state_dict.get("last_critic_grad_norm_post_clip", self.last_critic_grad_norm)
         )
+        self.last_q_filter_enabled = float(state_dict.get("last_q_filter_enabled", 0.0))
+        self.last_q_filter_pass_frac = float(state_dict.get("last_q_filter_pass_frac", 0.0))
+        self.last_q_filter_demo_q_mean = float(state_dict.get("last_q_filter_demo_q_mean", 0.0))
+        self.last_q_filter_actor_q_mean = float(state_dict.get("last_q_filter_actor_q_mean", 0.0))
+        self.last_q_filter_margin_mean = float(state_dict.get("last_q_filter_margin_mean", 0.0))
 
     def _current_demo_bc_coef(self, global_env_steps: int | None) -> float:
         if int(self.config.warmup_steps) <= 0:
@@ -505,6 +520,66 @@ class GraphTD3Learner:
             "critic_error_std": _std(error_sumsq, mean_error),
         }
 
+    def _compute_demo_q_filter_mask(
+        self,
+        batch: TensorReplayBatch,
+        *,
+        margin: float,
+    ) -> tuple[Tensor, dict[str, float]]:
+        demo_mask = batch.is_demo.bool()
+        batch_size = _batch_size_from_observations(batch.obs)
+        q_filter_mask = torch.zeros_like(demo_mask, dtype=torch.bool)
+        total_demo_count = int(demo_mask.sum().item())
+        if total_demo_count <= 0:
+            return q_filter_mask, {
+                "q_filter_enabled": 1.0,
+                "q_filter_pass_frac": 0.0,
+                "q_filter_demo_q_mean": 0.0,
+                "q_filter_actor_q_mean": 0.0,
+                "q_filter_margin_mean": 0.0,
+            }
+
+        chunk_size = max(1, int(self.config.graph_batch_chunk_size))
+        total_pass_count = 0
+        total_demo_q = 0.0
+        total_actor_q = 0.0
+        total_margin = 0.0
+
+        with torch.no_grad():
+            for start, end in _chunk_ranges(batch_size, chunk_size):
+                chunk_observations = _slice_observation_batch(batch.obs, start, end)
+                chunk_demo_mask = demo_mask[start:end]
+                if not bool(chunk_demo_mask.any().item()):
+                    continue
+
+                actor_outputs = self.actor.deterministic_action_tensor_batch(chunk_observations)
+                demo_q1, demo_q2 = self.critics.forward_tensor_batch(
+                    chunk_observations,
+                    batch.action.allocation[start:end],
+                )
+                actor_q1, actor_q2 = self.critics.forward_tensor_batch(
+                    chunk_observations,
+                    actor_outputs.allocation_matrix.detach(),
+                )
+                demo_q = torch.minimum(demo_q1, demo_q2)
+                actor_q = torch.minimum(actor_q1, actor_q2)
+                q_margin = demo_q - actor_q
+
+                q_filter_mask[start:end] = chunk_demo_mask & (q_margin > float(margin))
+                total_pass_count += int(q_filter_mask[start:end].sum().item())
+                total_demo_q += float(demo_q[chunk_demo_mask].sum().item())
+                total_actor_q += float(actor_q[chunk_demo_mask].sum().item())
+                total_margin += float(q_margin[chunk_demo_mask].sum().item())
+
+        normalization = float(max(total_demo_count, 1))
+        return q_filter_mask, {
+            "q_filter_enabled": 1.0,
+            "q_filter_pass_frac": float(total_pass_count) / normalization,
+            "q_filter_demo_q_mean": float(total_demo_q) / normalization,
+            "q_filter_actor_q_mean": float(total_actor_q) / normalization,
+            "q_filter_margin_mean": float(total_margin) / normalization,
+        }
+
     def actor_bc_pretrain_step(self, batch_size: int | None = None) -> dict[str, float]:
         resolved_batch_size = self._resolve_pretrain_batch_size(batch_size)
         cpu_batch = self.replay_buffer.sample_demo(
@@ -528,6 +603,7 @@ class GraphTD3Learner:
             actor_q_enabled=False,
             bc_coef=self.last_actor_bc_coef,
             actor_q_coef=self.last_actor_q_coef,
+            enable_q_filter=bool(self.config.actor_bc_q_filter_enabled and not self.config.actor_bc_q_filter_online_only),
         )
         self.target_actor.load_state_dict(self.actor.state_dict())
         return {
@@ -586,7 +662,12 @@ class GraphTD3Learner:
             **replay_sample_stats,
         }
 
-    def train_step(self, global_env_steps: int | None = None) -> dict[str, float]:
+    def train_step(
+        self,
+        global_env_steps: int | None = None,
+        *,
+        teacher_release_unlocked: bool = False,
+    ) -> dict[str, float]:
         if len(self.replay_buffer) < max(1, self.config.batch_size):
             return {
                 "critic1_loss": 0.0,
@@ -600,6 +681,11 @@ class GraphTD3Learner:
                 "actor_bc_loss": self.last_actor_bc_loss,
                 "actor_bc_coef": self.last_actor_bc_coef,
                 "actor_q_coef": self.last_actor_q_coef,
+                "q_filter_enabled": self.last_q_filter_enabled,
+                "q_filter_pass_frac": self.last_q_filter_pass_frac,
+                "q_filter_demo_q_mean": self.last_q_filter_demo_q_mean,
+                "q_filter_actor_q_mean": self.last_q_filter_actor_q_mean,
+                "q_filter_margin_mean": self.last_q_filter_margin_mean,
                 "loss": 0.0,
                 "replay_size": float(len(self.replay_buffer)),
                 "replay_demo_frac": self.last_replay_demo_frac,
@@ -660,6 +746,11 @@ class GraphTD3Learner:
             "actor_reg_loss": self.last_actor_reg_loss,
             "actor_bc_loss": self.last_actor_bc_loss,
             "actor_bc_coef": self.last_actor_bc_coef,
+            "q_filter_enabled": self.last_q_filter_enabled,
+            "q_filter_pass_frac": self.last_q_filter_pass_frac,
+            "q_filter_demo_q_mean": self.last_q_filter_demo_q_mean,
+            "q_filter_actor_q_mean": self.last_q_filter_actor_q_mean,
+            "q_filter_margin_mean": self.last_q_filter_margin_mean,
         }
         actor_update_seconds = 0.0
         target_soft_update_seconds = 0.0
@@ -676,6 +767,10 @@ class GraphTD3Learner:
         )
         if actor_q_enabled:
             actor_q_coef = self._current_actor_q_coef(global_env_steps)
+        q_filter_enabled = bool(self.config.actor_bc_q_filter_enabled) and actor_q_enabled and bc_coef > 0.0
+        if q_filter_enabled and bool(self.config.actor_bc_q_filter_require_teacher_release):
+            if bool(self.config.adaptive_teacher_release_enabled):
+                q_filter_enabled = bool(teacher_release_unlocked)
         self.last_actor_bc_coef = float(bc_coef)
         self.last_actor_q_coef = float(actor_q_coef)
         if self.update_step_count % self.config.policy_delay == 0:
@@ -685,6 +780,7 @@ class GraphTD3Learner:
                 actor_q_enabled=actor_q_enabled,
                 bc_coef=bc_coef,
                 actor_q_coef=actor_q_coef,
+                enable_q_filter=q_filter_enabled,
             )
             actor_update_seconds = float(perf_counter() - actor_update_start)
 
@@ -821,10 +917,24 @@ class GraphTD3Learner:
         actor_q_enabled: bool,
         bc_coef: float,
         actor_q_coef: float,
+        enable_q_filter: bool = False,
     ) -> dict[str, float]:
         observations = batch.obs
         target_actions = batch.action.allocation
         demo_mask = batch.is_demo.bool()
+        q_filter_metrics = {
+            "q_filter_enabled": 0.0,
+            "q_filter_pass_frac": 0.0,
+            "q_filter_demo_q_mean": 0.0,
+            "q_filter_actor_q_mean": 0.0,
+            "q_filter_margin_mean": 0.0,
+        }
+        effective_demo_mask = demo_mask
+        if bool(enable_q_filter):
+            effective_demo_mask, q_filter_metrics = self._compute_demo_q_filter_mask(
+                batch,
+                margin=float(self.config.actor_bc_q_filter_margin),
+            )
 
         self.actor_optimizer.zero_grad(set_to_none=True)
 
@@ -835,9 +945,7 @@ class GraphTD3Learner:
         total_entropy_rows = 0
         total_logit_square = 0.0
         total_valid_logits = int(observations["local_mask"].sum().item())
-        total_demo_valid_entries = int(
-            (observations["local_mask"] & demo_mask.view(-1, 1, 1)).sum().item()
-        )
+        total_demo_valid_entries = int((observations["local_mask"] & effective_demo_mask.view(-1, 1, 1)).sum().item())
         total_bc_square = 0.0
 
         for start, end in _chunk_ranges(batch_size, chunk_size):
@@ -870,7 +978,7 @@ class GraphTD3Learner:
             total_entropy += float(entropy_sum.item())
             total_entropy_rows += entropy_rows
 
-            chunk_demo_mask = demo_mask[start:end]
+            chunk_demo_mask = effective_demo_mask[start:end]
             if bool(chunk_demo_mask.any().item()) and total_demo_valid_entries > 0:
                 chunk_valid_demo_mask = chunk_observations["local_mask"] & chunk_demo_mask.view(-1, 1, 1)
                 bc_square_sum = (allocation - target_actions[start:end]).pow(2)[chunk_valid_demo_mask].sum()
@@ -917,6 +1025,11 @@ class GraphTD3Learner:
         self.last_actor_logit_l2 = float(mean_logit_l2)
         self.last_actor_reg_loss = float(actor_reg_loss)
         self.last_actor_bc_loss = float(actor_bc_loss)
+        self.last_q_filter_enabled = float(q_filter_metrics["q_filter_enabled"])
+        self.last_q_filter_pass_frac = float(q_filter_metrics["q_filter_pass_frac"])
+        self.last_q_filter_demo_q_mean = float(q_filter_metrics["q_filter_demo_q_mean"])
+        self.last_q_filter_actor_q_mean = float(q_filter_metrics["q_filter_actor_q_mean"])
+        self.last_q_filter_margin_mean = float(q_filter_metrics["q_filter_margin_mean"])
         return {
             "actor_loss": self.last_actor_loss,
             "actor_q_loss": self.last_actor_q_loss,
@@ -926,6 +1039,11 @@ class GraphTD3Learner:
             "actor_bc_loss": self.last_actor_bc_loss,
             "actor_bc_coef": self.last_actor_bc_coef,
             "actor_q_coef": self.last_actor_q_coef,
+            "q_filter_enabled": self.last_q_filter_enabled,
+            "q_filter_pass_frac": self.last_q_filter_pass_frac,
+            "q_filter_demo_q_mean": self.last_q_filter_demo_q_mean,
+            "q_filter_actor_q_mean": self.last_q_filter_actor_q_mean,
+            "q_filter_margin_mean": self.last_q_filter_margin_mean,
             "actor_grad_norm": self.last_actor_grad_norm,
             "actor_grad_norm_pre_clip": self.last_actor_grad_norm_pre_clip,
             "actor_grad_norm_post_clip": self.last_actor_grad_norm_post_clip,

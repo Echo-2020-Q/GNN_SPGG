@@ -185,3 +185,50 @@ class GraphTD3LearnerPretrainTests(unittest.TestCase):
             float(late_metrics["critic_grad_norm_pre_clip"]),
             float(late_metrics["critic_grad_norm_post_clip"]),
         )
+
+    def test_q_filter_can_disable_demo_bc_loss(self) -> None:
+        learner = self._make_learner()
+        learner.config.warmup_steps = 1
+        learner.config.policy_delay = 1
+        learner.config.total_updates = 100
+        learner.config.steps_per_update = 1
+        learner.config.batch_size = 4
+        learner.config.actor_bc_q_filter_enabled = True
+        learner.config.actor_bc_q_filter_margin = 1e6
+        learner.config.actor_bc_q_filter_require_teacher_release = False
+
+        fixed_batch = learner.replay_buffer.export_demo_batch()
+        assert fixed_batch is not None
+        learner.replay_buffer.sample = lambda *args, **kwargs: fixed_batch  # type: ignore[method-assign]
+        learner.replay_buffer.get_last_sample_stats = lambda: {}  # type: ignore[method-assign]
+
+        metrics = learner.train_step(global_env_steps=10, teacher_release_unlocked=True)
+
+        self.assertEqual(float(metrics["q_filter_enabled"]), 1.0)
+        self.assertEqual(float(metrics["q_filter_pass_frac"]), 0.0)
+        self.assertAlmostEqual(float(metrics["actor_bc_loss"]), 0.0, places=8)
+
+    def test_q_filter_can_wait_for_teacher_release(self) -> None:
+        learner = self._make_learner()
+        learner.config.warmup_steps = 1
+        learner.config.policy_delay = 1
+        learner.config.total_updates = 100
+        learner.config.steps_per_update = 1
+        learner.config.batch_size = 4
+        learner.config.actor_bc_q_filter_enabled = True
+        learner.config.actor_bc_q_filter_margin = 1e6
+        learner.config.actor_bc_q_filter_require_teacher_release = True
+        learner.config.adaptive_teacher_release_enabled = True
+
+        fixed_batch = learner.replay_buffer.export_demo_batch()
+        assert fixed_batch is not None
+        learner.replay_buffer.sample = lambda *args, **kwargs: fixed_batch  # type: ignore[method-assign]
+        learner.replay_buffer.get_last_sample_stats = lambda: {}  # type: ignore[method-assign]
+
+        locked_metrics = learner.train_step(global_env_steps=10, teacher_release_unlocked=False)
+        unlocked_metrics = learner.train_step(global_env_steps=10, teacher_release_unlocked=True)
+
+        self.assertEqual(float(locked_metrics["q_filter_enabled"]), 0.0)
+        self.assertGreater(float(locked_metrics["actor_bc_loss"]), 0.0)
+        self.assertEqual(float(unlocked_metrics["q_filter_enabled"]), 1.0)
+        self.assertEqual(float(unlocked_metrics["q_filter_pass_frac"]), 0.0)

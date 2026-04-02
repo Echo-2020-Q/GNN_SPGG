@@ -131,6 +131,8 @@ class GraphTD3Trainer:
         self.demo_pretrain_completed = False
         self.demo_pretrain_summary: dict[str, float | str | bool | None] | None = None
         self.demo_validation_batch: TensorReplayBatch | None = None
+        self.teacher_takeover_release_env_step: int | None = None
+        self.teacher_takeover_stable_eval_count = 0
 
     def preload_demo_replay(
         self,
@@ -313,6 +315,81 @@ class GraphTD3Trainer:
             metrics["quick_eval_num_episodes"] = float(quick_eval_episodes)
         return metrics
 
+    def _update_adaptive_teacher_release(
+        self,
+        *,
+        online_eval_return_mean: float,
+        actor_bc_val_loss: float | None,
+        critic_val_loss: float | None,
+    ) -> dict[str, float]:
+        metrics = {
+            "teacher_release_enabled": 1.0 if bool(self.config.adaptive_teacher_release_enabled) else 0.0,
+            "teacher_release_unlocked": 1.0 if self.teacher_takeover_release_env_step is not None else 0.0,
+            "teacher_release_stable_eval_count": float(self.teacher_takeover_stable_eval_count),
+            "teacher_release_gate_pass_count": 0.0,
+            "teacher_release_gate_available_count": 0.0,
+            "teacher_release_passed": 0.0,
+            "teacher_release_just_unlocked": 0.0,
+        }
+        if not bool(self.config.adaptive_teacher_release_enabled):
+            return metrics
+        if self.teacher_takeover_release_env_step is not None:
+            metrics["teacher_release_unlocked"] = 1.0
+            return metrics
+        demo_summary = self.demo_pretrain_summary or {}
+        baseline_return = float(demo_summary.get("quick_eval_return_best", 0.0))
+        baseline_actor_val = float(demo_summary.get("actor_bc_val_loss_best", 0.0))
+        baseline_critic_val = float(demo_summary.get("critic_val_loss_best", 0.0))
+        passed = 0
+        available = 0
+
+        if baseline_return > 0.0:
+            available += 1
+            if float(online_eval_return_mean) >= baseline_return * float(self.config.adaptive_teacher_release_min_return_ratio):
+                passed += 1
+        if actor_bc_val_loss is not None and baseline_actor_val > 1e-8:
+            available += 1
+            if float(actor_bc_val_loss) <= baseline_actor_val * float(
+                self.config.adaptive_teacher_release_max_actor_bc_val_ratio
+            ):
+                passed += 1
+        if critic_val_loss is not None and baseline_critic_val > 1e-8:
+            available += 1
+            if float(critic_val_loss) <= baseline_critic_val * float(
+                self.config.adaptive_teacher_release_max_critic_val_ratio
+            ):
+                passed += 1
+
+        required_criteria = min(int(self.config.adaptive_teacher_release_min_criteria), max(1, available))
+        gate_passed = available > 0 and passed >= required_criteria
+        if gate_passed:
+            self.teacher_takeover_stable_eval_count += 1
+        else:
+            self.teacher_takeover_stable_eval_count = 0
+
+        if self.teacher_takeover_stable_eval_count >= int(self.config.adaptive_teacher_release_required_evals):
+            self.teacher_takeover_release_env_step = int(self.global_env_steps)
+            print(
+                "Teacher Release | unlocked at t_env={0} | eval_return={1:.6f} | actor_bc_val={2} | critic_val={3}".format(
+                    int(self.global_env_steps),
+                    float(online_eval_return_mean),
+                    "None" if actor_bc_val_loss is None else "{0:.6f}".format(float(actor_bc_val_loss)),
+                    "None" if critic_val_loss is None else "{0:.6f}".format(float(critic_val_loss)),
+                )
+            )
+            metrics["teacher_release_just_unlocked"] = 1.0
+
+        metrics.update(
+            {
+                "teacher_release_unlocked": 1.0 if self.teacher_takeover_release_env_step is not None else 0.0,
+                "teacher_release_stable_eval_count": float(self.teacher_takeover_stable_eval_count),
+                "teacher_release_gate_pass_count": float(passed),
+                "teacher_release_gate_available_count": float(available),
+                "teacher_release_passed": 1.0 if gate_passed else 0.0,
+            }
+        )
+        return metrics
+
     def _shutdown_rollout_runtime(self) -> None:
         for worker in self.workers:
             close_method = getattr(worker, "close", None)
@@ -462,6 +539,10 @@ class GraphTD3Trainer:
             "history": [dict(item) for item in self.history],
             "demo_pretrain_completed": bool(self.demo_pretrain_completed),
             "demo_pretrain_summary": None if self.demo_pretrain_summary is None else dict(self.demo_pretrain_summary),
+            "teacher_takeover_release_env_step": (
+                None if self.teacher_takeover_release_env_step is None else int(self.teacher_takeover_release_env_step)
+            ),
+            "teacher_takeover_stable_eval_count": int(self.teacher_takeover_stable_eval_count),
         }
         if checkpoint_mode == "full_resume":
             payload["replay_buffer_state"] = self.replay_buffer.state_dict()
@@ -477,6 +558,9 @@ class GraphTD3Trainer:
         self.demo_pretrain_completed = bool(checkpoint.get("demo_pretrain_completed", False))
         demo_pretrain_summary = checkpoint.get("demo_pretrain_summary")
         self.demo_pretrain_summary = None if demo_pretrain_summary is None else dict(demo_pretrain_summary)
+        release_env_step = checkpoint.get("teacher_takeover_release_env_step")
+        self.teacher_takeover_release_env_step = None if release_env_step is None else int(release_env_step)
+        self.teacher_takeover_stable_eval_count = int(checkpoint.get("teacher_takeover_stable_eval_count", 0))
         checkpoint_mode = str(
             checkpoint.get(
                 "checkpoint_mode",
@@ -501,7 +585,11 @@ class GraphTD3Trainer:
             actor_state_dict, actor_version = self.learner.publish_actor_state()
             self._sync_rollout_inference_servers(actor_state_dict)
             for worker in self.workers:
-                worker.sync_actor(actor_state_dict, version=actor_version)
+                worker.sync_actor(
+                    actor_state_dict,
+                    version=actor_version,
+                    teacher_takeover_release_env_step=self.teacher_takeover_release_env_step,
+                )
 
         actor_state_dict, _ = self.learner.publish_actor_state()
         self._sync_rollout_inference_servers(actor_state_dict)
@@ -1362,7 +1450,10 @@ class GraphTD3Trainer:
             key: 0.0 for key in self._accumulated_learner_profile_keys()
         }
         for _ in range(int(self.config.gradient_steps_per_update)):
-            step_metrics = self.learner.train_step(global_env_steps=int(self.global_env_steps))
+            step_metrics = self.learner.train_step(
+                global_env_steps=int(self.global_env_steps),
+                teacher_release_unlocked=(self.teacher_takeover_release_env_step is not None),
+            )
             learner_metrics = dict(step_metrics)
             for key in accumulated_profiles:
                 accumulated_profiles[key] += float(step_metrics.get(key, 0.0))
@@ -1374,25 +1465,34 @@ class GraphTD3Trainer:
     def _sync_rollout_workers_if_needed(self, update: int) -> dict[str, float]:
         sync_metrics = self._empty_rollout_sync_profile()
         if update == 1 or ((update - 1) % self.config.worker_sync_interval == 0):
-            publish_start = perf_counter()
-            actor_state_dict, actor_version = self.learner.publish_actor_state()
-            sync_metrics["profile_actor_publish_seconds"] = float(perf_counter() - publish_start)
+            sync_metrics = self._broadcast_actor_state_to_rollout_runtime()
+        return sync_metrics
 
-            inference_server_sync_start = perf_counter()
-            self._sync_rollout_inference_servers(actor_state_dict)
-            sync_metrics["profile_actor_sync_inference_server_seconds"] = float(
-                perf_counter() - inference_server_sync_start
-            )
+    def _broadcast_actor_state_to_rollout_runtime(self) -> dict[str, float]:
+        sync_metrics = self._empty_rollout_sync_profile()
+        publish_start = perf_counter()
+        actor_state_dict, actor_version = self.learner.publish_actor_state()
+        sync_metrics["profile_actor_publish_seconds"] = float(perf_counter() - publish_start)
 
-            worker_sync_start = perf_counter()
-            for worker in self.workers:
-                worker.sync_actor(actor_state_dict, version=actor_version)
-            sync_metrics["profile_actor_sync_worker_rpc_seconds"] = float(perf_counter() - worker_sync_start)
-            sync_metrics["profile_actor_sync_seconds"] = (
-                sync_metrics["profile_actor_publish_seconds"]
-                + sync_metrics["profile_actor_sync_inference_server_seconds"]
-                + sync_metrics["profile_actor_sync_worker_rpc_seconds"]
+        inference_server_sync_start = perf_counter()
+        self._sync_rollout_inference_servers(actor_state_dict)
+        sync_metrics["profile_actor_sync_inference_server_seconds"] = float(
+            perf_counter() - inference_server_sync_start
+        )
+
+        worker_sync_start = perf_counter()
+        for worker in self.workers:
+            worker.sync_actor(
+                actor_state_dict,
+                version=actor_version,
+                teacher_takeover_release_env_step=self.teacher_takeover_release_env_step,
             )
+        sync_metrics["profile_actor_sync_worker_rpc_seconds"] = float(perf_counter() - worker_sync_start)
+        sync_metrics["profile_actor_sync_seconds"] = (
+            sync_metrics["profile_actor_publish_seconds"]
+            + sync_metrics["profile_actor_sync_inference_server_seconds"]
+            + sync_metrics["profile_actor_sync_worker_rpc_seconds"]
+        )
         return sync_metrics
 
     def _should_overlap_rollout_and_update(self) -> bool:
@@ -1585,6 +1685,24 @@ class GraphTD3Trainer:
             if update % self.config.eval_interval == 0 or update == total_updates:
                 evaluation_start = perf_counter()
                 evaluation = self.evaluate(self.config.eval_episodes)
+                demo_validation_metrics = self._run_demo_pretrain_validation(include_quick_eval=False)
+                metrics["online_actor_bc_val_loss"] = float(demo_validation_metrics.get("actor_bc_val_loss", 0.0))
+                metrics["online_critic_val_loss"] = float(demo_validation_metrics.get("critic_val_loss", 0.0))
+                metrics["online_critic_q_pred_mean"] = float(demo_validation_metrics.get("critic_q_pred_mean", 0.0))
+                metrics["online_critic_q_pred_std"] = float(demo_validation_metrics.get("critic_q_pred_std", 0.0))
+                metrics["online_critic_target_mean"] = float(demo_validation_metrics.get("critic_target_mean", 0.0))
+                metrics["online_critic_target_std"] = float(demo_validation_metrics.get("critic_target_std", 0.0))
+                metrics["online_critic_error_mean"] = float(demo_validation_metrics.get("critic_error_mean", 0.0))
+                metrics["online_critic_error_std"] = float(demo_validation_metrics.get("critic_error_std", 0.0))
+                teacher_release_metrics = self._update_adaptive_teacher_release(
+                    online_eval_return_mean=float(evaluation.get("return_mean", 0.0)),
+                    actor_bc_val_loss=float(demo_validation_metrics.get("actor_bc_val_loss", 0.0)),
+                    critic_val_loss=float(demo_validation_metrics.get("critic_val_loss", 0.0)),
+                )
+                for key, value in teacher_release_metrics.items():
+                    metrics[key] = float(value)
+                if bool(teacher_release_metrics.get("teacher_release_just_unlocked", 0.0)) and self.workers:
+                    self._broadcast_actor_state_to_rollout_runtime()
                 evaluation_seconds = float(perf_counter() - evaluation_start)
                 metrics["profile_eval_seconds"] = evaluation_seconds
                 metrics["eval_return_mean"] = evaluation["return_mean"]

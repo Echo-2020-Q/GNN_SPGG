@@ -497,11 +497,20 @@ class RolloutWorker:
         self.constant_mix_policy = ConstantMixAllocationPolicy(train_config.warmup_constant_mix_omega)
         self.pool_power_mix_policy = PoolPowerMixAllocationPolicy(train_config.warmup_pool_power_k)
         self.current_warmup_behavior_sources: list[str | None] = [None for _ in range(self.num_envs_per_worker)]
+        self.teacher_takeover_release_env_step: int | None = None
 
-    def sync_actor(self, actor_state_dict: dict[str, torch.Tensor], version: int) -> None:
+    def sync_actor(
+        self,
+        actor_state_dict: dict[str, torch.Tensor],
+        version: int,
+        teacher_takeover_release_env_step: int | None = None,
+    ) -> None:
         self.actor.load_state_dict(_deserialize_module_state(actor_state_dict))
         self.actor.eval()
         self.actor_version = version
+        self.teacher_takeover_release_env_step = (
+            None if teacher_takeover_release_env_step is None else int(teacher_takeover_release_env_step)
+        )
 
     def set_env_factory(self, env_factory: RandomizedEnvFactory, reset_environment: bool = True) -> None:
         self.env_factory = env_factory
@@ -524,6 +533,11 @@ class RolloutWorker:
             "total_env_steps": int(self.total_env_steps),
             "actor_version": int(self.actor_version),
             "actor_state_dict": _serialize_module_state(_copy_module_state_to_cpu(self.actor)),
+            "teacher_takeover_release_env_step": (
+                None
+                if self.teacher_takeover_release_env_step is None
+                else int(self.teacher_takeover_release_env_step)
+            ),
             "env_metadata_list": [dict(item) for item in self.env_metadatas],
             "observation_list": [
                 ({key: np.asarray(value).copy() for key, value in observation.items()} if observation is not None else None)
@@ -540,6 +554,8 @@ class RolloutWorker:
         self.actor_version = int(state_dict["actor_version"])
         self.actor.load_state_dict(_deserialize_module_state(dict(state_dict["actor_state_dict"])))
         self.actor.eval()
+        release_env_step = state_dict.get("teacher_takeover_release_env_step")
+        self.teacher_takeover_release_env_step = None if release_env_step is None else int(release_env_step)
         env_metadata_list = state_dict.get("env_metadata_list")
         if env_metadata_list is None:
             env_metadata_list = [dict(state_dict.get("env_metadata", {}))]
@@ -587,14 +603,29 @@ class RolloutWorker:
         total_rollout_env_steps = self._total_rollout_env_steps()
         decay_end_step = int(round(float(total_rollout_env_steps) * float(self.train_config.teacher_takeover_decay_end_fraction)))
         decay_end_step = max(warmup_end_step, decay_end_step)
+        decay_duration = max(0, int(decay_end_step - warmup_end_step))
         current_step = max(0, int(global_env_step))
 
         if current_step < warmup_end_step:
             return float(self.train_config.teacher_takeover_start_prob)
-        if current_step >= decay_end_step or decay_end_step <= warmup_end_step:
+        if bool(self.train_config.adaptive_teacher_release_enabled) and self.teacher_takeover_release_env_step is None:
+            return float(self.train_config.teacher_takeover_start_prob)
+
+        release_env_step = (
+            int(self.teacher_takeover_release_env_step)
+            if self.teacher_takeover_release_env_step is not None
+            else warmup_end_step
+        )
+        release_env_step = max(warmup_end_step, release_env_step)
+        if decay_duration <= 0:
+            return float(self.train_config.teacher_takeover_end_prob)
+        decay_finish_step = release_env_step + decay_duration
+        if current_step <= release_env_step:
+            return float(self.train_config.teacher_takeover_start_prob)
+        if current_step >= decay_finish_step:
             return float(self.train_config.teacher_takeover_end_prob)
 
-        progress = float(current_step - warmup_end_step) / float(decay_end_step - warmup_end_step)
+        progress = float(current_step - release_env_step) / float(decay_duration)
         progress = min(max(progress, 0.0), 1.0)
         start_prob = float(self.train_config.teacher_takeover_start_prob)
         end_prob = float(self.train_config.teacher_takeover_end_prob)
@@ -1301,6 +1332,7 @@ def _parallel_rollout_worker_main(
                     worker.sync_actor(
                         actor_state_dict=dict(message["actor_state_dict"]),
                         version=int(message["version"]),
+                        teacher_takeover_release_env_step=message.get("teacher_takeover_release_env_step"),
                     )
                     connection.send({"status": "ok", "payload": None})
                     continue
@@ -1432,12 +1464,22 @@ class ParallelRolloutWorker:
         self._connection.send(payload)
         return self._recv_response()
 
-    def sync_actor(self, actor_state_dict: dict[str, torch.Tensor], version: int) -> None:
+    def sync_actor(
+        self,
+        actor_state_dict: dict[str, torch.Tensor],
+        version: int,
+        teacher_takeover_release_env_step: int | None = None,
+    ) -> None:
         self._request_response(
             {
                 "command": "sync_actor",
                 "actor_state_dict": _serialize_module_state(actor_state_dict),
                 "version": int(version),
+                "teacher_takeover_release_env_step": (
+                    None
+                    if teacher_takeover_release_env_step is None
+                    else int(teacher_takeover_release_env_step)
+                ),
             }
         )
 
