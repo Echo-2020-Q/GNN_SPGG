@@ -63,6 +63,10 @@ class GraphTD3Config:
     actor_bc_pretrain_updates: int = 0
     critic_pretrain_updates: int = 0
     demo_pretrain_batch_size: int | None = None
+    demo_validation_fraction: float = 0.10
+    demo_pretrain_eval_interval: int = 200
+    demo_pretrain_patience: int = 5
+    demo_pretrain_min_relative_improvement: float = 0.01
     demo_dataset_save_path: str | None = None
     demo_critic_pretrain_target_mode: str = "n_step"
     demo_critic_pretrain_n_step: int = 20
@@ -230,6 +234,14 @@ class GraphTD3Config:
             raise ValueError("critic_pretrain_updates must be non-negative.")
         if self.demo_pretrain_batch_size is not None and self.demo_pretrain_batch_size <= 0:
             raise ValueError("demo_pretrain_batch_size must be positive when provided.")
+        if self.demo_validation_fraction < 0.0 or self.demo_validation_fraction >= 1.0:
+            raise ValueError("demo_validation_fraction must be in [0, 1).")
+        if self.demo_pretrain_eval_interval <= 0:
+            raise ValueError("demo_pretrain_eval_interval must be positive.")
+        if self.demo_pretrain_patience <= 0:
+            raise ValueError("demo_pretrain_patience must be positive.")
+        if self.demo_pretrain_min_relative_improvement < 0.0:
+            raise ValueError("demo_pretrain_min_relative_improvement must be non-negative.")
         if self.demo_critic_pretrain_target_mode not in {"n_step", "mc"}:
             raise ValueError("demo_critic_pretrain_target_mode must be one of {'n_step', 'mc'}.")
         if self.demo_critic_pretrain_n_step <= 0:

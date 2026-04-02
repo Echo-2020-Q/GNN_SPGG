@@ -16,10 +16,11 @@ from Project1.policies.gnn_rl import GNNAllocationPolicy
 
 from .config import DomainRandomizationConfig, EvalConfig, GraphTD3Config, WorkerConfig
 from .critic import GraphActionCritic, GraphActionCriticConfig, TwinCritic
+from .data import TensorReplayActionRecord, TensorReplayBatch
 from .evaluator import GraphTD3Evaluator
 from .exploration import LogitSpaceExplorer
 from .learner import GraphTD3Learner
-from .replay import ReplayBuffer
+from .replay import ReplayBuffer, split_demo_batch_train_val
 from .worker import (
     ParallelRolloutInferenceServer,
     ParallelRolloutWorker,
@@ -129,11 +130,13 @@ class GraphTD3Trainer:
         self._last_replay_extend_seconds = 0.0
         self.demo_pretrain_completed = False
         self.demo_pretrain_summary: dict[str, float | str | bool | None] | None = None
+        self.demo_validation_batch: TensorReplayBatch | None = None
 
     def preload_demo_replay(
         self,
         replay_state: ReplayBuffer | Mapping[str, Any],
         summary: Mapping[str, float | str | bool | None] | None = None,
+        validation_batch: TensorReplayBatch | None = None,
     ) -> None:
         if isinstance(replay_state, ReplayBuffer):
             self.replay_buffer = replay_state
@@ -143,6 +146,7 @@ class GraphTD3Trainer:
         self.demo_pretrain_completed = False
         if summary is not None:
             self.demo_pretrain_summary = dict(summary)
+        self.demo_validation_batch = validation_batch.clone() if validation_batch is not None else None
 
     def close(self) -> None:
         self._shutdown_rollout_runtime()
@@ -198,6 +202,116 @@ class GraphTD3Trainer:
     @staticmethod
     def _progress_interval(total: int) -> int:
         return max(1, int(np.ceil(float(max(1, total)) / 20.0)))
+
+    def _make_split_rng(self) -> np.random.Generator:
+        return np.random.default_rng(int(self.config.seed or 0) + 3_000_000)
+
+    @staticmethod
+    def _concat_replay_batches(batches: Sequence[TensorReplayBatch]) -> TensorReplayBatch:
+        if not batches:
+            raise ValueError("batches must contain at least one item.")
+        if len(batches) == 1:
+            return batches[0].clone()
+        first_batch = batches[0]
+        return TensorReplayBatch(
+            obs={key: torch.cat([batch.obs[key] for batch in batches], dim=0) for key in first_batch.obs},
+            action=TensorReplayActionRecord(
+                allocation=torch.cat([batch.action.allocation for batch in batches], dim=0),
+            ),
+            reward=torch.cat([batch.reward for batch in batches], dim=0),
+            next_obs={key: torch.cat([batch.next_obs[key] for batch in batches], dim=0) for key in first_batch.next_obs},
+            done=torch.cat([batch.done for batch in batches], dim=0),
+            is_demo=torch.cat([batch.is_demo for batch in batches], dim=0),
+            collapse_flag=torch.cat([batch.collapse_flag for batch in batches], dim=0),
+            topology_id=torch.cat([batch.topology_id for batch in batches], dim=0),
+            pool_power_demo_flag=torch.cat([batch.pool_power_demo_flag for batch in batches], dim=0),
+            demo_return_target=torch.cat([batch.demo_return_target for batch in batches], dim=0),
+            demo_return_valid=torch.cat([batch.demo_return_valid for batch in batches], dim=0),
+        )
+
+    def _route_demo_batch_to_train_and_val(
+        self,
+        batch: TensorReplayBatch,
+        *,
+        split_rng: np.random.Generator,
+        validation_batches: list[TensorReplayBatch],
+    ) -> int:
+        train_batch, val_batch = split_demo_batch_train_val(
+            batch,
+            validation_fraction=float(self.config.demo_validation_fraction),
+            rng=split_rng,
+        )
+        collected_now = 0
+        if train_batch is not None and len(train_batch) > 0:
+            self.replay_buffer.extend(train_batch)
+            collected_now += len(train_batch)
+        if val_batch is not None and len(val_batch) > 0:
+            validation_batches.append(val_batch.clone())
+            collected_now += len(val_batch)
+        return collected_now
+
+    def _resolved_demo_validation_batch(self) -> TensorReplayBatch | None:
+        if self.demo_validation_batch is not None and len(self.demo_validation_batch) > 0:
+            return self.demo_validation_batch.clone()
+        exported = self.replay_buffer.export_demo_batch()
+        if exported is None or len(exported) <= 0:
+            return None
+        return exported
+
+    @staticmethod
+    def _metric_improved(
+        current: float,
+        best: float | None,
+        *,
+        greater_is_better: bool,
+        min_relative_improvement: float,
+    ) -> bool:
+        if best is None:
+            return True
+        baseline = max(abs(float(best)), 1e-8)
+        if greater_is_better:
+            return float(current) > float(best) * (1.0 + float(min_relative_improvement))
+        return float(current) < float(best) - baseline * float(min_relative_improvement)
+
+    def _current_learner_state(self) -> dict[str, Any]:
+        return copy.deepcopy(self.learner.checkpoint_state())
+
+    def _run_demo_pretrain_validation(
+        self,
+        *,
+        include_quick_eval: bool,
+    ) -> dict[str, float]:
+        validation_batch = self._resolved_demo_validation_batch()
+        metrics: dict[str, float] = {}
+        if validation_batch is not None and len(validation_batch) > 0:
+            metrics.update(self.learner.evaluate_actor_bc_on_demo_batch(validation_batch))
+            metrics.update(self.learner.evaluate_critic_on_demo_return_batch(validation_batch))
+        else:
+            metrics.update(
+                {
+                    "actor_bc_val_loss": 0.0,
+                    "actor_bc_val_num_entries": 0.0,
+                    "critic_val_loss": 0.0,
+                    "critic1_val_loss": 0.0,
+                    "critic2_val_loss": 0.0,
+                    "critic_val_num_targets": 0.0,
+                    "critic_q_pred_mean": 0.0,
+                    "critic_q_pred_std": 0.0,
+                    "critic_target_mean": 0.0,
+                    "critic_target_std": 0.0,
+                    "critic_error_mean": 0.0,
+                    "critic_error_std": 0.0,
+                }
+            )
+        if include_quick_eval:
+            quick_eval_episodes = max(1, min(int(self.config.eval_episodes), 4))
+            quick_eval = self.evaluate(num_episodes=quick_eval_episodes)
+            metrics["quick_eval_return_mean"] = float(quick_eval.get("return_mean", 0.0))
+            metrics["quick_eval_cooperation_mean"] = float(quick_eval.get("cooperation_mean", 0.0))
+            metrics["quick_eval_gini_mean"] = float(quick_eval.get("gini_mean", 0.0))
+            metrics["quick_eval_collapse_rate"] = float(quick_eval.get("collapse_rate", 0.0))
+            metrics["quick_eval_num_episodes"] = float(quick_eval_episodes)
+        return metrics
 
     def _shutdown_rollout_runtime(self) -> None:
         for worker in self.workers:
@@ -642,6 +756,8 @@ class GraphTD3Trainer:
         total_steps: int,
         demo_batches_to_save: list[Any],
         demo_return_targets: list[np.ndarray],
+        validation_batches: list[TensorReplayBatch],
+        split_rng: np.random.Generator,
     ) -> None:
         demo_worker = self._build_isolated_demo_collection_worker(demo_factory)
         remaining_steps = max(0, int(total_steps))
@@ -666,7 +782,11 @@ class GraphTD3Trainer:
                 if collected_now <= 0:
                     raise RuntimeError("Demo collection produced zero transitions.")
                 replay_extend_start = perf_counter()
-                self.replay_buffer.extend(result.replay_batch)
+                collected_now = self._route_demo_batch_to_train_and_val(
+                    result.replay_batch,
+                    split_rng=split_rng,
+                    validation_batches=validation_batches,
+                )
                 self._last_replay_extend_seconds = float(perf_counter() - replay_extend_start)
                 if self.config.demo_dataset_save_path:
                     demo_batches_to_save.append(result.replay_batch.clone())
@@ -693,6 +813,8 @@ class GraphTD3Trainer:
         total_steps: int,
         demo_batches_to_save: list[Any],
         demo_return_targets: list[np.ndarray],
+        validation_batches: list[TensorReplayBatch],
+        split_rng: np.random.Generator,
     ) -> None:
         demo_workers = self._build_parallel_demo_collection_workers(demo_factory)
         started_at = perf_counter()
@@ -720,6 +842,11 @@ class GraphTD3Trainer:
                 if self.config.demo_dataset_save_path:
                     demo_batches_to_save.extend(result.replay_batch.clone() for result in rollout_results)
                 for result in rollout_results:
+                    self._route_demo_batch_to_train_and_val(
+                        result.replay_batch,
+                        split_rng=split_rng,
+                        validation_batches=validation_batches,
+                    )
                     valid_mask = result.replay_batch.demo_return_valid.detach().cpu().numpy().astype(np.bool_, copy=False)
                     if np.any(valid_mask):
                         demo_return_targets.append(
@@ -763,10 +890,34 @@ class GraphTD3Trainer:
             "enabled": bool(self.config.demo_pretrain_enabled),
             "demo_collection_env_steps": float(self.config.demo_collection_env_steps),
             "demo_replay_size_after_collection": float(self.replay_buffer.demo_size()),
-            "actor_bc_updates": float(0),
-            "critic_pretrain_updates": float(0),
+            "demo_train_replay_size_after_split": float(self.replay_buffer.demo_size()),
+            "demo_val_replay_size_after_split": float(
+                len(self.demo_validation_batch) if self.demo_validation_batch is not None else 0
+            ),
+            "demo_validation_fraction": float(self.config.demo_validation_fraction),
+            "demo_pretrain_eval_interval": float(self.config.demo_pretrain_eval_interval),
+            "demo_pretrain_patience": float(self.config.demo_pretrain_patience),
+            "demo_pretrain_min_relative_improvement": float(self.config.demo_pretrain_min_relative_improvement),
+            "actor_bc_updates": 0.0,
+            "critic_pretrain_updates": 0.0,
             "actor_bc_loss_last": 0.0,
             "critic_loss_last": 0.0,
+            "actor_bc_val_loss_last": 0.0,
+            "actor_bc_val_loss_best": 0.0,
+            "critic_val_loss_last": 0.0,
+            "critic_val_loss_best": 0.0,
+            "quick_eval_return_last": 0.0,
+            "quick_eval_return_best": 0.0,
+            "actor_bc_eval_count": 0.0,
+            "critic_eval_count": 0.0,
+            "actor_bc_early_stopped": False,
+            "critic_pretrain_early_stopped": False,
+            "critic_q_pred_mean": 0.0,
+            "critic_q_pred_std": 0.0,
+            "critic_target_mean": 0.0,
+            "critic_target_std": 0.0,
+            "critic_error_mean": 0.0,
+            "critic_error_std": 0.0,
             "seconds_collection": 0.0,
             "seconds_actor_bc": 0.0,
             "seconds_critic": 0.0,
@@ -779,7 +930,14 @@ class GraphTD3Trainer:
         if self.demo_pretrain_summary is not None:
             summary.update(dict(self.demo_pretrain_summary))
             summary["enabled"] = bool(self.config.demo_pretrain_enabled)
-            summary["demo_replay_size_after_collection"] = float(self.replay_buffer.demo_size())
+        summary["demo_train_replay_size_after_split"] = float(self.replay_buffer.demo_size())
+        summary["demo_val_replay_size_after_split"] = float(
+            len(self.demo_validation_batch) if self.demo_validation_batch is not None else 0
+        )
+        summary["demo_replay_size_after_collection"] = (
+            float(summary["demo_train_replay_size_after_split"])
+            + float(summary["demo_val_replay_size_after_split"])
+        )
         if not bool(self.config.demo_pretrain_enabled):
             self.demo_pretrain_completed = False
             self.demo_pretrain_summary = dict(summary)
@@ -787,6 +945,8 @@ class GraphTD3Trainer:
 
         demo_batches_to_save: list[Any] = []
         demo_return_targets: list[np.ndarray] = []
+        validation_batches: list[TensorReplayBatch] = []
+        split_rng = self._make_split_rng()
         demo_collection_steps = max(0, int(self.config.demo_collection_env_steps))
         if demo_collection_steps > 0:
             print(
@@ -825,6 +985,11 @@ class GraphTD3Trainer:
                         if self.config.demo_dataset_save_path:
                             demo_batches_to_save.extend(result.replay_batch.clone() for result in rollout_results)
                         for result in rollout_results:
+                            self._route_demo_batch_to_train_and_val(
+                                result.replay_batch,
+                                split_rng=split_rng,
+                                validation_batches=validation_batches,
+                            )
                             valid_mask = result.replay_batch.demo_return_valid.detach().cpu().numpy().astype(
                                 np.bool_, copy=False
                             )
@@ -855,6 +1020,8 @@ class GraphTD3Trainer:
                         total_steps=demo_collection_steps,
                         demo_batches_to_save=demo_batches_to_save,
                         demo_return_targets=demo_return_targets,
+                        validation_batches=validation_batches,
+                        split_rng=split_rng,
                     )
                 finally:
                     if had_active_rollout_runtime:
@@ -872,24 +1039,39 @@ class GraphTD3Trainer:
                     total_steps=demo_collection_steps,
                     demo_batches_to_save=demo_batches_to_save,
                     demo_return_targets=demo_return_targets,
+                    validation_batches=validation_batches,
+                    split_rng=split_rng,
                 )
 
             summary["seconds_collection"] = float(perf_counter() - demo_collection_start)
-            summary["demo_replay_size_after_collection"] = float(self.replay_buffer.demo_size())
             summary["dataset_path"] = self._save_demo_dataset(demo_batches_to_save)
             if demo_return_targets:
                 concatenated_demo_returns = np.concatenate(demo_return_targets, axis=0)
                 summary["demo_return_target_mean"] = float(np.mean(concatenated_demo_returns))
                 summary["demo_return_target_std"] = float(np.std(concatenated_demo_returns))
-            print(
-                "Demo Pretrain | collection done | demo_replay_size={0:.0f} | return_mode={1} | target_mean={2:.6f} | target_std={3:.6f} | seconds={4:.3f}".format(
-                    float(summary["demo_replay_size_after_collection"]),
-                    str(summary["critic_target_mode"]),
-                    float(summary["demo_return_target_mean"]),
-                    float(summary["demo_return_target_std"]),
-                    float(summary["seconds_collection"]),
-                )
+
+        if validation_batches:
+            self.demo_validation_batch = self._concat_replay_batches(validation_batches)
+
+        summary["demo_train_replay_size_after_split"] = float(self.replay_buffer.demo_size())
+        summary["demo_val_replay_size_after_split"] = float(
+            len(self.demo_validation_batch) if self.demo_validation_batch is not None else 0
+        )
+        summary["demo_replay_size_after_collection"] = (
+            float(summary["demo_train_replay_size_after_split"])
+            + float(summary["demo_val_replay_size_after_split"])
+        )
+        print(
+            "Demo Pretrain | collection done | demo_total={0:.0f} | train={1:.0f} | val={2:.0f} | return_mode={3} | target_mean={4:.6f} | target_std={5:.6f} | seconds={6:.3f}".format(
+                float(summary["demo_replay_size_after_collection"]),
+                float(summary["demo_train_replay_size_after_split"]),
+                float(summary["demo_val_replay_size_after_split"]),
+                str(summary["critic_target_mode"]),
+                float(summary["demo_return_target_mean"]),
+                float(summary["demo_return_target_std"]),
+                float(summary["seconds_collection"]),
             )
+        )
 
         if self.replay_buffer.demo_size() <= 0:
             raise ValueError("Demo pretrain requires at least one demo transition in replay.")
@@ -902,20 +1084,96 @@ class GraphTD3Trainer:
             actor_log_interval = self._progress_interval(actor_updates)
             next_actor_log_at = actor_log_interval
             last_actor_logged = 0
+            actor_eval_interval = max(1, int(self.config.demo_pretrain_eval_interval))
+            actor_eval_count = 0
+            actor_no_improve = 0
+            actor_best_state: dict[str, Any] | None = None
+            actor_best_quick_eval: float | None = None
+            actor_best_val_loss: float | None = None
+            actor_early_stopped = False
+            executed_actor_updates = 0
             for update_index in range(1, actor_updates + 1):
                 actor_metrics = self.learner.actor_bc_pretrain_step()
+                executed_actor_updates = update_index
                 if update_index >= next_actor_log_at:
                     self._print_pretrain_progress("actor_bc", update_index, actor_updates, actor_pretrain_start)
                     last_actor_logged = update_index
                     next_actor_log_at += actor_log_interval
+                should_eval = update_index == actor_updates or update_index % actor_eval_interval == 0
+                if should_eval:
+                    actor_eval_count += 1
+                    validation_metrics = self._run_demo_pretrain_validation(include_quick_eval=True)
+                    current_quick_eval = float(validation_metrics.get("quick_eval_return_mean", 0.0))
+                    current_actor_val = float(validation_metrics.get("actor_bc_val_loss", 0.0))
+                    summary["actor_bc_val_loss_last"] = current_actor_val
+                    summary["quick_eval_return_last"] = current_quick_eval
+                    quick_improved = self._metric_improved(
+                        current_quick_eval,
+                        actor_best_quick_eval,
+                        greater_is_better=True,
+                        min_relative_improvement=float(self.config.demo_pretrain_min_relative_improvement),
+                    )
+                    actor_val_improved = self._metric_improved(
+                        current_actor_val,
+                        actor_best_val_loss,
+                        greater_is_better=False,
+                        min_relative_improvement=float(self.config.demo_pretrain_min_relative_improvement),
+                    )
+                    quick_tie_margin = (
+                        max(abs(float(actor_best_quick_eval)), 1e-8)
+                        * float(self.config.demo_pretrain_min_relative_improvement)
+                        if actor_best_quick_eval is not None
+                        else 0.0
+                    )
+                    better_than_best = (
+                        actor_best_state is None
+                        or quick_improved
+                        or (
+                            actor_best_quick_eval is not None
+                            and abs(current_quick_eval - float(actor_best_quick_eval)) <= quick_tie_margin
+                            and actor_val_improved
+                        )
+                    )
+                    if better_than_best:
+                        actor_best_state = self._current_learner_state()
+                        actor_best_quick_eval = current_quick_eval
+                        actor_best_val_loss = current_actor_val
+                    if quick_improved or actor_val_improved or actor_best_state is None:
+                        actor_no_improve = 0
+                    else:
+                        actor_no_improve += 1
+                    print(
+                        "Demo Pretrain | actor_bc eval | update={0}/{1} | val_bc={2:.6f} | quick_eval_return={3:.6f} | patience={4}/{5}".format(
+                            update_index,
+                            actor_updates,
+                            current_actor_val,
+                            current_quick_eval,
+                            actor_no_improve,
+                            int(self.config.demo_pretrain_patience),
+                        )
+                    )
+                    if actor_no_improve >= int(self.config.demo_pretrain_patience) and update_index < actor_updates:
+                        actor_early_stopped = True
+                        break
             summary["seconds_actor_bc"] = float(perf_counter() - actor_pretrain_start)
-            summary["actor_bc_updates"] = float(actor_updates)
+            summary["actor_bc_updates"] = float(executed_actor_updates)
             summary["actor_bc_loss_last"] = float(actor_metrics.get("actor_bc_loss", 0.0))
-            if last_actor_logged < actor_updates:
-                self._print_pretrain_progress("actor_bc", actor_updates, actor_updates, actor_pretrain_start)
+            summary["actor_bc_eval_count"] = float(actor_eval_count)
+            summary["actor_bc_early_stopped"] = bool(actor_early_stopped)
+            summary["actor_bc_val_loss_best"] = float(actor_best_val_loss or 0.0)
+            summary["quick_eval_return_best"] = float(actor_best_quick_eval or 0.0)
+            if actor_best_state is not None:
+                self.learner.load_checkpoint_state(actor_best_state)
+                self.learner.target_actor.load_state_dict(self.learner.actor.state_dict())
+            if last_actor_logged < executed_actor_updates:
+                self._print_pretrain_progress("actor_bc", executed_actor_updates, actor_updates, actor_pretrain_start)
             print(
-                "Demo Pretrain | actor BC done | last_bc_loss={0:.6f} | seconds={1:.3f}".format(
+                "Demo Pretrain | actor BC done | executed={0:.0f} | last_bc_loss={1:.6f} | best_val_bc={2:.6f} | best_quick_eval={3:.6f} | early_stopped={4} | seconds={5:.3f}".format(
+                    float(summary["actor_bc_updates"]),
                     float(summary["actor_bc_loss_last"]),
+                    float(summary["actor_bc_val_loss_best"]),
+                    float(summary["quick_eval_return_best"]),
+                    bool(summary["actor_bc_early_stopped"]),
                     float(summary["seconds_actor_bc"]),
                 )
             )
@@ -928,20 +1186,75 @@ class GraphTD3Trainer:
             critic_log_interval = self._progress_interval(critic_updates)
             next_critic_log_at = critic_log_interval
             last_critic_logged = 0
+            critic_eval_interval = max(1, int(self.config.demo_pretrain_eval_interval))
+            critic_eval_count = 0
+            critic_no_improve = 0
+            critic_best_state: dict[str, Any] | None = None
+            critic_best_val_loss: float | None = None
+            critic_early_stopped = False
+            executed_critic_updates = 0
             for update_index in range(1, critic_updates + 1):
                 critic_metrics = self.learner.critic_pretrain_step()
+                executed_critic_updates = update_index
                 if update_index >= next_critic_log_at:
                     self._print_pretrain_progress("critic", update_index, critic_updates, critic_pretrain_start)
                     last_critic_logged = update_index
                     next_critic_log_at += critic_log_interval
+                should_eval = update_index == critic_updates or update_index % critic_eval_interval == 0
+                if should_eval:
+                    critic_eval_count += 1
+                    validation_metrics = self._run_demo_pretrain_validation(include_quick_eval=False)
+                    current_critic_val = float(validation_metrics.get("critic_val_loss", 0.0))
+                    summary["critic_val_loss_last"] = current_critic_val
+                    summary["critic_q_pred_mean"] = float(validation_metrics.get("critic_q_pred_mean", 0.0))
+                    summary["critic_q_pred_std"] = float(validation_metrics.get("critic_q_pred_std", 0.0))
+                    summary["critic_target_mean"] = float(validation_metrics.get("critic_target_mean", 0.0))
+                    summary["critic_target_std"] = float(validation_metrics.get("critic_target_std", 0.0))
+                    summary["critic_error_mean"] = float(validation_metrics.get("critic_error_mean", 0.0))
+                    summary["critic_error_std"] = float(validation_metrics.get("critic_error_std", 0.0))
+                    critic_improved = self._metric_improved(
+                        current_critic_val,
+                        critic_best_val_loss,
+                        greater_is_better=False,
+                        min_relative_improvement=float(self.config.demo_pretrain_min_relative_improvement),
+                    )
+                    if critic_best_state is None or critic_improved:
+                        critic_best_state = self._current_learner_state()
+                        critic_best_val_loss = current_critic_val
+                    if critic_improved or critic_best_state is None:
+                        critic_no_improve = 0
+                    else:
+                        critic_no_improve += 1
+                    print(
+                        "Demo Pretrain | critic eval | update={0}/{1} | val_critic={2:.6f} | q_pred_mean={3:.6f} | target_mean={4:.6f} | patience={5}/{6}".format(
+                            update_index,
+                            critic_updates,
+                            current_critic_val,
+                            float(summary["critic_q_pred_mean"]),
+                            float(summary["critic_target_mean"]),
+                            critic_no_improve,
+                            int(self.config.demo_pretrain_patience),
+                        )
+                    )
+                    if critic_no_improve >= int(self.config.demo_pretrain_patience) and update_index < critic_updates:
+                        critic_early_stopped = True
+                        break
             summary["seconds_critic"] = float(perf_counter() - critic_pretrain_start)
-            summary["critic_pretrain_updates"] = float(critic_updates)
+            summary["critic_pretrain_updates"] = float(executed_critic_updates)
             summary["critic_loss_last"] = float(critic_metrics.get("critic_loss", 0.0))
-            if last_critic_logged < critic_updates:
-                self._print_pretrain_progress("critic", critic_updates, critic_updates, critic_pretrain_start)
+            summary["critic_eval_count"] = float(critic_eval_count)
+            summary["critic_pretrain_early_stopped"] = bool(critic_early_stopped)
+            summary["critic_val_loss_best"] = float(critic_best_val_loss or 0.0)
+            if critic_best_state is not None:
+                self.learner.load_checkpoint_state(critic_best_state)
+            if last_critic_logged < executed_critic_updates:
+                self._print_pretrain_progress("critic", executed_critic_updates, critic_updates, critic_pretrain_start)
             print(
-                "Demo Pretrain | critic done | last_critic_loss={0:.6f} | seconds={1:.3f}".format(
+                "Demo Pretrain | critic done | executed={0:.0f} | last_critic_loss={1:.6f} | best_val_critic={2:.6f} | early_stopped={3} | seconds={4:.3f}".format(
+                    float(summary["critic_pretrain_updates"]),
                     float(summary["critic_loss_last"]),
+                    float(summary["critic_val_loss_best"]),
+                    bool(summary["critic_pretrain_early_stopped"]),
                     float(summary["seconds_critic"]),
                 )
             )

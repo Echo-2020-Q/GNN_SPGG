@@ -91,6 +91,50 @@ def _shuffle_replay_batch(batch: TensorReplayBatch, rng: np.random.Generator) ->
     return _slice_replay_batch(batch, indices)
 
 
+def split_demo_batch_train_val(
+    batch: TensorReplayBatch,
+    *,
+    validation_fraction: float,
+    rng: np.random.Generator,
+) -> tuple[TensorReplayBatch | None, TensorReplayBatch | None]:
+    if len(batch) <= 0:
+        return None, None
+    if validation_fraction <= 0.0:
+        return batch.clone(), None
+
+    demo_mask = batch.is_demo.detach().cpu().numpy().astype(np.bool_, copy=False)
+    if not np.any(demo_mask):
+        return batch.clone(), None
+
+    topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64, copy=False)
+    val_mask = np.zeros(len(batch), dtype=np.bool_)
+    for topology_id in np.unique(topology_ids[demo_mask]):
+        topology_demo_indices = np.flatnonzero(np.logical_and(demo_mask, topology_ids == int(topology_id)))
+        if topology_demo_indices.size <= 1:
+            continue
+        requested = int(round(float(topology_demo_indices.size) * float(validation_fraction)))
+        requested = max(0, min(requested, int(topology_demo_indices.size) - 1))
+        if requested <= 0:
+            continue
+        selected = rng.choice(topology_demo_indices, size=requested, replace=False)
+        val_mask[selected] = True
+
+    if not np.any(val_mask) and int(np.sum(demo_mask)) > 1:
+        selected = rng.choice(np.flatnonzero(demo_mask), size=1, replace=False)
+        val_mask[selected] = True
+
+    train_mask = np.logical_not(val_mask)
+    train_batch: TensorReplayBatch | None = None
+    val_batch: TensorReplayBatch | None = None
+    if np.any(train_mask):
+        train_indices = torch.as_tensor(np.flatnonzero(train_mask), dtype=torch.int64, device="cpu")
+        train_batch = _slice_replay_batch(batch, train_indices)
+    if np.any(val_mask):
+        val_indices = torch.as_tensor(np.flatnonzero(val_mask), dtype=torch.int64, device="cpu")
+        val_batch = _slice_replay_batch(batch, val_indices)
+    return train_batch, val_batch
+
+
 def _allocate_integer_counts(total: int, weights: Sequence[float]) -> list[int]:
     if total <= 0:
         return [0 for _ in weights]
@@ -142,6 +186,39 @@ class _TensorReplayStorage:
 
     def __len__(self) -> int:
         return int(self._size)
+
+    def _batch_from_indices(self, indices: Tensor) -> TensorReplayBatch:
+        obs = {key: buffer.index_select(0, indices) for key, buffer in self._obs_buffers.items()}
+        next_obs = {key: buffer.index_select(0, indices) for key, buffer in self._next_obs_buffers.items()}
+        assert self._reward_buffer is not None
+        assert self._done_buffer is not None
+        assert self._is_demo_buffer is not None
+        assert self._collapse_flag_buffer is not None
+        assert self._topology_id_buffer is not None
+        assert self._pool_power_demo_flag_buffer is not None
+        assert self._demo_return_target_buffer is not None
+        assert self._demo_return_valid_buffer is not None
+        return TensorReplayBatch(
+            obs=obs,
+            action=TensorReplayActionRecord(
+                allocation=self._action_buffers["allocation"].index_select(0, indices),
+            ),
+            reward=self._reward_buffer.index_select(0, indices),
+            next_obs=next_obs,
+            done=self._done_buffer.index_select(0, indices),
+            is_demo=self._is_demo_buffer.index_select(0, indices),
+            collapse_flag=self._collapse_flag_buffer.index_select(0, indices),
+            topology_id=self._topology_id_buffer.index_select(0, indices),
+            pool_power_demo_flag=self._pool_power_demo_flag_buffer.index_select(0, indices),
+            demo_return_target=self._demo_return_target_buffer.index_select(0, indices),
+            demo_return_valid=self._demo_return_valid_buffer.index_select(0, indices),
+        )
+
+    def export_all(self) -> TensorReplayBatch | None:
+        if self._size <= 0 or not self._is_initialized():
+            return None
+        indices = torch.arange(self._size, dtype=torch.int64, device="cpu")
+        return self._batch_from_indices(indices)
 
     def _is_initialized(self) -> bool:
         return self._reward_buffer is not None
@@ -652,31 +729,7 @@ class _TensorReplayStorage:
         )
         if indices.numel() == 0:
             return None
-        obs = {key: buffer.index_select(0, indices) for key, buffer in self._obs_buffers.items()}
-        next_obs = {key: buffer.index_select(0, indices) for key, buffer in self._next_obs_buffers.items()}
-        assert self._reward_buffer is not None
-        assert self._done_buffer is not None
-        assert self._is_demo_buffer is not None
-        assert self._collapse_flag_buffer is not None
-        assert self._topology_id_buffer is not None
-        assert self._pool_power_demo_flag_buffer is not None
-        assert self._demo_return_target_buffer is not None
-        assert self._demo_return_valid_buffer is not None
-        return TensorReplayBatch(
-            obs=obs,
-            action=TensorReplayActionRecord(
-                allocation=self._action_buffers["allocation"].index_select(0, indices),
-            ),
-            reward=self._reward_buffer.index_select(0, indices),
-            next_obs=next_obs,
-            done=self._done_buffer.index_select(0, indices),
-            is_demo=self._is_demo_buffer.index_select(0, indices),
-            collapse_flag=self._collapse_flag_buffer.index_select(0, indices),
-            topology_id=self._topology_id_buffer.index_select(0, indices),
-            pool_power_demo_flag=self._pool_power_demo_flag_buffer.index_select(0, indices),
-            demo_return_target=self._demo_return_target_buffer.index_select(0, indices),
-            demo_return_valid=self._demo_return_valid_buffer.index_select(0, indices),
-        )
+        return self._batch_from_indices(indices)
 
     def sample_filtered_up_to(
         self,
@@ -707,31 +760,7 @@ class _TensorReplayStorage:
         )
         if indices.numel() == 0:
             return None
-        obs = {key: buffer.index_select(0, indices) for key, buffer in self._obs_buffers.items()}
-        next_obs = {key: buffer.index_select(0, indices) for key, buffer in self._next_obs_buffers.items()}
-        assert self._reward_buffer is not None
-        assert self._done_buffer is not None
-        assert self._is_demo_buffer is not None
-        assert self._collapse_flag_buffer is not None
-        assert self._topology_id_buffer is not None
-        assert self._pool_power_demo_flag_buffer is not None
-        assert self._demo_return_target_buffer is not None
-        assert self._demo_return_valid_buffer is not None
-        return TensorReplayBatch(
-            obs=obs,
-            action=TensorReplayActionRecord(
-                allocation=self._action_buffers["allocation"].index_select(0, indices),
-            ),
-            reward=self._reward_buffer.index_select(0, indices),
-            next_obs=next_obs,
-            done=self._done_buffer.index_select(0, indices),
-            is_demo=self._is_demo_buffer.index_select(0, indices),
-            collapse_flag=self._collapse_flag_buffer.index_select(0, indices),
-            topology_id=self._topology_id_buffer.index_select(0, indices),
-            pool_power_demo_flag=self._pool_power_demo_flag_buffer.index_select(0, indices),
-            demo_return_target=self._demo_return_target_buffer.index_select(0, indices),
-            demo_return_valid=self._demo_return_valid_buffer.index_select(0, indices),
-        )
+        return self._batch_from_indices(indices)
 
     def sample(
         self,
@@ -1157,6 +1186,16 @@ class ReplayBuffer:
             return topology_name
         return str(self.topology_names[0])
 
+    def _canonical_export_storages(self) -> list[_TensorReplayStorage]:
+        if self.replay_strategy == "fifo":
+            assert self._fifo_storage is not None
+            return [self._fifo_storage]
+        if self._recent_storages:
+            return list(self._recent_storages.values())
+        if self._long_term_storages:
+            return list(self._long_term_storages.values())
+        return list(self._demo_storages.values())
+
     def _split_batch_by_topology(
         self,
         batch: TensorReplayBatch,
@@ -1244,6 +1283,27 @@ class ReplayBuffer:
     def get_last_sample_stats(self) -> dict[str, float]:
         with self._lock:
             return dict(self._last_sample_stats)
+
+    def export_demo_batch(self) -> TensorReplayBatch | None:
+        with self._lock:
+            exported_batches: list[TensorReplayBatch] = []
+            for storage in self._canonical_export_storages():
+                storage_batch = storage.export_all()
+                if storage_batch is None or len(storage_batch) <= 0:
+                    continue
+                demo_mask = storage_batch.is_demo.detach().cpu().numpy().astype(np.bool_, copy=False)
+                if self.demo_behavior_source == "pool_power_mix":
+                    pool_mask = storage_batch.pool_power_demo_flag.detach().cpu().numpy().astype(np.bool_, copy=False)
+                    demo_mask = np.logical_and(demo_mask, pool_mask)
+                if not np.any(demo_mask):
+                    continue
+                indices = torch.as_tensor(np.flatnonzero(demo_mask), dtype=torch.int64, device="cpu")
+                exported_batches.append(_slice_replay_batch(storage_batch, indices))
+            if not exported_batches:
+                return None
+            if len(exported_batches) == 1:
+                return exported_batches[0]
+            return _concat_replay_batches(exported_batches)
 
     def add(self, transition: TensorTransition | Transition) -> None:
         tensor_transition = _coerce_transition(transition)

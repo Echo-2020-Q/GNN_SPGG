@@ -12,7 +12,7 @@ from Project1.policies.gnn_rl import BatchedPolicyOutput, GNNAllocationPolicy
 
 from .config import GraphTD3Config
 from .critic import GraphActionCritic, TwinCritic
-from .data import TensorReplayBatch
+from .data import TensorReplayActionRecord, TensorReplayBatch
 from .exploration import LogitSpaceExplorer
 from .replay import ReplayBuffer
 
@@ -69,6 +69,24 @@ def _slice_observation_batch(observations: Mapping[str, Tensor], start: int, end
 def _chunk_ranges(batch_size: int, chunk_size: int):
     for start in range(0, batch_size, chunk_size):
         yield start, min(start + chunk_size, batch_size)
+
+
+def _slice_replay_batch_range(batch: TensorReplayBatch, start: int, end: int) -> TensorReplayBatch:
+    return TensorReplayBatch(
+        obs={key: value[start:end] for key, value in batch.obs.items()},
+        action=TensorReplayActionRecord(
+            allocation=batch.action.allocation[start:end],
+        ),
+        reward=batch.reward[start:end],
+        next_obs={key: value[start:end] for key, value in batch.next_obs.items()},
+        done=batch.done[start:end],
+        is_demo=batch.is_demo[start:end],
+        collapse_flag=batch.collapse_flag[start:end],
+        topology_id=batch.topology_id[start:end],
+        pool_power_demo_flag=batch.pool_power_demo_flag[start:end],
+        demo_return_target=batch.demo_return_target[start:end],
+        demo_return_valid=batch.demo_return_valid[start:end],
+    )
 
 
 def _gradient_norm(parameters: list[torch.nn.Parameter]) -> float:
@@ -376,6 +394,116 @@ class GraphTD3Learner:
         if resolved <= 0:
             raise ValueError("Pretrain batch size must be positive.")
         return resolved
+
+    def evaluate_actor_bc_on_demo_batch(
+        self,
+        cpu_batch: TensorReplayBatch,
+        batch_size: int | None = None,
+    ) -> dict[str, float]:
+        if len(cpu_batch) <= 0:
+            return {
+                "actor_bc_val_loss": 0.0,
+                "actor_bc_val_num_entries": 0.0,
+            }
+
+        resolved_batch_size = self._resolve_pretrain_batch_size(batch_size)
+        total_squared_error = 0.0
+        total_entries = 0
+        with torch.no_grad():
+            for start, end in _chunk_ranges(len(cpu_batch), resolved_batch_size):
+                chunk_cpu_batch = _slice_replay_batch_range(cpu_batch, start, end)
+                batch = chunk_cpu_batch if self.device.type == "cpu" else chunk_cpu_batch.to(self.device)
+                actor_outputs = self.actor.deterministic_action_tensor_batch(batch.obs)
+                valid_demo_mask = batch.obs["local_mask"] & batch.is_demo.view(-1, 1, 1)
+                if valid_demo_mask.any():
+                    squared_error = (
+                        actor_outputs.allocation_matrix - batch.action.allocation
+                    ).pow(2)
+                    total_squared_error += float(squared_error[valid_demo_mask].sum().item())
+                    total_entries += int(valid_demo_mask.sum().item())
+        return {
+            "actor_bc_val_loss": float(total_squared_error / max(total_entries, 1)),
+            "actor_bc_val_num_entries": float(total_entries),
+        }
+
+    def evaluate_critic_on_demo_return_batch(
+        self,
+        cpu_batch: TensorReplayBatch,
+        batch_size: int | None = None,
+    ) -> dict[str, float]:
+        if len(cpu_batch) <= 0:
+            return {
+                "critic_val_loss": 0.0,
+                "critic1_val_loss": 0.0,
+                "critic2_val_loss": 0.0,
+                "critic_val_num_targets": 0.0,
+                "critic_q_pred_mean": 0.0,
+                "critic_q_pred_std": 0.0,
+                "critic_target_mean": 0.0,
+                "critic_target_std": 0.0,
+                "critic_error_mean": 0.0,
+                "critic_error_std": 0.0,
+            }
+
+        resolved_batch_size = self._resolve_pretrain_batch_size(batch_size)
+        total_loss_q1 = 0.0
+        total_loss_q2 = 0.0
+        total_targets = 0
+        q_pred_sum = 0.0
+        q_pred_sumsq = 0.0
+        target_sum = 0.0
+        target_sumsq = 0.0
+        error_sum = 0.0
+        error_sumsq = 0.0
+        with torch.no_grad():
+            for start, end in _chunk_ranges(len(cpu_batch), resolved_batch_size):
+                chunk_cpu_batch = _slice_replay_batch_range(cpu_batch, start, end)
+                batch = chunk_cpu_batch if self.device.type == "cpu" else chunk_cpu_batch.to(self.device)
+                current_q1, current_q2 = self._twin_critic_forward_batch(
+                    self.critics,
+                    batch.obs,
+                    batch.action.allocation,
+                )
+                valid_mask = batch.demo_return_valid.bool()
+                if not bool(valid_mask.any().item()):
+                    continue
+                target_q = batch.demo_return_target
+                total_loss_q1 += float(self._critic_loss_sum(current_q1, target_q, valid_mask=valid_mask).item())
+                total_loss_q2 += float(self._critic_loss_sum(current_q2, target_q, valid_mask=valid_mask).item())
+                q_prediction = 0.5 * (current_q1 + current_q2)
+                valid_q_prediction = q_prediction[valid_mask]
+                valid_target = target_q[valid_mask]
+                valid_error = valid_q_prediction - valid_target
+                total_targets += int(valid_q_prediction.numel())
+                q_pred_sum += float(valid_q_prediction.sum().item())
+                q_pred_sumsq += float(valid_q_prediction.pow(2).sum().item())
+                target_sum += float(valid_target.sum().item())
+                target_sumsq += float(valid_target.pow(2).sum().item())
+                error_sum += float(valid_error.sum().item())
+                error_sumsq += float(valid_error.pow(2).sum().item())
+
+        mean_q_pred = q_pred_sum / max(total_targets, 1)
+        mean_target = target_sum / max(total_targets, 1)
+        mean_error = error_sum / max(total_targets, 1)
+
+        def _std(sum_squares: float, mean: float) -> float:
+            variance = max(sum_squares / max(total_targets, 1) - mean * mean, 0.0)
+            return float(variance ** 0.5)
+
+        critic1_val_loss = total_loss_q1 / max(total_targets, 1)
+        critic2_val_loss = total_loss_q2 / max(total_targets, 1)
+        return {
+            "critic_val_loss": float(0.5 * (critic1_val_loss + critic2_val_loss)),
+            "critic1_val_loss": float(critic1_val_loss),
+            "critic2_val_loss": float(critic2_val_loss),
+            "critic_val_num_targets": float(total_targets),
+            "critic_q_pred_mean": float(mean_q_pred),
+            "critic_q_pred_std": _std(q_pred_sumsq, mean_q_pred),
+            "critic_target_mean": float(mean_target),
+            "critic_target_std": _std(target_sumsq, mean_target),
+            "critic_error_mean": float(mean_error),
+            "critic_error_std": _std(error_sumsq, mean_error),
+        }
 
     def actor_bc_pretrain_step(self, batch_size: int | None = None) -> dict[str, float]:
         resolved_batch_size = self._resolve_pretrain_batch_size(batch_size)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
+from unittest import mock
 
 
 NUMPY_AVAILABLE = importlib.util.find_spec("numpy") is not None
@@ -284,6 +285,110 @@ class TrainerSmokeTests(unittest.TestCase):
             self.assertEqual(float(summary["demo_collection_env_steps"]), 4.0)
             self.assertEqual(float(summary["demo_replay_size_after_collection"]), 1.0)
             self.assertEqual(float(summary["seconds_collection"]), 0.5)
+        finally:
+            trainer.close()
+
+    def test_demo_pretrain_early_stopping_uses_validation_metrics(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.5,
+                p_max=5.0,
+                beta=1.0,
+                episode_length=4,
+                reward=RewardConfig(lambda_payoff=1.0, lambda_cooperation=0.5, lambda_gini=0.1),
+            ),
+            make_grid_graph(2, 2),
+        )
+        observation = env.reset(seed=0)
+        allocation = UniformAllocationPolicy().allocate(observation).astype(np.float32, copy=False)
+        next_observation, reward, done, _ = env.step(allocation)
+        transition = TensorTransition.from_step(
+            obs=observation,
+            action=TensorReplayActionRecord(allocation=torch.as_tensor(allocation, dtype=torch.float32)),
+            reward=float(reward),
+            next_obs=next_observation,
+            done=bool(done),
+            is_demo=True,
+            collapse_flag=False,
+            topology_name="fixed",
+            pool_power_demo_flag=True,
+            demo_return_target=1.0,
+            demo_return_valid=True,
+        )
+        replay_buffer = ReplayBuffer(
+            capacity=32,
+            seed=0,
+            replay_strategy="topology_stratified_mixed",
+            topology_names=("fixed",),
+            recent_fraction=0.50,
+            long_term_fraction=0.35,
+            demo_fraction=0.15,
+            demo_behavior_source="pool_power_mix",
+        )
+        replay_buffer.add(transition)
+        validation_batch = replay_buffer.export_demo_batch()
+        assert validation_batch is not None
+
+        policy = GNNAllocationPolicy(GNNPolicyConfig(hidden_dim=16, num_message_passing_layers=2))
+        trainer = CentralizedActorCriticTrainer(
+            env=env,
+            policy=policy,
+            config=TrainerConfig(
+                total_updates=1,
+                steps_per_update=4,
+                eval_interval=1,
+                eval_episodes=1,
+                demo_pretrain_enabled=True,
+                demo_collection_env_steps=0,
+                actor_bc_pretrain_updates=4,
+                critic_pretrain_updates=4,
+                demo_pretrain_batch_size=1,
+                demo_pretrain_eval_interval=1,
+                demo_pretrain_patience=1,
+                replay_strategy="topology_stratified_mixed",
+                replay_topology_names=("fixed",),
+                replay_recent_fraction=0.50,
+                replay_long_term_fraction=0.35,
+                replay_demo_fraction=0.15,
+                warmup_steps=0,
+                seed=0,
+            ),
+        )
+
+        try:
+            trainer.preload_demo_replay(
+                replay_buffer,
+                {
+                    "enabled": True,
+                    "demo_collection_env_steps": 4.0,
+                    "demo_replay_size_after_collection": 1.0,
+                    "demo_train_replay_size_after_split": 1.0,
+                    "demo_val_replay_size_after_split": 1.0,
+                },
+                validation_batch,
+            )
+            validation_sequence = iter(
+                [
+                    {"actor_bc_val_loss": 1.0, "quick_eval_return_mean": 1.0},
+                    {"actor_bc_val_loss": 1.0, "quick_eval_return_mean": 1.0},
+                    {"critic_val_loss": 2.0, "critic_q_pred_mean": 1.0, "critic_target_mean": 1.0},
+                    {"critic_val_loss": 2.0, "critic_q_pred_mean": 1.0, "critic_target_mean": 1.0},
+                ]
+            )
+            with mock.patch.object(
+                trainer,
+                "_run_demo_pretrain_validation",
+                side_effect=lambda include_quick_eval: dict(next(validation_sequence)),
+            ):
+                summary = trainer._run_demo_pretrain()
+
+            self.assertTrue(bool(summary["actor_bc_early_stopped"]))
+            self.assertTrue(bool(summary["critic_pretrain_early_stopped"]))
+            self.assertLess(int(summary["actor_bc_updates"]), 4)
+            self.assertLess(int(summary["critic_pretrain_updates"]), 4)
+            self.assertGreaterEqual(float(summary["actor_bc_eval_count"]), 2.0)
+            self.assertGreaterEqual(float(summary["critic_eval_count"]), 2.0)
         finally:
             trainer.close()
 

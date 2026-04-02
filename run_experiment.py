@@ -583,14 +583,30 @@ BASE_EXPERIMENT = {
         "demo_collection_runtime": "parallel_cpu",
 
         # demo 预收集结束后，纯 BC 预训练 actor 的更新次数。
-        "actor_bc_pretrain_updates": 3000,
+        "actor_bc_pretrain_updates": 5000,
 
         # actor BC 预训练完成后，critic 仅用 demo transition 做 TD 回归的更新次数。
-        "critic_pretrain_updates": 3000,
+        "critic_pretrain_updates": 5000,
 
         # demo 预训练的 batch 大小。
         # 设为 None 时，回退到 training.batch_size。
         "demo_pretrain_batch_size": 512,
+
+        # demo hold-out 验证集比例。
+        # 这些样本不会进入 train replay，只用于 pretrain 阶段的验证与 early stopping。
+        "demo_validation_fraction": 0.10,
+
+        # pretrain 每隔多少个 update 做一次验证。
+        # 验证内容包括 actor_bc_val_loss、critic_val_loss，以及 actor 阶段的小规模 quick eval。
+        "demo_pretrain_eval_interval": 200,
+
+        # pretrain early stopping 的 patience。
+        # 连续多少次验证没有足够改善后，提前停止当前 pretrain 阶段。
+        "demo_pretrain_patience": 5,
+
+        # pretrain 验证指标的最小相对改善阈值。
+        # 例如 0.01 表示至少改善 1% 才算真正变好。
+        "demo_pretrain_min_relative_improvement": 0.01,
 
         # 可选：把 demo 预收集得到的 replay batch 落盘成一个 .pt 文件。
         # 设为 None 时，只放进 replay，不额外保存到磁盘。
@@ -651,8 +667,8 @@ BASE_EXPERIMENT = {
 
         # Actor / Critic 的梯度裁剪范数。
         # 设为 None 表示关闭裁剪。
-        "actor_grad_clip_norm": 5.0,
-        "critic_grad_clip_norm": 5.0,
+        "actor_grad_clip_norm": 10.0,
+        "critic_grad_clip_norm": 10.0,
 
         # 每隔多少个外层训练迭代做一次 learner 更新。
         "train_every": 1,
@@ -1732,6 +1748,10 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         actor_bc_pretrain_updates=training.get("actor_bc_pretrain_updates", 0),
         critic_pretrain_updates=training.get("critic_pretrain_updates", 0),
         demo_pretrain_batch_size=training.get("demo_pretrain_batch_size"),
+        demo_validation_fraction=training.get("demo_validation_fraction", 0.10),
+        demo_pretrain_eval_interval=training.get("demo_pretrain_eval_interval", 200),
+        demo_pretrain_patience=training.get("demo_pretrain_patience", 5),
+        demo_pretrain_min_relative_improvement=training.get("demo_pretrain_min_relative_improvement", 0.01),
         demo_dataset_save_path=training.get("demo_dataset_save_path"),
         demo_critic_pretrain_target_mode=training.get("demo_critic_pretrain_target_mode", "n_step"),
         demo_critic_pretrain_n_step=training.get("demo_critic_pretrain_n_step", 20),
@@ -2182,9 +2202,11 @@ def run_external_demo_collection(
     env_config: SPGGConfig,
     trainer_config: Any,
     randomization_config: Any,
-) -> tuple[Any, Dict[str, Any]]:
+) -> tuple[Any, Any | None, Dict[str, Any]]:
+    import torch
+
     from Project1.policies.gnn_rl import GNNAllocationPolicy
-    from Project1.td3.replay import ReplayBuffer
+    from Project1.td3.replay import ReplayBuffer, split_demo_batch_train_val
     from Project1.td3.worker import ParallelRolloutWorker, RolloutWorker, WorkerConfig
     from Project1.td3.exploration import LogitSpaceExplorer
 
@@ -2222,6 +2244,8 @@ def run_external_demo_collection(
     actor_template = build_gnn_policy(spec)
     demo_batches_to_save: List[Any] = []
     demo_return_targets: List[np.ndarray] = []
+    validation_batches: List[Any] = []
+    split_rng = np.random.default_rng(int(trainer_config.seed or 0) + 3_000_000)
     started_at = time.perf_counter()
     log_interval = _progress_interval(demo_collection_steps)
     next_log_at = min(demo_collection_steps, log_interval)
@@ -2232,9 +2256,17 @@ def run_external_demo_collection(
         collected_now = len(result.replay_batch)
         if collected_now <= 0:
             raise RuntimeError("Demo collection produced zero transitions.")
-        replay_buffer.extend(result.replay_batch)
+        train_batch, val_batch = split_demo_batch_train_val(
+            result.replay_batch,
+            validation_fraction=float(trainer_config.demo_validation_fraction),
+            rng=split_rng,
+        )
+        if train_batch is not None and len(train_batch) > 0:
+            replay_buffer.extend(train_batch)
         if trainer_config.demo_dataset_save_path:
             demo_batches_to_save.append(result.replay_batch.clone())
+        if val_batch is not None and len(val_batch) > 0:
+            validation_batches.append(val_batch.clone())
         valid_mask = result.replay_batch.demo_return_valid.detach().cpu().numpy().astype(np.bool_, copy=False)
         if np.any(valid_mask):
             demo_return_targets.append(
@@ -2391,11 +2423,37 @@ def run_external_demo_collection(
     summary: Dict[str, Any] = {
         "enabled": True,
         "demo_collection_env_steps": float(demo_collection_steps),
-        "demo_replay_size_after_collection": float(replay_buffer.demo_size()),
+        "demo_replay_size_after_collection": float(
+            replay_buffer.demo_size() + sum(len(batch) for batch in validation_batches)
+        ),
+        "demo_train_replay_size_after_split": float(replay_buffer.demo_size()),
+        "demo_val_replay_size_after_split": float(sum(len(batch) for batch in validation_batches)),
+        "demo_validation_fraction": float(trainer_config.demo_validation_fraction),
+        "demo_pretrain_eval_interval": float(trainer_config.demo_pretrain_eval_interval),
+        "demo_pretrain_patience": float(trainer_config.demo_pretrain_patience),
+        "demo_pretrain_min_relative_improvement": float(
+            trainer_config.demo_pretrain_min_relative_improvement
+        ),
         "actor_bc_updates": 0.0,
         "critic_pretrain_updates": 0.0,
         "actor_bc_loss_last": 0.0,
         "critic_loss_last": 0.0,
+        "actor_bc_val_loss_last": 0.0,
+        "actor_bc_val_loss_best": 0.0,
+        "critic_val_loss_last": 0.0,
+        "critic_val_loss_best": 0.0,
+        "quick_eval_return_last": 0.0,
+        "quick_eval_return_best": 0.0,
+        "actor_bc_eval_count": 0.0,
+        "critic_eval_count": 0.0,
+        "actor_bc_early_stopped": False,
+        "critic_pretrain_early_stopped": False,
+        "critic_q_pred_mean": 0.0,
+        "critic_q_pred_std": 0.0,
+        "critic_target_mean": 0.0,
+        "critic_target_std": 0.0,
+        "critic_error_mean": 0.0,
+        "critic_error_std": 0.0,
         "seconds_collection": float(time.perf_counter() - started_at),
         "seconds_actor_bc": 0.0,
         "seconds_critic": 0.0,
@@ -2410,15 +2468,43 @@ def run_external_demo_collection(
         summary["demo_return_target_mean"] = float(np.mean(concatenated_demo_returns))
         summary["demo_return_target_std"] = float(np.std(concatenated_demo_returns))
     print(
-        "Demo Pretrain | external collection done | demo_replay_size={0:.0f} | return_mode={1} | target_mean={2:.6f} | target_std={3:.6f} | seconds={4:.3f}".format(
+        "Demo Pretrain | external collection done | demo_total={0:.0f} | train={1:.0f} | val={2:.0f} | return_mode={3} | target_mean={4:.6f} | target_std={5:.6f} | seconds={6:.3f}".format(
             float(summary["demo_replay_size_after_collection"]),
+            float(summary["demo_train_replay_size_after_split"]),
+            float(summary["demo_val_replay_size_after_split"]),
             str(summary["critic_target_mode"]),
             float(summary["demo_return_target_mean"]),
             float(summary["demo_return_target_std"]),
             float(summary["seconds_collection"]),
         )
     )
-    return replay_buffer, summary
+    validation_batch = None
+    if validation_batches:
+        validation_batch = validation_batches[0].clone()
+        for batch in validation_batches[1:]:
+            validation_batch = type(validation_batch)(
+                obs={key: torch.cat([validation_batch.obs[key], batch.obs[key]], dim=0) for key in validation_batch.obs},
+                action=validation_batch.action.__class__(
+                    allocation=torch.cat([validation_batch.action.allocation, batch.action.allocation], dim=0),
+                ),
+                reward=torch.cat([validation_batch.reward, batch.reward], dim=0),
+                next_obs={
+                    key: torch.cat([validation_batch.next_obs[key], batch.next_obs[key]], dim=0)
+                    for key in validation_batch.next_obs
+                },
+                done=torch.cat([validation_batch.done, batch.done], dim=0),
+                is_demo=torch.cat([validation_batch.is_demo, batch.is_demo], dim=0),
+                collapse_flag=torch.cat([validation_batch.collapse_flag, batch.collapse_flag], dim=0),
+                topology_id=torch.cat([validation_batch.topology_id, batch.topology_id], dim=0),
+                pool_power_demo_flag=torch.cat(
+                    [validation_batch.pool_power_demo_flag, batch.pool_power_demo_flag], dim=0
+                ),
+                demo_return_target=torch.cat(
+                    [validation_batch.demo_return_target, batch.demo_return_target], dim=0
+                ),
+                demo_return_valid=torch.cat([validation_batch.demo_return_valid, batch.demo_return_valid], dim=0),
+            )
+    return replay_buffer, validation_batch, summary
 
 
 def graph_summary(graph: Mapping[int, Sequence[int]]) -> Dict[str, float]:
@@ -3329,10 +3415,27 @@ def _log_tensorboard_demo_pretrain_summary(
     scalar_keys = {
         "demo_collection_env_steps": "demo_pretrain/demo_collection_env_steps",
         "demo_replay_size_after_collection": "demo_pretrain/demo_replay_size_after_collection",
+        "demo_train_replay_size_after_split": "demo_pretrain/demo_train_replay_size_after_split",
+        "demo_val_replay_size_after_split": "demo_pretrain/demo_val_replay_size_after_split",
+        "demo_validation_fraction": "demo_pretrain/demo_validation_fraction",
         "actor_bc_updates": "demo_pretrain/actor_bc_updates",
         "critic_pretrain_updates": "demo_pretrain/critic_pretrain_updates",
         "actor_bc_loss_last": "demo_pretrain/actor_bc_loss_last",
+        "actor_bc_val_loss_last": "demo_pretrain/actor_bc_val_loss_last",
+        "actor_bc_val_loss_best": "demo_pretrain/actor_bc_val_loss_best",
         "critic_loss_last": "demo_pretrain/critic_loss_last",
+        "critic_val_loss_last": "demo_pretrain/critic_val_loss_last",
+        "critic_val_loss_best": "demo_pretrain/critic_val_loss_best",
+        "quick_eval_return_last": "demo_pretrain/quick_eval_return_last",
+        "quick_eval_return_best": "demo_pretrain/quick_eval_return_best",
+        "actor_bc_eval_count": "demo_pretrain/actor_bc_eval_count",
+        "critic_eval_count": "demo_pretrain/critic_eval_count",
+        "critic_q_pred_mean": "demo_pretrain/critic_q_pred_mean",
+        "critic_q_pred_std": "demo_pretrain/critic_q_pred_std",
+        "critic_target_mean": "demo_pretrain/critic_target_mean",
+        "critic_target_std": "demo_pretrain/critic_target_std",
+        "critic_error_mean": "demo_pretrain/critic_error_mean",
+        "critic_error_std": "demo_pretrain/critic_error_std",
         "demo_return_target_mean": "demo_pretrain/demo_return_target_mean",
         "demo_return_target_std": "demo_pretrain/demo_return_target_std",
         "seconds_collection": "demo_pretrain/seconds_collection",
@@ -3342,6 +3445,12 @@ def _log_tensorboard_demo_pretrain_summary(
     for key, tag in scalar_keys.items():
         if key in summary and summary[key] is not None:
             writer.add_scalar(tag, float(summary[key]), 0)
+    for key, tag in {
+        "actor_bc_early_stopped": "demo_pretrain/actor_bc_early_stopped",
+        "critic_pretrain_early_stopped": "demo_pretrain/critic_pretrain_early_stopped",
+    }.items():
+        if key in summary and summary[key] is not None:
+            writer.add_scalar(tag, 1.0 if bool(summary[key]) else 0.0, 0)
     if "behavior_source" in summary and summary["behavior_source"] is not None:
         writer.add_text("demo_pretrain/behavior_source", str(summary["behavior_source"]), 0)
     if "critic_target_mode" in summary and summary["critic_target_mode"] is not None:
@@ -3623,6 +3732,7 @@ def run_gnn_training_mode(
     tensorboard = spec.get("tensorboard", {})
     resume_from_checkpoint = training.get("resume_from_checkpoint")
     external_demo_replay = None
+    external_demo_validation_batch = None
     external_demo_summary = None
     effective_trainer_config = trainer_config
     policy: Any = None
@@ -3686,7 +3796,7 @@ def run_gnn_training_mode(
                 )
             )
             print(
-                "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, runtime={4}, actor_bc_updates={5}, critic_pretrain_updates={6}, critic_target={7}, n_step={8}, batch_size={9}, dataset_path={10}, save_ckpt={11}, ckpt_name={12}, stop_after={13}".format(
+                "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, runtime={4}, actor_bc_updates={5}, critic_pretrain_updates={6}, critic_target={7}, n_step={8}, batch_size={9}, val_frac={10}, eval_interval={11}, patience={12}, min_improve={13}, dataset_path={14}, save_ckpt={15}, ckpt_name={16}, stop_after={17}".format(
                     trainer_config.demo_collection_env_steps,
                     trainer_config.demo_collection_behavior_source,
                     trainer_config.demo_collection_use_domain_randomization,
@@ -3699,6 +3809,10 @@ def run_gnn_training_mode(
                     trainer_config.demo_pretrain_batch_size
                     if trainer_config.demo_pretrain_batch_size is not None
                     else trainer_config.batch_size,
+                    trainer_config.demo_validation_fraction,
+                    trainer_config.demo_pretrain_eval_interval,
+                    trainer_config.demo_pretrain_patience,
+                    trainer_config.demo_pretrain_min_relative_improvement,
                     trainer_config.demo_dataset_save_path or "None",
                     bool(training.get("save_demo_pretrain_checkpoint", False)),
                     str(training.get("demo_pretrain_checkpoint_name", "demo_pretrained.pt")),
@@ -3752,7 +3866,7 @@ def run_gnn_training_mode(
             trainer_config,
             resume_from_checkpoint=resume_from_checkpoint,
         ):
-            external_demo_replay, external_demo_summary = run_external_demo_collection(
+            external_demo_replay, external_demo_validation_batch, external_demo_summary = run_external_demo_collection(
                 spec=spec,
                 graph=graph,
                 env_config=env_config,
@@ -3772,7 +3886,11 @@ def run_gnn_training_mode(
             curriculum_stages=curriculum_stages,
         )
         if external_demo_replay is not None:
-            trainer.preload_demo_replay(external_demo_replay, external_demo_summary)
+            trainer.preload_demo_replay(
+                external_demo_replay,
+                external_demo_summary,
+                external_demo_validation_batch,
+            )
 
         checkpoint_dir = output_dir / "checkpoints"
         should_save_checkpoints = bool(training.get("save_checkpoints", False))
@@ -4006,15 +4124,22 @@ def run_gnn_training_mode(
             )
             if demo_pretrain_summary is not None:
                 print(
-                    "Demo Summary: replay={0:.0f}, actor_bc_updates={1:.0f}, critic_pretrain_updates={2:.0f}, critic_target={3}, target_mean={4:.6f}, target_std={5:.6f}, actor_bc_loss_last={6:.6f}, critic_loss_last={7:.6f}, seconds={{collection:{8:.3f}, actor_bc:{9:.3f}, critic:{10:.3f}}}".format(
+                    "Demo Summary: total={0:.0f}, train={1:.0f}, val={2:.0f}, actor_bc_updates={3:.0f}, critic_pretrain_updates={4:.0f}, critic_target={5}, target_mean={6:.6f}, target_std={7:.6f}, actor_bc_loss_last={8:.6f}, actor_bc_val_best={9:.6f}, critic_loss_last={10:.6f}, critic_val_best={11:.6f}, quick_eval_best={12:.6f}, early_stop={{actor:{13}, critic:{14}}}, seconds={{collection:{15:.3f}, actor_bc:{16:.3f}, critic:{17:.3f}}}".format(
                         float(demo_pretrain_summary.get("demo_replay_size_after_collection", 0.0)),
+                        float(demo_pretrain_summary.get("demo_train_replay_size_after_split", 0.0)),
+                        float(demo_pretrain_summary.get("demo_val_replay_size_after_split", 0.0)),
                         float(demo_pretrain_summary.get("actor_bc_updates", 0.0)),
                         float(demo_pretrain_summary.get("critic_pretrain_updates", 0.0)),
                         str(demo_pretrain_summary.get("critic_target_mode", "n_step")),
                         float(demo_pretrain_summary.get("demo_return_target_mean", 0.0)),
                         float(demo_pretrain_summary.get("demo_return_target_std", 0.0)),
                         float(demo_pretrain_summary.get("actor_bc_loss_last", 0.0)),
+                        float(demo_pretrain_summary.get("actor_bc_val_loss_best", 0.0)),
                         float(demo_pretrain_summary.get("critic_loss_last", 0.0)),
+                        float(demo_pretrain_summary.get("critic_val_loss_best", 0.0)),
+                        float(demo_pretrain_summary.get("quick_eval_return_best", 0.0)),
+                        bool(demo_pretrain_summary.get("actor_bc_early_stopped", False)),
+                        bool(demo_pretrain_summary.get("critic_pretrain_early_stopped", False)),
                         float(demo_pretrain_summary.get("seconds_collection", 0.0)),
                         float(demo_pretrain_summary.get("seconds_actor_bc", 0.0)),
                         float(demo_pretrain_summary.get("seconds_critic", 0.0)),
@@ -4112,15 +4237,22 @@ def run_gnn_training_mode(
         if demo_pretrain_summary is not None:
             if not demo_pretrain_summary_logged:
                 print(
-                    "Demo Summary: replay={0:.0f}, actor_bc_updates={1:.0f}, critic_pretrain_updates={2:.0f}, critic_target={3}, target_mean={4:.6f}, target_std={5:.6f}, actor_bc_loss_last={6:.6f}, critic_loss_last={7:.6f}, seconds={{collection:{8:.3f}, actor_bc:{9:.3f}, critic:{10:.3f}}}".format(
+                    "Demo Summary: total={0:.0f}, train={1:.0f}, val={2:.0f}, actor_bc_updates={3:.0f}, critic_pretrain_updates={4:.0f}, critic_target={5}, target_mean={6:.6f}, target_std={7:.6f}, actor_bc_loss_last={8:.6f}, actor_bc_val_best={9:.6f}, critic_loss_last={10:.6f}, critic_val_best={11:.6f}, quick_eval_best={12:.6f}, early_stop={{actor:{13}, critic:{14}}}, seconds={{collection:{15:.3f}, actor_bc:{16:.3f}, critic:{17:.3f}}}".format(
                         float(demo_pretrain_summary.get("demo_replay_size_after_collection", 0.0)),
+                        float(demo_pretrain_summary.get("demo_train_replay_size_after_split", 0.0)),
+                        float(demo_pretrain_summary.get("demo_val_replay_size_after_split", 0.0)),
                         float(demo_pretrain_summary.get("actor_bc_updates", 0.0)),
                         float(demo_pretrain_summary.get("critic_pretrain_updates", 0.0)),
                         str(demo_pretrain_summary.get("critic_target_mode", "n_step")),
                         float(demo_pretrain_summary.get("demo_return_target_mean", 0.0)),
                         float(demo_pretrain_summary.get("demo_return_target_std", 0.0)),
                         float(demo_pretrain_summary.get("actor_bc_loss_last", 0.0)),
+                        float(demo_pretrain_summary.get("actor_bc_val_loss_best", 0.0)),
                         float(demo_pretrain_summary.get("critic_loss_last", 0.0)),
+                        float(demo_pretrain_summary.get("critic_val_loss_best", 0.0)),
+                        float(demo_pretrain_summary.get("quick_eval_return_best", 0.0)),
+                        bool(demo_pretrain_summary.get("actor_bc_early_stopped", False)),
+                        bool(demo_pretrain_summary.get("critic_pretrain_early_stopped", False)),
                         float(demo_pretrain_summary.get("seconds_collection", 0.0)),
                         float(demo_pretrain_summary.get("seconds_actor_bc", 0.0)),
                         float(demo_pretrain_summary.get("seconds_critic", 0.0)),

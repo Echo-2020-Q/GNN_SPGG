@@ -115,13 +115,14 @@ def main() -> None:
         randomization_config = build_domain_randomization_config(spec)
         print("Step 7     : external demo collection")
         external_demo_replay = None
+        external_demo_validation_batch = None
         external_demo_summary = None
         effective_trainer_config = trainer_config
         if int(trainer_config.demo_collection_env_steps) > 0 and str(trainer_config.demo_collection_runtime) in {
             "parallel_cpu",
             "isolated_cpu",
         }:
-            external_demo_replay, external_demo_summary = run_external_demo_collection(
+            external_demo_replay, external_demo_validation_batch, external_demo_summary = run_external_demo_collection(
                 spec=spec,
                 graph=graph,
                 env_config=env_config,
@@ -150,7 +151,11 @@ def main() -> None:
         try:
             if external_demo_replay is not None:
                 print("Step 11    : trainer.preload_demo_replay()")
-                trainer.preload_demo_replay(external_demo_replay, external_demo_summary)
+                trainer.preload_demo_replay(
+                    external_demo_replay,
+                    external_demo_summary,
+                    external_demo_validation_batch,
+                )
             if bool(DEBUG_CONFIG["pretrain_only"]):
                 print("Step 12    : trainer._run_demo_pretrain()")
                 summary = trainer._run_demo_pretrain()

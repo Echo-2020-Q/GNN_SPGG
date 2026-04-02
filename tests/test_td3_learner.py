@@ -150,6 +150,20 @@ class GraphTD3LearnerPretrainTests(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(torch.tensor(float(metrics["critic_loss"]))))
 
+    def test_demo_validation_metrics_are_finite(self) -> None:
+        learner = self._make_learner()
+        validation_batch = learner.replay_buffer.export_demo_batch()
+        assert validation_batch is not None
+
+        actor_metrics = learner.evaluate_actor_bc_on_demo_batch(validation_batch, batch_size=2)
+        critic_metrics = learner.evaluate_critic_on_demo_return_batch(validation_batch, batch_size=2)
+
+        self.assertGreater(float(actor_metrics["actor_bc_val_num_entries"]), 0.0)
+        self.assertGreater(float(critic_metrics["critic_val_num_targets"]), 0.0)
+        for metrics in (actor_metrics, critic_metrics):
+            for value in metrics.values():
+                self.assertTrue(torch.isfinite(torch.tensor(float(value))))
+
     def test_train_step_reports_actor_q_coef_schedule(self) -> None:
         learner = self._make_learner()
         learner.config.warmup_steps = 0
