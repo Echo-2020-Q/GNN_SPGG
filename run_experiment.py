@@ -575,6 +575,12 @@ BASE_EXPERIMENT = {
         # 设为 None 时，自动继承 domain_randomization.network_types。
         "demo_collection_network_types": None,
 
+        # demo 预收集运行时：
+        # - "parallel_cpu"  : 单独启动并行 CPU teacher workers，保留多进程吞吐，避开 local CUDA rollout worker
+        # - "isolated_cpu"  : 单进程 CPU teacher collector，最稳但最慢
+        # - "reuse_workers" : 复用当前 rollout workers，速度最快，但会重新走本地 CUDA/并行 rollout 路径
+        "demo_collection_runtime": "parallel_cpu",
+
         # demo 预收集结束后，纯 BC 预训练 actor 的更新次数。
         "actor_bc_pretrain_updates": 3000,
 
@@ -1711,6 +1717,7 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         demo_collection_behavior_source=training.get("demo_collection_behavior_source", "pool_power_mix"),
         demo_collection_use_domain_randomization=training.get("demo_collection_use_domain_randomization", True),
         demo_collection_network_types=tuple(str(item) for item in (training.get("demo_collection_network_types") or ())),
+        demo_collection_runtime=str(training.get("demo_collection_runtime", "parallel_cpu")),
         actor_bc_pretrain_updates=training.get("actor_bc_pretrain_updates", 0),
         critic_pretrain_updates=training.get("critic_pretrain_updates", 0),
         demo_pretrain_batch_size=training.get("demo_pretrain_batch_size"),
@@ -3252,11 +3259,12 @@ def run_gnn_training_mode(
                 )
             )
             print(
-                "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, actor_bc_updates={4}, critic_pretrain_updates={5}, critic_target={6}, n_step={7}, batch_size={8}, dataset_path={9}".format(
+                "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, runtime={4}, actor_bc_updates={5}, critic_pretrain_updates={6}, critic_target={7}, n_step={8}, batch_size={9}, dataset_path={10}".format(
                     trainer_config.demo_collection_env_steps,
                     trainer_config.demo_collection_behavior_source,
                     trainer_config.demo_collection_use_domain_randomization,
                     demo_collection_network_types,
+                    trainer_config.demo_collection_runtime,
                     trainer_config.actor_bc_pretrain_updates,
                     trainer_config.critic_pretrain_updates,
                     trainer_config.demo_critic_pretrain_target_mode,

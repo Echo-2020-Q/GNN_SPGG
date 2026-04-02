@@ -59,6 +59,7 @@ class GraphTD3Config:
     demo_collection_behavior_source: str = "pool_power_mix"
     demo_collection_use_domain_randomization: bool = True
     demo_collection_network_types: tuple[str, ...] = ()
+    demo_collection_runtime: str = "parallel_cpu"
     actor_bc_pretrain_updates: int = 0
     critic_pretrain_updates: int = 0
     demo_pretrain_batch_size: int | None = None
@@ -219,6 +220,10 @@ class GraphTD3Config:
         if not isinstance(self.demo_collection_use_domain_randomization, bool):
             raise ValueError("demo_collection_use_domain_randomization must be a bool.")
         self.demo_collection_network_types = tuple(str(item) for item in self.demo_collection_network_types if str(item))
+        if self.demo_collection_runtime not in {"parallel_cpu", "isolated_cpu", "reuse_workers"}:
+            raise ValueError(
+                "demo_collection_runtime must be one of {'parallel_cpu', 'isolated_cpu', 'reuse_workers'}."
+            )
         if self.actor_bc_pretrain_updates < 0:
             raise ValueError("actor_bc_pretrain_updates must be non-negative.")
         if self.critic_pretrain_updates < 0:
