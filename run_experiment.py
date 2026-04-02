@@ -596,6 +596,16 @@ BASE_EXPERIMENT = {
         # 设为 None 时，只放进 replay，不额外保存到磁盘。
         "demo_dataset_save_path": None,
 
+        # 是否在 demo pretrain 完成后，额外保存一个可直接续训的专用 checkpoint。
+        # 这个 checkpoint 始终按 full_resume 口径保存，包含 replay buffer。
+        "save_demo_pretrain_checkpoint": False,
+
+        # demo pretrain 专用 checkpoint 的文件名。
+        "demo_pretrain_checkpoint_name": "demo_pretrained.pt",
+
+        # 是否在 demo pretrain 完成并保存 checkpoint 后直接退出，不进入 online training。
+        "stop_after_demo_pretrain": False,
+
         # demo critic 预训练使用的目标类型：
         # - "n_step" ：teacher 轨迹自身的纯 n-step return
         # - "mc"     ：teacher 轨迹自身的整局 Monte Carlo return
@@ -3184,6 +3194,12 @@ def _log_tensorboard_static_metadata(
         "static/training/actor_bc_pretrain_updates": float(spec["training"].get("actor_bc_pretrain_updates", 0)),
         "static/training/critic_pretrain_updates": float(spec["training"].get("critic_pretrain_updates", 0)),
         "static/training/demo_critic_pretrain_n_step": float(spec["training"].get("demo_critic_pretrain_n_step", 20)),
+        "static/training/save_demo_pretrain_checkpoint": float(
+            1.0 if spec["training"].get("save_demo_pretrain_checkpoint", False) else 0.0
+        ),
+        "static/training/stop_after_demo_pretrain": float(
+            1.0 if spec["training"].get("stop_after_demo_pretrain", False) else 0.0
+        ),
         "static/training/teacher_takeover_enabled": float(
             1.0 if spec["training"].get("teacher_takeover_enabled", True) else 0.0
         ),
@@ -3237,6 +3253,11 @@ def _log_tensorboard_static_metadata(
     writer.add_text(
         "static/training/demo_critic_pretrain_target_mode",
         str(spec["training"].get("demo_critic_pretrain_target_mode", "n_step")),
+        0,
+    )
+    writer.add_text(
+        "static/training/demo_pretrain_checkpoint_name",
+        str(spec["training"].get("demo_pretrain_checkpoint_name", "demo_pretrained.pt")),
         0,
     )
     writer.add_text(
@@ -3316,6 +3337,26 @@ def _log_tensorboard_demo_pretrain_summary(
         writer.add_text("demo_pretrain/critic_target_mode", str(summary["critic_target_mode"]), 0)
     if "dataset_path" in summary and summary["dataset_path"] is not None:
         writer.add_text("demo_pretrain/dataset_path", str(summary["dataset_path"]), 0)
+
+
+def _log_tensorboard_demo_pretrain_eval_summary(
+    writer: Any,
+    summary: Mapping[str, Any],
+) -> None:
+    if "num_episodes" in summary and summary["num_episodes"] is not None:
+        writer.add_scalar("demo_pretrain/eval_num_episodes", float(summary["num_episodes"]), 0)
+    for key, value in summary.items():
+        if key in {"num_episodes", "checkpoint_path"} or not isinstance(value, (int, float)):
+            continue
+        writer.add_scalar("demo_pretrain/eval_{0}".format(key), float(value), 0)
+    if "checkpoint_eval_return_mean" in summary and summary["checkpoint_eval_return_mean"] is not None:
+        writer.add_scalar(
+            "demo_pretrain/checkpoint_eval_return_mean",
+            float(summary["checkpoint_eval_return_mean"]),
+            0,
+        )
+    if "checkpoint_path" in summary and summary["checkpoint_path"] is not None:
+        writer.add_text("demo_pretrain/checkpoint_path", str(summary["checkpoint_path"]), 0)
 
 
 def _log_tensorboard_update_metrics(
@@ -3634,7 +3675,7 @@ def run_gnn_training_mode(
                 )
             )
             print(
-                "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, runtime={4}, actor_bc_updates={5}, critic_pretrain_updates={6}, critic_target={7}, n_step={8}, batch_size={9}, dataset_path={10}".format(
+                "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, runtime={4}, actor_bc_updates={5}, critic_pretrain_updates={6}, critic_target={7}, n_step={8}, batch_size={9}, dataset_path={10}, save_ckpt={11}, ckpt_name={12}, stop_after={13}".format(
                     trainer_config.demo_collection_env_steps,
                     trainer_config.demo_collection_behavior_source,
                     trainer_config.demo_collection_use_domain_randomization,
@@ -3648,6 +3689,9 @@ def run_gnn_training_mode(
                     if trainer_config.demo_pretrain_batch_size is not None
                     else trainer_config.batch_size,
                     trainer_config.demo_dataset_save_path or "None",
+                    bool(training.get("save_demo_pretrain_checkpoint", False)),
+                    str(training.get("demo_pretrain_checkpoint_name", "demo_pretrained.pt")),
+                    bool(training.get("stop_after_demo_pretrain", False)),
                 )
             )
         print(
@@ -3723,11 +3767,21 @@ def run_gnn_training_mode(
         should_save_checkpoints = bool(training.get("save_checkpoints", False))
         save_final_checkpoint = bool(training.get("save_final_checkpoint", True))
         save_best_checkpoint = bool(training.get("save_best_checkpoint", True))
+        save_demo_pretrain_checkpoint = bool(training.get("save_demo_pretrain_checkpoint", False))
+        demo_pretrain_checkpoint_name = str(training.get("demo_pretrain_checkpoint_name", "demo_pretrained.pt"))
+        stop_after_demo_pretrain = bool(training.get("stop_after_demo_pretrain", False))
+        if stop_after_demo_pretrain and not save_demo_pretrain_checkpoint:
+            raise ValueError(
+                "training.stop_after_demo_pretrain=True requires "
+                "training.save_demo_pretrain_checkpoint=True."
+            )
         checkpoint_interval = int(training.get("checkpoint_interval", 0))
         checkpoint_mode = str(training.get("checkpoint_mode", "lightweight"))
         if checkpoint_mode not in {"lightweight", "full_resume"}:
             raise ValueError("training.checkpoint_mode must be one of {'lightweight', 'full_resume'}.")
         best_eval_return = float("-inf")
+        demo_pretrain_checkpoint_path: str | None = None
+        demo_pretrain_eval_summary: dict[str, Any] | None = None
         resumed_update = 0
         tensorboard_enabled = bool(tensorboard.get("enabled", False))
         console_progress_logs = bool(tensorboard.get("console_progress_logs", True))
@@ -3742,6 +3796,8 @@ def run_gnn_training_mode(
         warmup_env_steps = int(training_schedule["warmup_env_steps"])
         recent_metrics: deque[dict[str, float]] = deque(maxlen=max(console_recent_window_updates, 1))
         resumed_global_env_steps = int(getattr(trainer, "global_env_steps", 0))
+        demo_pretrain_summary_logged = False
+        demo_pretrain_eval_summary_logged = False
 
         def _current_stage_label(metrics: Mapping[str, float]) -> Optional[str]:
             if "curriculum_stage" not in metrics:
@@ -3757,7 +3813,7 @@ def run_gnn_training_mode(
             except TypeError:
                 return torch.load(checkpoint_path, map_location="cpu")
 
-        if should_save_checkpoints or save_final_checkpoint or save_best_checkpoint:
+        if should_save_checkpoints or save_final_checkpoint or save_best_checkpoint or save_demo_pretrain_checkpoint:
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         if resume_from_checkpoint:
@@ -3771,6 +3827,19 @@ def run_gnn_training_mode(
             resumed_update = int(trainer.completed_updates)
             resumed_global_env_steps = int(trainer.global_env_steps)
             best_eval_return = float(checkpoint_payload.get("best_eval_return_so_far", float("-inf")))
+            if checkpoint_payload.get("demo_pretrain_eval_summary") is not None:
+                demo_pretrain_eval_summary = dict(checkpoint_payload["demo_pretrain_eval_summary"])
+            if bool(checkpoint_payload.get("is_demo_pretrain_checkpoint", False)):
+                demo_pretrain_checkpoint_path = str(checkpoint_path)
+                if save_best_checkpoint:
+                    best_checkpoint_path = checkpoint_dir / "best_eval.pt"
+                    if not best_checkpoint_path.exists():
+                        torch.save(checkpoint_payload, best_checkpoint_path)
+                        print(
+                            "Resume    : seeded best checkpoint from demo-pretrain checkpoint -> {0}".format(
+                                best_checkpoint_path
+                            )
+                        )
             print(
                 "Resume    : checkpoint={0}, resume_update={1}, checkpoint_mode={2}".format(
                     checkpoint_path,
@@ -3808,16 +3877,52 @@ def run_gnn_training_mode(
                 )
             writer.flush()
 
-        def _save_checkpoint(filename: str, update: int, metrics: Mapping[str, float]) -> None:
+        def _save_checkpoint(
+            filename: str,
+            update: int,
+            metrics: Mapping[str, float],
+            *,
+            checkpoint_mode_override: str | None = None,
+            best_eval_return_override: float | None = None,
+            extra_payload: Mapping[str, Any] | None = None,
+            log_prefix: str = "Checkpoint saved",
+        ) -> Path:
             checkpoint_path = checkpoint_dir / filename
             payload = trainer.build_checkpoint(
                 update=update,
                 metrics=metrics,
-                checkpoint_mode=checkpoint_mode,
+                checkpoint_mode=checkpoint_mode_override or checkpoint_mode,
             )
-            payload["best_eval_return_so_far"] = float(best_eval_return)
+            payload["best_eval_return_so_far"] = float(
+                best_eval_return if best_eval_return_override is None else best_eval_return_override
+            )
+            if extra_payload is not None:
+                payload.update(dict(extra_payload))
             torch.save(payload, checkpoint_path)
-            print("Checkpoint saved: {0}".format(checkpoint_path))
+            print("{0}: {1}".format(log_prefix, checkpoint_path))
+            return checkpoint_path
+
+        def _build_demo_pretrain_eval_summary(
+            *,
+            num_episodes: int,
+            raw_metrics: Mapping[str, float],
+            checkpoint_path: str | None = None,
+        ) -> dict[str, Any]:
+            summary: dict[str, Any] = {"num_episodes": int(num_episodes)}
+            for key, value in raw_metrics.items():
+                summary[str(key)] = float(value)
+            summary["checkpoint_eval_return_mean"] = float(raw_metrics.get("return_mean", 0.0))
+            summary["checkpoint_path"] = checkpoint_path
+            return summary
+
+        def _demo_pretrain_eval_metrics(raw_metrics: Mapping[str, float]) -> dict[str, float]:
+            metrics: dict[str, float] = {
+                "update": float(int(trainer.completed_updates)),
+                "global_env_steps": float(int(trainer.global_env_steps)),
+            }
+            for key, value in raw_metrics.items():
+                metrics["eval_{0}".format(key)] = float(value)
+            return metrics
 
         def _on_update(metrics: dict[str, float]) -> None:
             nonlocal best_eval_return
@@ -3876,6 +3981,114 @@ def run_gnn_training_mode(
                 ):
                     print(line)
 
+        should_run_demo_pretrain = (
+            int(trainer.completed_updates) == 0
+            and not bool(getattr(trainer, "demo_pretrain_completed", False))
+            and bool(effective_trainer_config.demo_pretrain_enabled)
+        )
+        if should_run_demo_pretrain:
+            trainer._run_demo_pretrain()
+            demo_pretrain_summary = (
+                dict(trainer.demo_pretrain_summary)
+                if getattr(trainer, "demo_pretrain_summary", None) is not None
+                else None
+            )
+            if demo_pretrain_summary is not None:
+                print(
+                    "Demo Summary: replay={0:.0f}, actor_bc_updates={1:.0f}, critic_pretrain_updates={2:.0f}, critic_target={3}, target_mean={4:.6f}, target_std={5:.6f}, actor_bc_loss_last={6:.6f}, critic_loss_last={7:.6f}, seconds={{collection:{8:.3f}, actor_bc:{9:.3f}, critic:{10:.3f}}}".format(
+                        float(demo_pretrain_summary.get("demo_replay_size_after_collection", 0.0)),
+                        float(demo_pretrain_summary.get("actor_bc_updates", 0.0)),
+                        float(demo_pretrain_summary.get("critic_pretrain_updates", 0.0)),
+                        str(demo_pretrain_summary.get("critic_target_mode", "n_step")),
+                        float(demo_pretrain_summary.get("demo_return_target_mean", 0.0)),
+                        float(demo_pretrain_summary.get("demo_return_target_std", 0.0)),
+                        float(demo_pretrain_summary.get("actor_bc_loss_last", 0.0)),
+                        float(demo_pretrain_summary.get("critic_loss_last", 0.0)),
+                        float(demo_pretrain_summary.get("seconds_collection", 0.0)),
+                        float(demo_pretrain_summary.get("seconds_actor_bc", 0.0)),
+                        float(demo_pretrain_summary.get("seconds_critic", 0.0)),
+                    )
+                )
+                if writer is not None:
+                    _log_tensorboard_demo_pretrain_summary(writer, demo_pretrain_summary)
+                demo_pretrain_summary_logged = True
+
+            demo_pretrain_eval_episodes = max(1, min(int(effective_trainer_config.eval_episodes), 4))
+            raw_demo_pretrain_eval = trainer.evaluate(num_episodes=demo_pretrain_eval_episodes)
+            pretrain_eval_return = float(raw_demo_pretrain_eval.get("return_mean", 0.0))
+            best_eval_return = pretrain_eval_return
+            pretrain_eval_metrics = _demo_pretrain_eval_metrics(raw_demo_pretrain_eval)
+            print(
+                "Demo Pretrain Eval | episodes={0} | return_mean={1:.6f} | cooperation_mean={2:.6f} | gini_mean={3:.6f} | collapse_rate={4:.6f}".format(
+                    demo_pretrain_eval_episodes,
+                    pretrain_eval_return,
+                    float(raw_demo_pretrain_eval.get("cooperation_mean", 0.0)),
+                    float(raw_demo_pretrain_eval.get("gini_mean", 0.0)),
+                    float(raw_demo_pretrain_eval.get("collapse_rate", 0.0)),
+                )
+            )
+
+            if save_best_checkpoint:
+                _save_checkpoint(
+                    "best_eval.pt",
+                    update=int(trainer.completed_updates),
+                    metrics=pretrain_eval_metrics,
+                )
+
+            if save_demo_pretrain_checkpoint:
+                checkpoint_path = _save_checkpoint(
+                    demo_pretrain_checkpoint_name,
+                    update=int(trainer.completed_updates),
+                    metrics=pretrain_eval_metrics,
+                    checkpoint_mode_override="full_resume",
+                    best_eval_return_override=pretrain_eval_return,
+                    extra_payload={
+                        "is_demo_pretrain_checkpoint": True,
+                    },
+                    log_prefix="Demo Pretrain Checkpoint saved",
+                )
+                demo_pretrain_checkpoint_path = str(checkpoint_path)
+
+            demo_pretrain_eval_summary = _build_demo_pretrain_eval_summary(
+                num_episodes=demo_pretrain_eval_episodes,
+                raw_metrics=raw_demo_pretrain_eval,
+                checkpoint_path=demo_pretrain_checkpoint_path,
+            )
+            if demo_pretrain_checkpoint_path is not None:
+                enriched_checkpoint_path = Path(demo_pretrain_checkpoint_path)
+                checkpoint_payload = _load_checkpoint_payload(enriched_checkpoint_path)
+                checkpoint_payload["demo_pretrain_eval_summary"] = dict(demo_pretrain_eval_summary)
+                torch.save(checkpoint_payload, enriched_checkpoint_path)
+                if save_best_checkpoint:
+                    best_checkpoint_path = checkpoint_dir / "best_eval.pt"
+                    if best_checkpoint_path.exists():
+                        best_payload = _load_checkpoint_payload(best_checkpoint_path)
+                        best_payload["demo_pretrain_eval_summary"] = dict(demo_pretrain_eval_summary)
+                        torch.save(best_payload, best_checkpoint_path)
+            if writer is not None:
+                _log_tensorboard_demo_pretrain_eval_summary(writer, demo_pretrain_eval_summary)
+                writer.flush()
+                demo_pretrain_eval_summary_logged = True
+
+            if stop_after_demo_pretrain:
+                return {
+                    "experiment_name": spec["experiment_name"],
+                    "run_mode": spec["run_mode"],
+                    "network_type": spec["network"]["type"],
+                    "trainer_config": asdict(trainer_config),
+                    "demo_pretrain_summary": demo_pretrain_summary,
+                    "demo_pretrain_eval_summary": demo_pretrain_eval_summary,
+                    "demo_pretrain_checkpoint_path": demo_pretrain_checkpoint_path,
+                    "stopped_after_demo_pretrain": True,
+                    "history": [],
+                    "post_training_eval_model_source": (
+                        "demo_pretrain_checkpoint" if demo_pretrain_checkpoint_path is not None else "demo_pretrain_eval"
+                    ),
+                    "post_training_eval_checkpoint": demo_pretrain_checkpoint_path,
+                    "post_training_evaluation": [],
+                    "final_metrics": dict(pretrain_eval_metrics),
+                }
+
         history = trainer.train(
             num_updates=effective_trainer_config.total_updates,
             on_update=_on_update,
@@ -3886,23 +4099,26 @@ def run_gnn_training_mode(
             else None
         )
         if demo_pretrain_summary is not None:
-            print(
-                "Demo Summary: replay={0:.0f}, actor_bc_updates={1:.0f}, critic_pretrain_updates={2:.0f}, critic_target={3}, target_mean={4:.6f}, target_std={5:.6f}, actor_bc_loss_last={6:.6f}, critic_loss_last={7:.6f}, seconds={{collection:{8:.3f}, actor_bc:{9:.3f}, critic:{10:.3f}}}".format(
-                    float(demo_pretrain_summary.get("demo_replay_size_after_collection", 0.0)),
-                    float(demo_pretrain_summary.get("actor_bc_updates", 0.0)),
-                    float(demo_pretrain_summary.get("critic_pretrain_updates", 0.0)),
-                    str(demo_pretrain_summary.get("critic_target_mode", "n_step")),
-                    float(demo_pretrain_summary.get("demo_return_target_mean", 0.0)),
-                    float(demo_pretrain_summary.get("demo_return_target_std", 0.0)),
-                    float(demo_pretrain_summary.get("actor_bc_loss_last", 0.0)),
-                    float(demo_pretrain_summary.get("critic_loss_last", 0.0)),
-                    float(demo_pretrain_summary.get("seconds_collection", 0.0)),
-                    float(demo_pretrain_summary.get("seconds_actor_bc", 0.0)),
-                    float(demo_pretrain_summary.get("seconds_critic", 0.0)),
+            if not demo_pretrain_summary_logged:
+                print(
+                    "Demo Summary: replay={0:.0f}, actor_bc_updates={1:.0f}, critic_pretrain_updates={2:.0f}, critic_target={3}, target_mean={4:.6f}, target_std={5:.6f}, actor_bc_loss_last={6:.6f}, critic_loss_last={7:.6f}, seconds={{collection:{8:.3f}, actor_bc:{9:.3f}, critic:{10:.3f}}}".format(
+                        float(demo_pretrain_summary.get("demo_replay_size_after_collection", 0.0)),
+                        float(demo_pretrain_summary.get("actor_bc_updates", 0.0)),
+                        float(demo_pretrain_summary.get("critic_pretrain_updates", 0.0)),
+                        str(demo_pretrain_summary.get("critic_target_mode", "n_step")),
+                        float(demo_pretrain_summary.get("demo_return_target_mean", 0.0)),
+                        float(demo_pretrain_summary.get("demo_return_target_std", 0.0)),
+                        float(demo_pretrain_summary.get("actor_bc_loss_last", 0.0)),
+                        float(demo_pretrain_summary.get("critic_loss_last", 0.0)),
+                        float(demo_pretrain_summary.get("seconds_collection", 0.0)),
+                        float(demo_pretrain_summary.get("seconds_actor_bc", 0.0)),
+                        float(demo_pretrain_summary.get("seconds_critic", 0.0)),
+                    )
                 )
-            )
-            if writer is not None:
+            if writer is not None and not demo_pretrain_summary_logged:
                 _log_tensorboard_demo_pretrain_summary(writer, demo_pretrain_summary)
+        if writer is not None and demo_pretrain_eval_summary is not None and not demo_pretrain_eval_summary_logged:
+            _log_tensorboard_demo_pretrain_eval_summary(writer, demo_pretrain_eval_summary)
         if history and save_final_checkpoint:
             final_metrics = history[-1]
             _save_checkpoint(
@@ -3957,6 +4173,9 @@ def run_gnn_training_mode(
             "network_type": spec["network"]["type"],
             "trainer_config": asdict(trainer_config),
             "demo_pretrain_summary": demo_pretrain_summary,
+            "demo_pretrain_eval_summary": demo_pretrain_eval_summary,
+            "demo_pretrain_checkpoint_path": demo_pretrain_checkpoint_path,
+            "stopped_after_demo_pretrain": False,
             "history": history,
             "post_training_eval_model_source": post_training_eval_model_source,
             "post_training_eval_checkpoint": post_training_eval_checkpoint,
