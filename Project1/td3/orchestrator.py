@@ -337,13 +337,17 @@ class GraphTD3Trainer:
         return allocations
 
     def _global_step_allocations(self, total_steps: int) -> list[int]:
+        return self._global_step_allocations_for_workers(self.workers, total_steps)
+
+    @staticmethod
+    def _global_step_allocations_for_workers(workers: Sequence[Any], total_steps: int) -> list[int]:
         remaining_steps = max(0, int(total_steps))
         if remaining_steps <= 0:
-            return [0 for _ in self.workers]
+            return [0 for _ in workers]
 
         allocations: list[int] = []
-        remaining_workers = len(self.workers)
-        for worker in self.workers:
+        remaining_workers = len(workers)
+        for worker in workers:
             per_worker_steps = int(worker.config.rollout_steps_per_sync)
             if remaining_workers <= 1:
                 allocation = min(per_worker_steps, remaining_steps)
@@ -366,22 +370,45 @@ class GraphTD3Trainer:
         demo_return_target_mode: str | None = None,
         demo_return_n_step: int | None = None,
     ) -> list[RolloutResult]:
-        if len(step_allocations) != len(self.workers):
+        return self._collect_rollouts_with_allocations_on_workers(
+            self.workers,
+            step_allocations,
+            warmup_allocations=warmup_allocations,
+            forced_behavior_source=forced_behavior_source,
+            mark_as_demo=mark_as_demo,
+            count_env_steps=count_env_steps,
+            demo_return_target_mode=demo_return_target_mode,
+            demo_return_n_step=demo_return_n_step,
+        )
+
+    def _collect_rollouts_with_allocations_on_workers(
+        self,
+        workers: Sequence[Any],
+        step_allocations: Sequence[int],
+        *,
+        warmup_allocations: Sequence[int] | None = None,
+        forced_behavior_source: str | None = None,
+        mark_as_demo: bool | None = None,
+        count_env_steps: bool = True,
+        demo_return_target_mode: str | None = None,
+        demo_return_n_step: int | None = None,
+    ) -> list[RolloutResult]:
+        if len(step_allocations) != len(workers):
             raise ValueError("step_allocations must align with workers.")
         if warmup_allocations is None:
-            warmup_allocations = [0 for _ in self.workers]
-        if len(warmup_allocations) != len(self.workers):
+            warmup_allocations = [0 for _ in workers]
+        if len(warmup_allocations) != len(workers):
             raise ValueError("warmup_allocations must align with workers.")
 
         positive_requests = [
             (worker, int(num_steps), int(warmup_steps))
-            for worker, num_steps, warmup_steps in zip(self.workers, step_allocations, warmup_allocations)
+            for worker, num_steps, warmup_steps in zip(workers, step_allocations, warmup_allocations)
             if int(num_steps) > 0
         ]
         if not positive_requests:
             return []
 
-        if self.config.num_workers <= 1:
+        if len(workers) <= 1:
             worker, num_steps, warmup_steps = positive_requests[0]
             rollout_results = [
                 worker.collect(
@@ -506,6 +533,26 @@ class GraphTD3Trainer:
             device="cpu",
         )
 
+    def _build_parallel_demo_collection_workers(self, demo_factory: RandomizedEnvFactory) -> list[ParallelRolloutWorker]:
+        demo_workers: list[ParallelRolloutWorker] = []
+        for worker_id in range(int(self.config.num_workers)):
+            worker_config = WorkerConfig(
+                worker_id=worker_id,
+                seed=(int(self.config.seed or 0) + 2_000_000 + worker_id),
+                rollout_steps_per_sync=int(self.config.steps_per_update),
+                num_envs_per_worker=int(self.config.num_envs_per_worker),
+            )
+            demo_workers.append(
+                ParallelRolloutWorker(
+                    actor=copy.deepcopy(self.learner.actor),
+                    env_factory=demo_factory,
+                    config=worker_config,
+                    train_config=self.config,
+                    device="cpu",
+                )
+            )
+        return demo_workers
+
     def _collect_demo_rollouts_with_isolated_worker(
         self,
         *,
@@ -545,6 +592,46 @@ class GraphTD3Trainer:
                 remaining_steps -= collected_now
             finally:
                 result.release_shared_memory()
+
+    def _collect_demo_rollouts_with_parallel_workers(
+        self,
+        *,
+        demo_factory: RandomizedEnvFactory,
+        total_steps: int,
+        demo_batches_to_save: list[Any],
+        demo_return_targets: list[np.ndarray],
+    ) -> None:
+        demo_workers = self._build_parallel_demo_collection_workers(demo_factory)
+        try:
+            remaining_steps = max(0, int(total_steps))
+            while remaining_steps > 0:
+                step_allocations = self._global_step_allocations_for_workers(demo_workers, remaining_steps)
+                if sum(step_allocations) <= 0:
+                    break
+                rollout_results = self._collect_rollouts_with_allocations_on_workers(
+                    demo_workers,
+                    step_allocations,
+                    forced_behavior_source=str(self.config.demo_collection_behavior_source),
+                    mark_as_demo=True,
+                    count_env_steps=False,
+                    demo_return_target_mode=str(self.config.demo_critic_pretrain_target_mode),
+                    demo_return_n_step=int(self.config.demo_critic_pretrain_n_step),
+                )
+                collected_now = sum(len(result.replay_batch) for result in rollout_results)
+                if collected_now <= 0:
+                    raise RuntimeError("Demo collection produced zero transitions.")
+                if self.config.demo_dataset_save_path:
+                    demo_batches_to_save.extend(result.replay_batch.clone() for result in rollout_results)
+                for result in rollout_results:
+                    valid_mask = result.replay_batch.demo_return_valid.detach().cpu().numpy().astype(np.bool_, copy=False)
+                    if np.any(valid_mask):
+                        demo_return_targets.append(
+                            result.replay_batch.demo_return_target.detach().cpu().numpy().astype(np.float32, copy=False)[valid_mask]
+                        )
+                remaining_steps -= collected_now
+        finally:
+            for worker in demo_workers:
+                worker.close()
 
     def _save_demo_dataset(self, replay_batches: Sequence[Any]) -> str | None:
         save_path = self.config.demo_dataset_save_path
@@ -602,18 +689,70 @@ class GraphTD3Trainer:
             )
             demo_collection_start = perf_counter()
             demo_factory = self._build_demo_collection_factory()
-            print(
-                "Demo Pretrain | using isolated CPU collector | envs={0} | steps_per_sync={1}".format(
-                    max(1, int(self.config.num_workers)) * max(1, int(self.config.num_envs_per_worker)),
-                    max(1, int(self.config.num_workers)) * max(1, int(self.config.steps_per_update)),
+            demo_collection_runtime = str(self.config.demo_collection_runtime)
+            if demo_collection_runtime == "reuse_workers":
+                print("Demo Pretrain | runtime=reuse_workers")
+                for worker in self.workers:
+                    worker.set_env_factory(demo_factory, reset_environment=True)
+                try:
+                    remaining_steps = int(demo_collection_steps)
+                    while remaining_steps > 0:
+                        step_allocations = self._global_step_allocations(remaining_steps)
+                        if sum(step_allocations) <= 0:
+                            break
+                        rollout_results = self._collect_rollouts_with_allocations(
+                            step_allocations,
+                            forced_behavior_source=str(self.config.demo_collection_behavior_source),
+                            mark_as_demo=True,
+                            count_env_steps=False,
+                            demo_return_target_mode=str(self.config.demo_critic_pretrain_target_mode),
+                            demo_return_n_step=int(self.config.demo_critic_pretrain_n_step),
+                        )
+                        collected_now = sum(len(result.replay_batch) for result in rollout_results)
+                        if collected_now <= 0:
+                            raise RuntimeError("Demo collection produced zero transitions.")
+                        if self.config.demo_dataset_save_path:
+                            demo_batches_to_save.extend(result.replay_batch.clone() for result in rollout_results)
+                        for result in rollout_results:
+                            valid_mask = result.replay_batch.demo_return_valid.detach().cpu().numpy().astype(
+                                np.bool_, copy=False
+                            )
+                            if np.any(valid_mask):
+                                demo_return_targets.append(
+                                    result.replay_batch.demo_return_target.detach().cpu().numpy().astype(
+                                        np.float32, copy=False
+                                    )[valid_mask]
+                                )
+                        remaining_steps -= collected_now
+                finally:
+                    for worker in self.workers:
+                        worker.set_env_factory(self.train_factory, reset_environment=True)
+            elif demo_collection_runtime == "parallel_cpu" and int(self.config.num_workers) > 1:
+                print(
+                    "Demo Pretrain | runtime=parallel_cpu | envs={0} | steps_per_sync={1}".format(
+                        max(1, int(self.config.num_workers)) * max(1, int(self.config.num_envs_per_worker)),
+                        max(1, int(self.config.steps_per_update)),
+                    )
                 )
-            )
-            self._collect_demo_rollouts_with_isolated_worker(
-                demo_factory=demo_factory,
-                total_steps=demo_collection_steps,
-                demo_batches_to_save=demo_batches_to_save,
-                demo_return_targets=demo_return_targets,
-            )
+                self._collect_demo_rollouts_with_parallel_workers(
+                    demo_factory=demo_factory,
+                    total_steps=demo_collection_steps,
+                    demo_batches_to_save=demo_batches_to_save,
+                    demo_return_targets=demo_return_targets,
+                )
+            else:
+                print(
+                    "Demo Pretrain | runtime=isolated_cpu | envs={0} | steps_per_sync={1}".format(
+                        max(1, int(self.config.num_workers)) * max(1, int(self.config.num_envs_per_worker)),
+                        max(1, int(self.config.num_workers)) * max(1, int(self.config.steps_per_update)),
+                    )
+                )
+                self._collect_demo_rollouts_with_isolated_worker(
+                    demo_factory=demo_factory,
+                    total_steps=demo_collection_steps,
+                    demo_batches_to_save=demo_batches_to_save,
+                    demo_return_targets=demo_return_targets,
+                )
 
             summary["seconds_collection"] = float(perf_counter() - demo_collection_start)
             summary["demo_replay_size_after_collection"] = float(self.replay_buffer.demo_size())
