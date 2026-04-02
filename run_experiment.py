@@ -103,7 +103,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "spgg_GNN_12workers_100length_Fermi_Teacher-Return_Critic",
+    "experiment_name": "spgg_GNN_12workers_20length_Fermi_Teacher-Return_Critic",
 
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -216,7 +216,7 @@ BASE_EXPERIMENT = {
         # - fixed            ：每轮直接消耗这个值
         # - piecewise_linear ：作为基础固定消耗
         # 仅当 resource_consumption_fixed_mode == "constant" 时生效。
-        "resource_consumption_fixed": 4, #暂时设置等于平均度
+        "resource_consumption_fixed": 5, #暂时设置等于平均度
 
         # 度比例固定消耗倍数。
         # 当 resource_consumption_fixed_mode == "degree_scaled" 时：
@@ -230,7 +230,7 @@ BASE_EXPERIMENT = {
 
         # 分段线性消耗阈值。
         # 仅当 resource_consumption_mode == "piecewise_linear" 时使用。
-        "resource_consumption_threshold": 4.0, #50
+        "resource_consumption_threshold": 5.0, #50
 
         # 个体策略更新规则：
         # - "fermi"        ：同步 Fermi 更新
@@ -254,7 +254,7 @@ BASE_EXPERIMENT = {
 
         # 每个 episode 的时间步上限。
         # 到达这个步数后，本 episode 结束。
-        "episode_length": 100, #150 10000
+        "episode_length": 20, #150 10000
 
         # 所有节点统一的初始资源。
         "initial_resource": 20.0,#10
@@ -376,10 +376,10 @@ BASE_EXPERIMENT = {
         "learning_rate": 1e-4,
 
         # Actor 学习率。
-        "actor_lr": None,
+        "actor_lr":  1e-4,
 
         # Critic 学习率。
-        "critic_lr": None,
+        "critic_lr":  1e-5,
 
         # 学习率调度类型：
         # - "constant"          ：固定学习率
@@ -387,7 +387,7 @@ BASE_EXPERIMENT = {
         "lr_schedule_type": "exponential_decay",
 
         # 指数退火的最小学习率下界。
-        "lr_final": 1e-5,
+        "lr_final": 5e-6,
 
         # 指数退火的 decay_rate。
         "lr_decay_rate": 0.05,
@@ -547,7 +547,7 @@ BASE_EXPERIMENT = {
         "warmup_actor_bc_coef": 1.0,
 
         # warm-up 结束后，继续在 demo 样本上保留一个较轻的行为克隆锚点。
-        "actor_demo_bc_coef": 0.6,
+        "actor_demo_bc_coef": 0.8,
 
         # warm-up 结束后，demo BC 系数线性衰减到 0 的总 rollout 步数比例。
         # 例如 0.50 表示到总 rollout 步数的 20% 时衰减到 0。
@@ -623,13 +623,13 @@ BASE_EXPERIMENT = {
 
         # online 阶段 actor 的 Q 项初始系数。
         # 早期让 actor loss 以 BC 为主，Q 为辅。
-        "online_actor_q_coef_initial": 0.2,
+        "online_actor_q_coef_initial": 0.05,
 
         # online 阶段 actor 的 Q 项最终系数。
         "online_actor_q_coef_final": 1.0,
 
         # actor Q 系数从 initial 线性升到 final 的总 rollout 步数比例。
-        "online_actor_q_coef_ramp_end_fraction": 0.30,
+        "online_actor_q_coef_ramp_end_fraction": 0.50,
 
         # critic 损失类型：
         # - "mse"
@@ -704,7 +704,7 @@ BASE_EXPERIMENT = {
         # 默认建议先用 "cpu"，让 worker 侧保持最简单、最稳定的本地 CPU rollout。
         # 如果后面要专门做 rollout 推理加速，再改成某张 GPU 或多张 GPU 列表。
         # learner 训练设备仍由下面的 device 单独控制。
-        "rollout_device": "cuda:2",
+        "rollout_device": "cuda:0",
 
         # rollout 推理模式：
         # - "local"       ：每个 worker 自己持有 actor，并在本地前向
@@ -719,7 +719,7 @@ BASE_EXPERIMENT = {
 
         # learner 训练设备：cpu / cuda / cuda:0 等。
         # 这只控制主进程里的 actor/critic 训练，不控制 rollout worker 的推理设备。
-        "device": "cuda:3",
+        "device": "cuda:1",
 
         # 并行 rollout worker 进程内的 PyTorch CPU 线程数。
         # 仅对多进程 worker 生效，用于减少小图前向时的线程争抢。

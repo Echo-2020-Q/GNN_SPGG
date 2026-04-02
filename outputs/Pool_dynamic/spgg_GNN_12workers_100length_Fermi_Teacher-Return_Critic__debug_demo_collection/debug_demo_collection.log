@@ -1,0 +1,38 @@
+Debug Log  : /home/QinYiHang/Code/GNN_SPGG/outputs/Pool_dynamic/spgg_GNN_12workers_100length_Fermi_Teacher-Return_Critic__debug_demo_collection/debug_demo_collection.log
+=== Debug Demo Collection ===
+Python     : /home/QinYiHang/anaconda3/envs/cnn_spgg/bin/python
+Version    : 3.10.19 (main, Oct 21 2025, 16:43:05) [GCC 11.2.0]
+Platform   : Linux-5.15.0-139-generic-x86_64-with-glibc2.31
+PID        : 430995
+CWD        : /home/QinYiHang/Code/GNN_SPGG
+Torch      : 2.6.0+cu124
+CUDA avail : True
+CUDA count : 4
+CUDA[0]   : NVIDIA GeForce RTX 4090
+CUDA[1]   : NVIDIA GeForce RTX 4090
+CUDA[2]   : NVIDIA GeForce RTX 4090
+CUDA[3]   : NVIDIA GeForce RTX 4090
+========================================
+Step 1     : build_graph
+Step 2     : build_env_config
+Step 3     : build_env
+Step 4     : build_policy
+Step 5     : build_trainer_config
+Step 6     : build_domain_randomization_config
+Step 7     : build_evaluation_env_factories
+Step 8     : build_training_curriculum
+Step 9     : construct GraphTD3Trainer
+Step 10    : trainer._run_demo_pretrain()
+Demo Pretrain | collection start | env_steps=10000 | behavior=pool_power_mix
+Demo Pretrain | runtime=parallel_cpu | envs=48 | steps_per_sync=400
+Fatal Python error: Segmentation fault
+
+Current thread 0x00007f4b73660280 (most recent call first):
+  File "/home/QinYiHang/anaconda3/envs/cnn_spgg/lib/python3.10/site-packages/numpy/_core/fromnumeric.py", line 102 in _wrapreduction_any_all
+  File "/home/QinYiHang/anaconda3/envs/cnn_spgg/lib/python3.10/site-packages/numpy/_core/fromnumeric.py", line 2580 in any
+  File "/home/QinYiHang/Code/GNN_SPGG/Project1/td3/orchestrator.py", line 710 in _collect_demo_rollouts_with_parallel_workers
+  File "/home/QinYiHang/Code/GNN_SPGG/Project1/td3/orchestrator.py", line 835 in _run_demo_pretrain
+  File "/home/QinYiHang/Code/GNN_SPGG/debug_demo_collection.py", line 136 in main
+  File "/home/QinYiHang/Code/GNN_SPGG/debug_demo_collection.py", line 156 in <module>
+
+Extension modules: mkl._mklinit, mkl._py_mkl_service, numpy._core._multiarray_umath, numpy.linalg._umath_linalg, torch._C, torch._C._dynamo.autograd_compiler, torch._C._dynamo.eval_frame, torch._C._dynamo.guards, torch._C._dynamo.utils, torch._C._fft, torch._C._linalg, torch._C._nested, torch._C._nn, torch._C._sparse, torch._C._special, numpy.random._common, numpy.random.bit_generator, numpy.random._bounded_integers, numpy.random._mt19937, numpy.random.mtrand, numpy.random._philox, numpy.random._pcg64, numpy.random._sfc64, numpy.random._generator (total: 24)
