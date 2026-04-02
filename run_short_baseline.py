@@ -413,6 +413,9 @@ def _build_spec(args: argparse.Namespace) -> Dict[str, Any]:
             "rollout": {
                 "post_training_eval_episodes": int(args.post_train_eval_episodes),
             },
+            "evaluation": {
+                "use_best_checkpoint_for_post_training_eval": False,
+            },
             "visualization": {
                 "enable_micro_snapshots": False,
                 "enable_macro_timeseries": False,

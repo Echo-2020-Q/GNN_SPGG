@@ -1033,6 +1033,31 @@ class GraphTD3Trainer:
             "profile_actor_sync_worker_rpc_seconds": 0.0,
         }
 
+    @staticmethod
+    def _accumulated_learner_profile_keys() -> tuple[str, ...]:
+        return (
+            "profile_replay_sample_seconds",
+            "profile_batch_to_device_seconds",
+            "profile_critic_update_seconds",
+            "profile_actor_update_seconds",
+            "profile_target_soft_update_seconds",
+        )
+
+    def _run_learner_updates(self) -> dict[str, float]:
+        learner_metrics: dict[str, float] | None = None
+        accumulated_profiles = {
+            key: 0.0 for key in self._accumulated_learner_profile_keys()
+        }
+        for _ in range(int(self.config.gradient_steps_per_update)):
+            step_metrics = self.learner.train_step(global_env_steps=int(self.global_env_steps))
+            learner_metrics = dict(step_metrics)
+            for key in accumulated_profiles:
+                accumulated_profiles[key] += float(step_metrics.get(key, 0.0))
+        if learner_metrics is None:
+            learner_metrics = {}
+        learner_metrics.update(accumulated_profiles)
+        return learner_metrics
+
     def _sync_rollout_workers_if_needed(self, update: int) -> dict[str, float]:
         sync_metrics = self._empty_rollout_sync_profile()
         if update == 1 or ((update - 1) % self.config.worker_sync_interval == 0):
@@ -1103,8 +1128,7 @@ class GraphTD3Trainer:
                 rollout_sync_metrics = dict(pending_sync_metrics)
                 learner_update_start = perf_counter()
                 if update % self.config.train_every == 0:
-                    for _ in range(self.config.gradient_steps_per_update):
-                        learner_metrics = self.learner.train_step(global_env_steps=int(self.global_env_steps))
+                    learner_metrics = self._run_learner_updates()
                 learner_update_seconds = float(perf_counter() - learner_update_start)
 
                 rollout_wait_start = perf_counter()
@@ -1127,8 +1151,7 @@ class GraphTD3Trainer:
 
                 learner_update_start = perf_counter()
                 if update % self.config.train_every == 0:
-                    for _ in range(self.config.gradient_steps_per_update):
-                        learner_metrics = self.learner.train_step(global_env_steps=int(self.global_env_steps))
+                    learner_metrics = self._run_learner_updates()
                 learner_update_seconds = float(perf_counter() - learner_update_start)
 
             rollout_metrics = [result.metrics for result in rollout_results]
