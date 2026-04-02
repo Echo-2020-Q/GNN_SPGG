@@ -95,3 +95,13 @@ class RunExperimentTensorboardTests(unittest.TestCase):
             _tensorboard_tag_for_metric("profile_rollout_overlap_seconds"),
             "profile/rollout_overlap_seconds",
         )
+
+    def test_grad_clip_metrics_map_to_grad_tensorboard_namespace(self) -> None:
+        self.assertEqual(
+            _tensorboard_tag_for_metric("actor_grad_norm_pre_clip"),
+            "grad/actor_grad_norm_pre_clip",
+        )
+        self.assertEqual(
+            _tensorboard_tag_for_metric("critic_grad_norm_post_clip"),
+            "grad/critic_grad_norm_post_clip",
+        )

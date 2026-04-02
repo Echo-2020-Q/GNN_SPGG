@@ -66,6 +66,24 @@ def _slice_replay_batch(batch: TensorReplayBatch, indices: Tensor) -> TensorRepl
     )
 
 
+def _slice_replay_batch_range(batch: TensorReplayBatch, start: int, end: int) -> TensorReplayBatch:
+    return TensorReplayBatch(
+        obs={key: value[start:end] for key, value in batch.obs.items()},
+        action=TensorReplayActionRecord(
+            allocation=batch.action.allocation[start:end],
+        ),
+        reward=batch.reward[start:end],
+        next_obs={key: value[start:end] for key, value in batch.next_obs.items()},
+        done=batch.done[start:end],
+        is_demo=batch.is_demo[start:end],
+        collapse_flag=batch.collapse_flag[start:end],
+        topology_id=batch.topology_id[start:end],
+        pool_power_demo_flag=batch.pool_power_demo_flag[start:end],
+        demo_return_target=batch.demo_return_target[start:end],
+        demo_return_valid=batch.demo_return_valid[start:end],
+    )
+
+
 def _shuffle_replay_batch(batch: TensorReplayBatch, rng: np.random.Generator) -> TensorReplayBatch:
     if len(batch) <= 1:
         return batch
@@ -406,18 +424,72 @@ class _TensorReplayStorage:
             self._seen_count += batch_size
             return
 
-        for batch_index in range(len(cpu_batch)):
-            index = self._select_write_index()
-            if index is None:
-                continue
-            item = _slice_replay_batch(
-                cpu_batch,
-                torch.tensor([batch_index], dtype=torch.int64, device="cpu"),
-            )
-            self._write_batch_at_indices(
-                torch.tensor([index], dtype=torch.int64, device="cpu"),
-                item,
-            )
+        batch_size = len(cpu_batch)
+        batch_offset = 0
+
+        if self._size < self.capacity:
+            fill_count = min(int(self.capacity - self._size), int(batch_size))
+            if fill_count > 0:
+                fill_indices = torch.arange(
+                    int(self._size),
+                    int(self._size) + fill_count,
+                    dtype=torch.int64,
+                    device="cpu",
+                )
+                self._write_batch_at_indices(
+                    fill_indices,
+                    _slice_replay_batch_range(cpu_batch, 0, fill_count),
+                )
+                self._size += fill_count
+                self._seen_count += fill_count
+                batch_offset = fill_count
+
+        remaining = int(batch_size - batch_offset)
+        if remaining <= 0:
+            return
+
+        assert self._size == self.capacity
+        seen_highs = np.arange(
+            int(self._seen_count) + 1,
+            int(self._seen_count) + remaining + 1,
+            dtype=np.int64,
+        )
+        replacement_indices = np.asarray(
+            [int(self._rng.integers(0, int(high))) for high in seen_highs],
+            dtype=np.int64,
+        )
+        valid_mask = replacement_indices < int(self.capacity)
+        self._seen_count += remaining
+        if not np.any(valid_mask):
+            return
+
+        source_indices = torch.as_tensor(
+            batch_offset + np.flatnonzero(valid_mask),
+            dtype=torch.int64,
+            device="cpu",
+        )
+        target_indices = torch.as_tensor(
+            replacement_indices[valid_mask],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        deduplicated_replacements: dict[int, int] = {}
+        for source_index, target_index in zip(source_indices.tolist(), target_indices.tolist()):
+            deduplicated_replacements[int(target_index)] = int(source_index)
+        target_indices = torch.as_tensor(
+            list(deduplicated_replacements.keys()),
+            dtype=torch.int64,
+            device="cpu",
+        )
+        source_indices = torch.as_tensor(
+            list(deduplicated_replacements.values()),
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self._write_batch_at_indices(
+            target_indices,
+            _slice_replay_batch(cpu_batch, source_indices),
+        )
 
     def _sample_indices_up_to(
         self,
@@ -1212,11 +1284,12 @@ class ReplayBuffer:
                 if long_term_storage is not None:
                     long_term_storage.extend(topology_batch)
 
-            demo_groups = self._split_batch_by_topology(cpu_batch, require_pool_power_demo=True)
-            for topology_name, topology_batch in demo_groups.items():
-                demo_storage = self._demo_storages.get(topology_name)
-                if demo_storage is not None:
-                    demo_storage.extend(topology_batch)
+            if bool(cpu_batch.pool_power_demo_flag.any().item()):
+                demo_groups = self._split_batch_by_topology(cpu_batch, require_pool_power_demo=True)
+                for topology_name, topology_batch in demo_groups.items():
+                    demo_storage = self._demo_storages.get(topology_name)
+                    if demo_storage is not None:
+                        demo_storage.extend(topology_batch)
 
     def sample(
         self,

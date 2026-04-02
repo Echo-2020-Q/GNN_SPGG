@@ -119,6 +119,9 @@ class GraphTD3LearnerPretrainTests(unittest.TestCase):
         actor_after = [parameter.detach().clone() for parameter in learner.actor.parameters()]
         critic_after = [parameter.detach().clone() for parameter in learner.critics.parameters()]
         self.assertGreater(float(metrics["actor_bc_loss"]), 0.0)
+        self.assertIn("actor_grad_norm_pre_clip", metrics)
+        self.assertIn("actor_grad_norm_post_clip", metrics)
+        self.assertGreaterEqual(float(metrics["actor_grad_norm_pre_clip"]), float(metrics["actor_grad_norm_post_clip"]))
         self.assertTrue(any(not torch.allclose(before, after) for before, after in zip(actor_before, actor_after)))
         self.assertTrue(all(torch.allclose(before, after) for before, after in zip(critic_before, critic_after)))
 
@@ -164,3 +167,7 @@ class GraphTD3LearnerPretrainTests(unittest.TestCase):
         self.assertAlmostEqual(float(early_metrics["actor_q_coef"]), 0.2, places=6)
         self.assertAlmostEqual(float(late_metrics["actor_q_coef"]), 1.0, places=6)
         self.assertGreaterEqual(float(late_metrics["critic_grad_norm"]), 0.0)
+        self.assertGreaterEqual(
+            float(late_metrics["critic_grad_norm_pre_clip"]),
+            float(late_metrics["critic_grad_norm_post_clip"]),
+        )

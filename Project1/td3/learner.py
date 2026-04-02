@@ -145,6 +145,10 @@ class GraphTD3Learner:
         self.last_replay_collapse_frac = 0.0
         self.last_actor_grad_norm = 0.0
         self.last_critic_grad_norm = 0.0
+        self.last_actor_grad_norm_pre_clip = 0.0
+        self.last_actor_grad_norm_post_clip = 0.0
+        self.last_critic_grad_norm_pre_clip = 0.0
+        self.last_critic_grad_norm_post_clip = 0.0
 
         self.target_actor.load_state_dict(self.actor.state_dict())
         self.target_critics.load_state_dict(self.critics.state_dict())
@@ -262,6 +266,10 @@ class GraphTD3Learner:
             "last_replay_collapse_frac": float(self.last_replay_collapse_frac),
             "last_actor_grad_norm": float(self.last_actor_grad_norm),
             "last_critic_grad_norm": float(self.last_critic_grad_norm),
+            "last_actor_grad_norm_pre_clip": float(self.last_actor_grad_norm_pre_clip),
+            "last_actor_grad_norm_post_clip": float(self.last_actor_grad_norm_post_clip),
+            "last_critic_grad_norm_pre_clip": float(self.last_critic_grad_norm_pre_clip),
+            "last_critic_grad_norm_post_clip": float(self.last_critic_grad_norm_post_clip),
         }
 
     def load_checkpoint_state(self, state_dict: dict[str, Any]) -> None:
@@ -287,6 +295,18 @@ class GraphTD3Learner:
         self.last_replay_collapse_frac = float(state_dict.get("last_replay_collapse_frac", 0.0))
         self.last_actor_grad_norm = float(state_dict.get("last_actor_grad_norm", 0.0))
         self.last_critic_grad_norm = float(state_dict.get("last_critic_grad_norm", 0.0))
+        self.last_actor_grad_norm_pre_clip = float(
+            state_dict.get("last_actor_grad_norm_pre_clip", self.last_actor_grad_norm)
+        )
+        self.last_actor_grad_norm_post_clip = float(
+            state_dict.get("last_actor_grad_norm_post_clip", self.last_actor_grad_norm)
+        )
+        self.last_critic_grad_norm_pre_clip = float(
+            state_dict.get("last_critic_grad_norm_pre_clip", self.last_critic_grad_norm)
+        )
+        self.last_critic_grad_norm_post_clip = float(
+            state_dict.get("last_critic_grad_norm_post_clip", self.last_critic_grad_norm)
+        )
 
     def _current_demo_bc_coef(self, global_env_steps: int | None) -> float:
         if int(self.config.warmup_steps) <= 0:
@@ -392,6 +412,10 @@ class GraphTD3Learner:
             "actor_q_coef": self.last_actor_q_coef,
             "actor_grad_norm": self.last_actor_grad_norm,
             "critic_grad_norm": self.last_critic_grad_norm,
+            "actor_grad_norm_pre_clip": self.last_actor_grad_norm_pre_clip,
+            "actor_grad_norm_post_clip": self.last_actor_grad_norm_post_clip,
+            "critic_grad_norm_pre_clip": self.last_critic_grad_norm_pre_clip,
+            "critic_grad_norm_post_clip": self.last_critic_grad_norm_post_clip,
             "actor_lr": self._current_actor_lr(),
             "critic_lr": self._current_critic_lr(),
             **replay_sample_stats,
@@ -425,6 +449,10 @@ class GraphTD3Learner:
             "actor_q_coef": self.last_actor_q_coef,
             "actor_grad_norm": self.last_actor_grad_norm,
             "critic_grad_norm": self.last_critic_grad_norm,
+            "actor_grad_norm_pre_clip": self.last_actor_grad_norm_pre_clip,
+            "actor_grad_norm_post_clip": self.last_actor_grad_norm_post_clip,
+            "critic_grad_norm_pre_clip": self.last_critic_grad_norm_pre_clip,
+            "critic_grad_norm_post_clip": self.last_critic_grad_norm_post_clip,
             "actor_lr": self._current_actor_lr(),
             "critic_lr": self._current_critic_lr(),
             **replay_sample_stats,
@@ -452,6 +480,10 @@ class GraphTD3Learner:
                 "replay_collapse_frac": self.last_replay_collapse_frac,
                 "actor_grad_norm": self.last_actor_grad_norm,
                 "critic_grad_norm": self.last_critic_grad_norm,
+                "actor_grad_norm_pre_clip": self.last_actor_grad_norm_pre_clip,
+                "actor_grad_norm_post_clip": self.last_actor_grad_norm_post_clip,
+                "critic_grad_norm_pre_clip": self.last_critic_grad_norm_pre_clip,
+                "critic_grad_norm_post_clip": self.last_critic_grad_norm_post_clip,
                 "actor_lr": self._current_actor_lr(),
                 "critic_lr": self._current_critic_lr(),
                 "profile_replay_sample_seconds": 0.0,
@@ -548,6 +580,10 @@ class GraphTD3Learner:
             "actor_q_coef": self.last_actor_q_coef,
             "actor_grad_norm": self.last_actor_grad_norm,
             "critic_grad_norm": self.last_critic_grad_norm,
+            "actor_grad_norm_pre_clip": self.last_actor_grad_norm_pre_clip,
+            "actor_grad_norm_post_clip": self.last_actor_grad_norm_post_clip,
+            "critic_grad_norm_pre_clip": self.last_critic_grad_norm_pre_clip,
+            "critic_grad_norm_post_clip": self.last_critic_grad_norm_post_clip,
             "actor_lr": actor_lr,
             "critic_lr": critic_lr,
             "profile_replay_sample_seconds": replay_sample_seconds,
@@ -627,11 +663,14 @@ class GraphTD3Learner:
 
         critic_parameters = list(self.critics.critic1.parameters()) + list(self.critics.critic2.parameters())
         if self.config.critic_grad_clip_norm is not None:
-            self.last_critic_grad_norm = float(
+            self.last_critic_grad_norm_pre_clip = float(
                 torch.nn.utils.clip_grad_norm_(critic_parameters, float(self.config.critic_grad_clip_norm)).item()
             )
+            self.last_critic_grad_norm_post_clip = _gradient_norm(critic_parameters)
         else:
-            self.last_critic_grad_norm = _gradient_norm(critic_parameters)
+            self.last_critic_grad_norm_pre_clip = _gradient_norm(critic_parameters)
+            self.last_critic_grad_norm_post_clip = self.last_critic_grad_norm_pre_clip
+        self.last_critic_grad_norm = self.last_critic_grad_norm_pre_clip
         self.critic_optimizer.step()
 
         critic1_loss = total_critic1_loss / float(normalization_count)
@@ -643,6 +682,8 @@ class GraphTD3Learner:
             "critic2_loss": float(critic2_loss),
             "critic_loss": float(critic_loss),
             "critic_grad_norm": float(self.last_critic_grad_norm),
+            "critic_grad_norm_pre_clip": float(self.last_critic_grad_norm_pre_clip),
+            "critic_grad_norm_post_clip": float(self.last_critic_grad_norm_post_clip),
         }
 
     def update_actor(
@@ -718,11 +759,14 @@ class GraphTD3Learner:
 
         actor_parameters = list(self.actor.parameters())
         if self.config.actor_grad_clip_norm is not None:
-            self.last_actor_grad_norm = float(
+            self.last_actor_grad_norm_pre_clip = float(
                 torch.nn.utils.clip_grad_norm_(actor_parameters, float(self.config.actor_grad_clip_norm)).item()
             )
+            self.last_actor_grad_norm_post_clip = _gradient_norm(actor_parameters)
         else:
-            self.last_actor_grad_norm = _gradient_norm(actor_parameters)
+            self.last_actor_grad_norm_pre_clip = _gradient_norm(actor_parameters)
+            self.last_actor_grad_norm_post_clip = self.last_actor_grad_norm_pre_clip
+        self.last_actor_grad_norm = self.last_actor_grad_norm_pre_clip
         self.actor_optimizer.step()
 
         actor_q_loss = -(total_actor_q / float(batch_size))
@@ -755,6 +799,8 @@ class GraphTD3Learner:
             "actor_bc_coef": self.last_actor_bc_coef,
             "actor_q_coef": self.last_actor_q_coef,
             "actor_grad_norm": self.last_actor_grad_norm,
+            "actor_grad_norm_pre_clip": self.last_actor_grad_norm_pre_clip,
+            "actor_grad_norm_post_clip": self.last_actor_grad_norm_post_clip,
         }
 
     def soft_update_targets(self) -> None:

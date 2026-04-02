@@ -460,7 +460,7 @@ BASE_EXPERIMENT = {
         "critic_q_hidden_dim": 64,
 
         # replay buffer 容量。
-        "replay_capacity": 1_000_000, # 300k 步=0.3M 步
+        "replay_capacity": 500_000, # 300k 步=0.3M 步
 
         # replay 采样策略：
         # - "fifo"                     ：原始单一 FIFO replay
@@ -658,10 +658,10 @@ BASE_EXPERIMENT = {
         "train_every": 1,
 
         # 每个外层训练迭代做多少次梯度更新。
-        "gradient_steps_per_update": 24,
+        "gradient_steps_per_update": 6,
 
         # TD3 delayed policy update 频率。
-        "policy_delay": 4,
+        "policy_delay": 8,
 
         # 将实际合作率过低的 transition 视为塌缩样本。
         "replay_collapse_fc_threshold": 0.10,
@@ -671,7 +671,7 @@ BASE_EXPERIMENT = {
         "replay_max_collapse_sample_ratio": 0.20,
 
         # target network soft update 系数 tau。
-        "tau": 0.005,
+        "tau": 0.001,
 
         # rollout 时在 logits 空间加噪声的标准差。
         "rollout_logit_noise_std": 0.30,
@@ -862,9 +862,9 @@ BASE_EXPERIMENT = {
             {
                 "label": "regular__small_world",
                 "portion": 0.15,
-                "train_network_types": ["regular","small_world","erdos_renyi"],
-                "train_network_type_weights": [0.4, 0.4,0.2],
-                "eval_network_types": ["regular", "small_world","erdos_renyi"],
+                "train_network_types": ["regular","small_world","erdos_renyi","scale_free"],
+                "train_network_type_weights": [0.3, 0.3,0.2,0.2],
+                "eval_network_types": ["regular", "small_world","erdos_renyi","scale_free"],
             },
             {
                 "label": "regular__scale_free__erdos_renyi",
@@ -2974,6 +2974,10 @@ def _format_console_recent_stats_lines(
         ("actor_q_coef", "actor_q_coef"),
         ("actor_grad_norm", "actor_grad_norm"),
         ("critic_grad_norm", "critic_grad_norm"),
+        ("actor_grad_norm_pre_clip", "actor_grad_pre"),
+        ("actor_grad_norm_post_clip", "actor_grad_post"),
+        ("critic_grad_norm_pre_clip", "critic_grad_pre"),
+        ("critic_grad_norm_post_clip", "critic_grad_post"),
         ("actor_lr", "actor_lr"),
         ("critic_lr", "critic_lr"),
         ("replay_size", "replay_size"),
@@ -3113,6 +3117,13 @@ def _tensorboard_tag_for_metric(metric_name: str) -> Optional[str]:
         return "eval/{0}".format(mapped_key)
     if metric_name in {"actor_lr", "critic_lr"}:
         return "optim/{0}".format(metric_name)
+    if metric_name in {
+        "actor_grad_norm_pre_clip",
+        "actor_grad_norm_post_clip",
+        "critic_grad_norm_pre_clip",
+        "critic_grad_norm_post_clip",
+    }:
+        return "grad/{0}".format(metric_name)
     if metric_name == "replay_size":
         return "replay/size"
     if metric_name == "curriculum_stage":
