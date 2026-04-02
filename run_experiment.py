@@ -102,7 +102,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "spgg_GNN_12workers_100length_Qlearn_Teacher-Return_Critic",
+    "experiment_name": "spgg_GNN_12workers_100length_Fermi_Teacher-Return_Critic",
 
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -237,7 +237,7 @@ BASE_EXPERIMENT = {
         # - "q_learning_2x2"：每个节点使用 2状态×2动作 Q-learning，
         #                     状态=自己上一轮动作，动作=本轮选 C/D
         # - "imitate_best" ：最优邻居模仿 / Best-takes-over
-        "strategy_update_rule": "q_learning",
+        "strategy_update_rule": "fermi",
 
         # beta：同步 Fermi 更新的选择强度。
         # 仅当 strategy_update_rule == "fermi" 时使用。
@@ -560,7 +560,7 @@ BASE_EXPERIMENT = {
 
         # demo 预收集的总环境步数。
         # 这些步数不会计入 online warm-up，也不会计入 total_env_steps。
-        "demo_collection_env_steps": 800_000,
+        "demo_collection_env_steps": 100_000,
 
         # demo 预收集使用的行为源。
         # 当前 v1 只支持 "pool_power_mix"。
