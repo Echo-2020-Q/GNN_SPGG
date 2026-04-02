@@ -488,6 +488,64 @@ class GraphTD3Trainer:
             randomization=demo_randomization,
         )
 
+    def _build_isolated_demo_collection_worker(self, demo_factory: RandomizedEnvFactory) -> RolloutWorker:
+        total_parallel_envs = max(1, int(self.config.num_workers)) * max(1, int(self.config.num_envs_per_worker))
+        total_parallel_steps = max(1, int(self.config.num_workers)) * max(1, int(self.config.steps_per_update))
+        worker_config = WorkerConfig(
+            worker_id=-1,
+            seed=int(self.config.seed or 0) + 1_000_000,
+            rollout_steps_per_sync=total_parallel_steps,
+            num_envs_per_worker=total_parallel_envs,
+        )
+        return RolloutWorker(
+            actor=copy.deepcopy(self.learner.actor),
+            explorer=LogitSpaceExplorer(),
+            env_factory=demo_factory,
+            config=worker_config,
+            train_config=self.config,
+            device="cpu",
+        )
+
+    def _collect_demo_rollouts_with_isolated_worker(
+        self,
+        *,
+        demo_factory: RandomizedEnvFactory,
+        total_steps: int,
+        demo_batches_to_save: list[Any],
+        demo_return_targets: list[np.ndarray],
+    ) -> None:
+        demo_worker = self._build_isolated_demo_collection_worker(demo_factory)
+        remaining_steps = max(0, int(total_steps))
+        while remaining_steps > 0:
+            batch_steps = min(int(demo_worker.config.rollout_steps_per_sync), remaining_steps)
+            result = demo_worker.collect(
+                num_steps=batch_steps,
+                global_warmup_steps=0,
+                forced_behavior_source=str(self.config.demo_collection_behavior_source),
+                mark_as_demo=True,
+                count_env_steps=False,
+                global_env_start_step=0,
+                demo_return_target_mode=str(self.config.demo_critic_pretrain_target_mode),
+                demo_return_n_step=int(self.config.demo_critic_pretrain_n_step),
+            )
+            try:
+                collected_now = len(result.replay_batch)
+                if collected_now <= 0:
+                    raise RuntimeError("Demo collection produced zero transitions.")
+                replay_extend_start = perf_counter()
+                self.replay_buffer.extend(result.replay_batch)
+                self._last_replay_extend_seconds = float(perf_counter() - replay_extend_start)
+                if self.config.demo_dataset_save_path:
+                    demo_batches_to_save.append(result.replay_batch.clone())
+                valid_mask = result.replay_batch.demo_return_valid.detach().cpu().numpy().astype(np.bool_, copy=False)
+                if np.any(valid_mask):
+                    demo_return_targets.append(
+                        result.replay_batch.demo_return_target.detach().cpu().numpy().astype(np.float32, copy=False)[valid_mask]
+                    )
+                remaining_steps -= collected_now
+            finally:
+                result.release_shared_memory()
+
     def _save_demo_dataset(self, replay_batches: Sequence[Any]) -> str | None:
         save_path = self.config.demo_dataset_save_path
         if not save_path:
@@ -544,37 +602,18 @@ class GraphTD3Trainer:
             )
             demo_collection_start = perf_counter()
             demo_factory = self._build_demo_collection_factory()
-            for worker in self.workers:
-                worker.set_env_factory(demo_factory, reset_environment=True)
-            try:
-                remaining_steps = int(demo_collection_steps)
-                while remaining_steps > 0:
-                    step_allocations = self._global_step_allocations(remaining_steps)
-                    if sum(step_allocations) <= 0:
-                        break
-                    rollout_results = self._collect_rollouts_with_allocations(
-                        step_allocations,
-                        forced_behavior_source=str(self.config.demo_collection_behavior_source),
-                        mark_as_demo=True,
-                        count_env_steps=False,
-                        demo_return_target_mode=str(self.config.demo_critic_pretrain_target_mode),
-                        demo_return_n_step=int(self.config.demo_critic_pretrain_n_step),
-                    )
-                    collected_now = sum(len(result.replay_batch) for result in rollout_results)
-                    if collected_now <= 0:
-                        raise RuntimeError("Demo collection produced zero transitions.")
-                    if self.config.demo_dataset_save_path:
-                        demo_batches_to_save.extend(result.replay_batch.clone() for result in rollout_results)
-                    for result in rollout_results:
-                        valid_mask = result.replay_batch.demo_return_valid.detach().cpu().numpy().astype(np.bool_, copy=False)
-                        if np.any(valid_mask):
-                            demo_return_targets.append(
-                                result.replay_batch.demo_return_target.detach().cpu().numpy().astype(np.float32, copy=False)[valid_mask]
-                            )
-                    remaining_steps -= collected_now
-            finally:
-                for worker in self.workers:
-                    worker.set_env_factory(self.train_factory, reset_environment=True)
+            print(
+                "Demo Pretrain | using isolated CPU collector | envs={0} | steps_per_sync={1}".format(
+                    max(1, int(self.config.num_workers)) * max(1, int(self.config.num_envs_per_worker)),
+                    max(1, int(self.config.num_workers)) * max(1, int(self.config.steps_per_update)),
+                )
+            )
+            self._collect_demo_rollouts_with_isolated_worker(
+                demo_factory=demo_factory,
+                total_steps=demo_collection_steps,
+                demo_batches_to_save=demo_batches_to_save,
+                demo_return_targets=demo_return_targets,
+            )
 
             summary["seconds_collection"] = float(perf_counter() - demo_collection_start)
             summary["demo_replay_size_after_collection"] = float(self.replay_buffer.demo_size())

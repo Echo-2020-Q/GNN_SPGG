@@ -1289,7 +1289,10 @@ def _parallel_rollout_worker_main(
 
     try:
         while True:
-            message = connection.recv()
+            try:
+                message = connection.recv()
+            except EOFError:
+                break
             command = str(message["command"])
             if command == "close":
                 break
@@ -1341,12 +1344,15 @@ def _parallel_rollout_worker_main(
                     continue
                 raise ValueError("Unsupported worker command: {0}".format(command))
             except Exception as exc:
-                connection.send(
-                    {
-                        "status": "error",
-                        "error": _serialize_remote_exception(exc),
-                    }
-                )
+                try:
+                    connection.send(
+                        {
+                            "status": "error",
+                            "error": _serialize_remote_exception(exc),
+                        }
+                    )
+                except (BrokenPipeError, EOFError, OSError):
+                    break
     finally:
         if inference_client is not None:
             inference_client.close()
