@@ -104,51 +104,7 @@ class GraphTD3Trainer:
         self.rollout_explorer = LogitSpaceExplorer()
         self.rollout_inference_servers: list[ParallelRolloutInferenceServer] = []
         self.workers = []
-        centralized_rollout_inference = _should_use_centralized_rollout_inference(config)
-        worker_inference_connections: dict[int, Any] = {}
-        if centralized_rollout_inference:
-            worker_ids_by_device: dict[str, list[int]] = {}
-            for worker_id in range(config.num_workers):
-                worker_device = _resolve_rollout_device_for_worker(config.rollout_device, worker_id)
-                worker_ids_by_device.setdefault(worker_device, []).append(worker_id)
-            for worker_device, worker_ids in worker_ids_by_device.items():
-                inference_server = ParallelRolloutInferenceServer(
-                    actor=copy.deepcopy(policy),
-                    train_config=config,
-                    device=worker_device,
-                    num_clients=len(worker_ids),
-                )
-                self.rollout_inference_servers.append(inference_server)
-                for local_index, worker_id in enumerate(worker_ids):
-                    worker_inference_connections[worker_id] = inference_server.take_worker_connection(local_index)
-
-        for worker_id in range(config.num_workers):
-            worker_config = WorkerConfig(
-                worker_id=worker_id,
-                seed=(config.seed or 0) + worker_id,
-                rollout_steps_per_sync=config.steps_per_update,
-                num_envs_per_worker=config.num_envs_per_worker,
-            )
-            worker_device = _resolve_rollout_device_for_worker(config.rollout_device, worker_id)
-            if config.num_workers > 1:
-                worker = ParallelRolloutWorker(
-                    actor=copy.deepcopy(policy),
-                    env_factory=train_factory,
-                    config=worker_config,
-                    train_config=config,
-                    device="cpu" if centralized_rollout_inference else worker_device,
-                    inference_connection=worker_inference_connections.get(worker_id),
-                )
-            else:
-                worker = RolloutWorker(
-                    actor=copy.deepcopy(policy),
-                    explorer=self.rollout_explorer,
-                    env_factory=train_factory,
-                    config=worker_config,
-                    train_config=config,
-                    device=worker_device,
-                )
-            self.workers.append(worker)
+        self._initialize_rollout_runtime()
 
         evaluator_factories = list(eval_env_factories) if eval_env_factories is not None else [
             RandomizedEnvFactory.from_env(eval_env or env)
@@ -173,20 +129,120 @@ class GraphTD3Trainer:
         self.demo_pretrain_summary: dict[str, float | str | bool | None] | None = None
 
     def close(self) -> None:
-        for worker in self.workers:
-            close_method = getattr(worker, "close", None)
-            if callable(close_method):
-                close_method()
-        for inference_server in self.rollout_inference_servers:
-            close_method = getattr(inference_server, "close", None)
-            if callable(close_method):
-                close_method()
+        self._shutdown_rollout_runtime()
 
     def __del__(self) -> None:
         try:
             self.close()
         except Exception:
             pass
+
+    @staticmethod
+    def _format_progress_duration(seconds: float) -> str:
+        total_seconds = max(0, int(round(float(seconds))))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours > 0:
+            return "{0}h {1:02d}m {2:02d}s".format(hours, minutes, secs)
+        if minutes > 0:
+            return "{0}m {1:02d}s".format(minutes, secs)
+        return "{0}s".format(secs)
+
+    @classmethod
+    def _print_pretrain_progress(
+        cls,
+        stage_label: str,
+        completed: int,
+        total: int,
+        started_at: float,
+    ) -> None:
+        if total <= 0:
+            return
+        elapsed = float(perf_counter() - started_at)
+        progress = min(max(float(completed) / float(total), 0.0), 1.0)
+        eta_seconds = None
+        if completed > 0 and progress > 0.0:
+            eta_seconds = max(0.0, elapsed * (1.0 - progress) / progress)
+        eta_text = (
+            cls._format_progress_duration(eta_seconds)
+            if eta_seconds is not None
+            else "unavailable"
+        )
+        print(
+            "Demo Pretrain | {0} progress | {1}/{2} ({3:.1f}%) | ETA={4} | elapsed={5}".format(
+                stage_label,
+                int(completed),
+                int(total),
+                progress * 100.0,
+                eta_text,
+                cls._format_progress_duration(elapsed),
+            )
+        )
+
+    @staticmethod
+    def _progress_interval(total: int) -> int:
+        return max(1, int(np.ceil(float(max(1, total)) / 20.0)))
+
+    def _shutdown_rollout_runtime(self) -> None:
+        for worker in self.workers:
+            close_method = getattr(worker, "close", None)
+            if callable(close_method):
+                close_method()
+        self.workers = []
+        for inference_server in self.rollout_inference_servers:
+            close_method = getattr(inference_server, "close", None)
+            if callable(close_method):
+                close_method()
+        self.rollout_inference_servers = []
+
+    def _initialize_rollout_runtime(self) -> None:
+        self._shutdown_rollout_runtime()
+        actor_source = self.learner.actor
+        centralized_rollout_inference = _should_use_centralized_rollout_inference(self.config)
+        worker_inference_connections: dict[int, Any] = {}
+        if centralized_rollout_inference:
+            worker_ids_by_device: dict[str, list[int]] = {}
+            for worker_id in range(self.config.num_workers):
+                worker_device = _resolve_rollout_device_for_worker(self.config.rollout_device, worker_id)
+                worker_ids_by_device.setdefault(worker_device, []).append(worker_id)
+            for worker_device, worker_ids in worker_ids_by_device.items():
+                inference_server = ParallelRolloutInferenceServer(
+                    actor=copy.deepcopy(actor_source),
+                    train_config=self.config,
+                    device=worker_device,
+                    num_clients=len(worker_ids),
+                )
+                self.rollout_inference_servers.append(inference_server)
+                for local_index, worker_id in enumerate(worker_ids):
+                    worker_inference_connections[worker_id] = inference_server.take_worker_connection(local_index)
+
+        for worker_id in range(self.config.num_workers):
+            worker_config = WorkerConfig(
+                worker_id=worker_id,
+                seed=(self.config.seed or 0) + worker_id,
+                rollout_steps_per_sync=self.config.steps_per_update,
+                num_envs_per_worker=self.config.num_envs_per_worker,
+            )
+            worker_device = _resolve_rollout_device_for_worker(self.config.rollout_device, worker_id)
+            if self.config.num_workers > 1:
+                worker = ParallelRolloutWorker(
+                    actor=copy.deepcopy(actor_source),
+                    env_factory=self.train_factory,
+                    config=worker_config,
+                    train_config=self.config,
+                    device="cpu" if centralized_rollout_inference else worker_device,
+                    inference_connection=worker_inference_connections.get(worker_id),
+                )
+            else:
+                worker = RolloutWorker(
+                    actor=copy.deepcopy(actor_source),
+                    explorer=self.rollout_explorer,
+                    env_factory=self.train_factory,
+                    config=worker_config,
+                    train_config=self.config,
+                    device=worker_device,
+                )
+            self.workers.append(worker)
 
     def _resolve_curriculum_stage(self, update: int) -> tuple[int, Mapping[str, Any]] | None:
         if not self.curriculum_stages:
@@ -563,6 +619,10 @@ class GraphTD3Trainer:
     ) -> None:
         demo_worker = self._build_isolated_demo_collection_worker(demo_factory)
         remaining_steps = max(0, int(total_steps))
+        started_at = perf_counter()
+        log_interval = self._progress_interval(remaining_steps)
+        next_log_at = min(int(total_steps), log_interval)
+        last_logged_completed = 0
         while remaining_steps > 0:
             batch_steps = min(int(demo_worker.config.rollout_steps_per_sync), remaining_steps)
             result = demo_worker.collect(
@@ -590,8 +650,15 @@ class GraphTD3Trainer:
                         result.replay_batch.demo_return_target.detach().cpu().numpy().astype(np.float32, copy=False)[valid_mask]
                     )
                 remaining_steps -= collected_now
+                completed_steps = int(total_steps) - int(remaining_steps)
+                if completed_steps >= next_log_at:
+                    self._print_pretrain_progress("collection", completed_steps, int(total_steps), started_at)
+                    last_logged_completed = completed_steps
+                    next_log_at += log_interval
             finally:
                 result.release_shared_memory()
+        if last_logged_completed < int(total_steps):
+            self._print_pretrain_progress("collection", int(total_steps), int(total_steps), started_at)
 
     def _collect_demo_rollouts_with_parallel_workers(
         self,
@@ -602,6 +669,10 @@ class GraphTD3Trainer:
         demo_return_targets: list[np.ndarray],
     ) -> None:
         demo_workers = self._build_parallel_demo_collection_workers(demo_factory)
+        started_at = perf_counter()
+        log_interval = self._progress_interval(total_steps)
+        next_log_at = min(int(total_steps), log_interval)
+        last_logged_completed = 0
         try:
             remaining_steps = max(0, int(total_steps))
             while remaining_steps > 0:
@@ -629,9 +700,16 @@ class GraphTD3Trainer:
                             result.replay_batch.demo_return_target.detach().cpu().numpy().astype(np.float32, copy=False)[valid_mask]
                         )
                 remaining_steps -= collected_now
+                completed_steps = int(total_steps) - int(remaining_steps)
+                if completed_steps >= next_log_at:
+                    self._print_pretrain_progress("collection", completed_steps, int(total_steps), started_at)
+                    last_logged_completed = completed_steps
+                    next_log_at += log_interval
         finally:
             for worker in demo_workers:
                 worker.close()
+        if last_logged_completed < int(total_steps):
+            self._print_pretrain_progress("collection", int(total_steps), int(total_steps), started_at)
 
     def _save_demo_dataset(self, replay_batches: Sequence[Any]) -> str | None:
         save_path = self.config.demo_dataset_save_path
@@ -734,12 +812,18 @@ class GraphTD3Trainer:
                         max(1, int(self.config.steps_per_update)),
                     )
                 )
-                self._collect_demo_rollouts_with_parallel_workers(
-                    demo_factory=demo_factory,
-                    total_steps=demo_collection_steps,
-                    demo_batches_to_save=demo_batches_to_save,
-                    demo_return_targets=demo_return_targets,
-                )
+                print("Demo Pretrain | suspending online rollout workers during parallel_cpu collection")
+                self._shutdown_rollout_runtime()
+                try:
+                    self._collect_demo_rollouts_with_parallel_workers(
+                        demo_factory=demo_factory,
+                        total_steps=demo_collection_steps,
+                        demo_batches_to_save=demo_batches_to_save,
+                        demo_return_targets=demo_return_targets,
+                    )
+                finally:
+                    print("Demo Pretrain | restoring online rollout workers after parallel_cpu collection")
+                    self._initialize_rollout_runtime()
             else:
                 print(
                     "Demo Pretrain | runtime=isolated_cpu | envs={0} | steps_per_sync={1}".format(
@@ -779,11 +863,20 @@ class GraphTD3Trainer:
             print("Demo Pretrain | actor BC start | updates={0}".format(actor_updates))
             actor_pretrain_start = perf_counter()
             actor_metrics: dict[str, float] = {}
-            for _ in range(actor_updates):
+            actor_log_interval = self._progress_interval(actor_updates)
+            next_actor_log_at = actor_log_interval
+            last_actor_logged = 0
+            for update_index in range(1, actor_updates + 1):
                 actor_metrics = self.learner.actor_bc_pretrain_step()
+                if update_index >= next_actor_log_at:
+                    self._print_pretrain_progress("actor_bc", update_index, actor_updates, actor_pretrain_start)
+                    last_actor_logged = update_index
+                    next_actor_log_at += actor_log_interval
             summary["seconds_actor_bc"] = float(perf_counter() - actor_pretrain_start)
             summary["actor_bc_updates"] = float(actor_updates)
             summary["actor_bc_loss_last"] = float(actor_metrics.get("actor_bc_loss", 0.0))
+            if last_actor_logged < actor_updates:
+                self._print_pretrain_progress("actor_bc", actor_updates, actor_updates, actor_pretrain_start)
             print(
                 "Demo Pretrain | actor BC done | last_bc_loss={0:.6f} | seconds={1:.3f}".format(
                     float(summary["actor_bc_loss_last"]),
@@ -796,11 +889,20 @@ class GraphTD3Trainer:
             print("Demo Pretrain | critic start | updates={0}".format(critic_updates))
             critic_pretrain_start = perf_counter()
             critic_metrics: dict[str, float] = {}
-            for _ in range(critic_updates):
+            critic_log_interval = self._progress_interval(critic_updates)
+            next_critic_log_at = critic_log_interval
+            last_critic_logged = 0
+            for update_index in range(1, critic_updates + 1):
                 critic_metrics = self.learner.critic_pretrain_step()
+                if update_index >= next_critic_log_at:
+                    self._print_pretrain_progress("critic", update_index, critic_updates, critic_pretrain_start)
+                    last_critic_logged = update_index
+                    next_critic_log_at += critic_log_interval
             summary["seconds_critic"] = float(perf_counter() - critic_pretrain_start)
             summary["critic_pretrain_updates"] = float(critic_updates)
             summary["critic_loss_last"] = float(critic_metrics.get("critic_loss", 0.0))
+            if last_critic_logged < critic_updates:
+                self._print_pretrain_progress("critic", critic_updates, critic_updates, critic_pretrain_start)
             print(
                 "Demo Pretrain | critic done | last_critic_loss={0:.6f} | seconds={1:.3f}".format(
                     float(summary["critic_loss_last"]),
