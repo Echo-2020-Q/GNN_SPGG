@@ -593,7 +593,7 @@ class GraphTD3Trainer:
             num_envs_per_worker=total_parallel_envs,
         )
         return RolloutWorker(
-            actor=copy.deepcopy(self.learner.actor),
+            actor=GNNAllocationPolicy(copy.deepcopy(self.policy.config)),
             explorer=LogitSpaceExplorer(),
             env_factory=demo_factory,
             config=worker_config,
@@ -612,7 +612,7 @@ class GraphTD3Trainer:
             )
             demo_workers.append(
                 ParallelRolloutWorker(
-                    actor=copy.deepcopy(self.learner.actor),
+                    actor=GNNAllocationPolicy(copy.deepcopy(self.policy.config)),
                     env_factory=demo_factory,
                     config=worker_config,
                     train_config=self.config,
