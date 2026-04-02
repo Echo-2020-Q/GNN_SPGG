@@ -184,6 +184,9 @@ class TrainerSmokeTests(unittest.TestCase):
             self.assertGreater(float(trainer.demo_pretrain_summary["demo_replay_size_after_collection"]), 0.0)
             self.assertEqual(int(trainer.demo_pretrain_summary["actor_bc_updates"]), 1)
             self.assertEqual(int(trainer.demo_pretrain_summary["critic_pretrain_updates"]), 1)
+            self.assertEqual(str(trainer.demo_pretrain_summary["critic_target_mode"]), "n_step")
+            self.assertIn("demo_return_target_mean", trainer.demo_pretrain_summary)
+            self.assertIn("demo_return_target_std", trainer.demo_pretrain_summary)
         finally:
             trainer.close()
 

@@ -71,6 +71,14 @@ def _chunk_ranges(batch_size: int, chunk_size: int):
         yield start, min(start + chunk_size, batch_size)
 
 
+def _gradient_norm(parameters: list[torch.nn.Parameter]) -> float:
+    grads = [parameter.grad.detach() for parameter in parameters if parameter.grad is not None]
+    if not grads:
+        return 0.0
+    norms = torch.stack([torch.norm(grad, p=2) for grad in grads])
+    return float(torch.norm(norms, p=2).item())
+
+
 def _concat_batched_policy_outputs(outputs: list[BatchedPolicyOutput]) -> BatchedPolicyOutput:
     if not outputs:
         raise ValueError("outputs must contain at least one item.")
@@ -131,9 +139,12 @@ class GraphTD3Learner:
         self.last_actor_q_loss = 0.0
         self.last_actor_bc_loss = 0.0
         self.last_actor_bc_coef = 0.0
+        self.last_actor_q_coef = 1.0
         self.last_replay_demo_frac = 0.0
         self.last_replay_pool_power_demo_frac = 0.0
         self.last_replay_collapse_frac = 0.0
+        self.last_actor_grad_norm = 0.0
+        self.last_critic_grad_norm = 0.0
 
         self.target_actor.load_state_dict(self.actor.state_dict())
         self.target_critics.load_state_dict(self.critics.state_dict())
@@ -245,9 +256,12 @@ class GraphTD3Learner:
             "last_actor_reg_loss": float(self.last_actor_reg_loss),
             "last_actor_bc_loss": float(self.last_actor_bc_loss),
             "last_actor_bc_coef": float(self.last_actor_bc_coef),
+            "last_actor_q_coef": float(self.last_actor_q_coef),
             "last_replay_demo_frac": float(self.last_replay_demo_frac),
             "last_replay_pool_power_demo_frac": float(self.last_replay_pool_power_demo_frac),
             "last_replay_collapse_frac": float(self.last_replay_collapse_frac),
+            "last_actor_grad_norm": float(self.last_actor_grad_norm),
+            "last_critic_grad_norm": float(self.last_critic_grad_norm),
         }
 
     def load_checkpoint_state(self, state_dict: dict[str, Any]) -> None:
@@ -267,9 +281,12 @@ class GraphTD3Learner:
         self.last_actor_reg_loss = float(state_dict["last_actor_reg_loss"])
         self.last_actor_bc_loss = float(state_dict.get("last_actor_bc_loss", 0.0))
         self.last_actor_bc_coef = float(state_dict.get("last_actor_bc_coef", 0.0))
+        self.last_actor_q_coef = float(state_dict.get("last_actor_q_coef", 1.0))
         self.last_replay_demo_frac = float(state_dict.get("last_replay_demo_frac", 0.0))
         self.last_replay_pool_power_demo_frac = float(state_dict.get("last_replay_pool_power_demo_frac", 0.0))
         self.last_replay_collapse_frac = float(state_dict.get("last_replay_collapse_frac", 0.0))
+        self.last_actor_grad_norm = float(state_dict.get("last_actor_grad_norm", 0.0))
+        self.last_critic_grad_norm = float(state_dict.get("last_critic_grad_norm", 0.0))
 
     def _current_demo_bc_coef(self, global_env_steps: int | None) -> float:
         if int(self.config.warmup_steps) <= 0:
@@ -293,6 +310,41 @@ class GraphTD3Learner:
         decay_progress = float(current_step - warmup_end_step) / float(decay_end_step - warmup_end_step)
         decay_progress = min(max(decay_progress, 0.0), 1.0)
         return float(self.config.actor_demo_bc_coef) * (1.0 - decay_progress)
+
+    def _current_actor_q_coef(self, global_env_steps: int | None) -> float:
+        if global_env_steps is None:
+            return float(self.config.online_actor_q_coef_final)
+
+        warmup_end_step = int(self.config.warmup_steps)
+        total_rollout_env_steps = int(self.config.total_updates) * int(self.config.steps_per_update) * int(self.config.num_workers)
+        ramp_end_step = int(round(float(total_rollout_env_steps) * float(self.config.online_actor_q_coef_ramp_end_fraction)))
+        ramp_end_step = max(warmup_end_step, ramp_end_step)
+        current_step = max(0, int(global_env_steps))
+
+        if current_step <= warmup_end_step:
+            return float(self.config.online_actor_q_coef_initial)
+        if current_step >= ramp_end_step or ramp_end_step <= warmup_end_step:
+            return float(self.config.online_actor_q_coef_final)
+
+        progress = float(current_step - warmup_end_step) / float(ramp_end_step - warmup_end_step)
+        progress = min(max(progress, 0.0), 1.0)
+        initial_coef = float(self.config.online_actor_q_coef_initial)
+        final_coef = float(self.config.online_actor_q_coef_final)
+        return initial_coef + (final_coef - initial_coef) * progress
+
+    def _critic_loss_sum(self, prediction: Tensor, target: Tensor, *, valid_mask: Tensor | None = None) -> Tensor:
+        if self.config.critic_loss_type == "huber":
+            loss = F.huber_loss(
+                prediction,
+                target,
+                reduction="none",
+                delta=float(self.config.critic_huber_delta),
+            )
+        else:
+            loss = F.mse_loss(prediction, target, reduction="none")
+        if valid_mask is not None:
+            loss = loss[valid_mask]
+        return loss.sum()
 
     def _resolve_pretrain_batch_size(self, batch_size: int | None) -> int:
         if batch_size is not None:
@@ -322,10 +374,12 @@ class GraphTD3Learner:
         )
         batch = cpu_batch if self.device.type == "cpu" else cpu_batch.to(self.device)
         self.last_actor_bc_coef = float(self.config.warmup_actor_bc_coef)
+        self.last_actor_q_coef = 0.0
         actor_metrics = self.update_actor(
             batch,
             actor_q_enabled=False,
             bc_coef=self.last_actor_bc_coef,
+            actor_q_coef=self.last_actor_q_coef,
         )
         self.target_actor.load_state_dict(self.actor.state_dict())
         return {
@@ -333,7 +387,11 @@ class GraphTD3Learner:
             "replay_size": float(len(self.replay_buffer)),
             "replay_demo_frac": self.last_replay_demo_frac,
             "replay_pool_power_demo_frac": self.last_replay_pool_power_demo_frac,
+            "replay_teacher_frac": self.last_replay_pool_power_demo_frac,
             "replay_collapse_frac": self.last_replay_collapse_frac,
+            "actor_q_coef": self.last_actor_q_coef,
+            "actor_grad_norm": self.last_actor_grad_norm,
+            "critic_grad_norm": self.last_critic_grad_norm,
             "actor_lr": self._current_actor_lr(),
             "critic_lr": self._current_critic_lr(),
             **replay_sample_stats,
@@ -355,14 +413,18 @@ class GraphTD3Learner:
             float(cpu_batch.collapse_flag.float().mean().item()) if len(cpu_batch) > 0 else 0.0
         )
         batch = cpu_batch if self.device.type == "cpu" else cpu_batch.to(self.device)
-        critic_metrics = self.update_critics(batch)
+        critic_metrics = self.update_critics(batch, use_demo_return_target=True)
         self.soft_update_targets()
         return {
             **critic_metrics,
             "replay_size": float(len(self.replay_buffer)),
             "replay_demo_frac": self.last_replay_demo_frac,
             "replay_pool_power_demo_frac": self.last_replay_pool_power_demo_frac,
+            "replay_teacher_frac": self.last_replay_pool_power_demo_frac,
             "replay_collapse_frac": self.last_replay_collapse_frac,
+            "actor_q_coef": self.last_actor_q_coef,
+            "actor_grad_norm": self.last_actor_grad_norm,
+            "critic_grad_norm": self.last_critic_grad_norm,
             "actor_lr": self._current_actor_lr(),
             "critic_lr": self._current_critic_lr(),
             **replay_sample_stats,
@@ -381,11 +443,15 @@ class GraphTD3Learner:
                 "actor_reg_loss": self.last_actor_reg_loss,
                 "actor_bc_loss": self.last_actor_bc_loss,
                 "actor_bc_coef": self.last_actor_bc_coef,
+                "actor_q_coef": self.last_actor_q_coef,
                 "loss": 0.0,
                 "replay_size": float(len(self.replay_buffer)),
                 "replay_demo_frac": self.last_replay_demo_frac,
                 "replay_pool_power_demo_frac": self.last_replay_pool_power_demo_frac,
+                "replay_teacher_frac": self.last_replay_pool_power_demo_frac,
                 "replay_collapse_frac": self.last_replay_collapse_frac,
+                "actor_grad_norm": self.last_actor_grad_norm,
+                "critic_grad_norm": self.last_critic_grad_norm,
                 "actor_lr": self._current_actor_lr(),
                 "critic_lr": self._current_critic_lr(),
                 "profile_replay_sample_seconds": 0.0,
@@ -437,6 +503,7 @@ class GraphTD3Learner:
         }
         actor_update_seconds = 0.0
         target_soft_update_seconds = 0.0
+        actor_q_coef = 0.0
         actor_q_enabled = not (
             bool(self.config.freeze_actor_q_during_warmup)
             and global_env_steps is not None
@@ -447,13 +514,17 @@ class GraphTD3Learner:
             if actor_q_enabled
             else float(self.config.warmup_actor_bc_coef)
         )
+        if actor_q_enabled:
+            actor_q_coef = self._current_actor_q_coef(global_env_steps)
         self.last_actor_bc_coef = float(bc_coef)
+        self.last_actor_q_coef = float(actor_q_coef)
         if self.update_step_count % self.config.policy_delay == 0:
             actor_update_start = perf_counter()
             actor_metrics = self.update_actor(
                 batch,
                 actor_q_enabled=actor_q_enabled,
                 bc_coef=bc_coef,
+                actor_q_coef=actor_q_coef,
             )
             actor_update_seconds = float(perf_counter() - actor_update_start)
 
@@ -471,8 +542,12 @@ class GraphTD3Learner:
             "replay_size": float(len(self.replay_buffer)),
             "replay_demo_frac": self.last_replay_demo_frac,
             "replay_pool_power_demo_frac": self.last_replay_pool_power_demo_frac,
+            "replay_teacher_frac": self.last_replay_pool_power_demo_frac,
             "replay_collapse_frac": self.last_replay_collapse_frac,
             "actor_bc_coef": self.last_actor_bc_coef,
+            "actor_q_coef": self.last_actor_q_coef,
+            "actor_grad_norm": self.last_actor_grad_norm,
+            "critic_grad_norm": self.last_critic_grad_norm,
             "actor_lr": actor_lr,
             "critic_lr": critic_lr,
             "profile_replay_sample_seconds": replay_sample_seconds,
@@ -483,7 +558,7 @@ class GraphTD3Learner:
             **replay_sample_stats,
         }
 
-    def update_critics(self, batch: TensorReplayBatch) -> dict[str, float]:
+    def update_critics(self, batch: TensorReplayBatch, *, use_demo_return_target: bool = False) -> dict[str, float]:
         observations = batch.obs
         next_observations = batch.next_obs
         actions = batch.action.allocation
@@ -495,6 +570,10 @@ class GraphTD3Learner:
         chunk_size = max(1, int(self.config.graph_batch_chunk_size))
         total_critic1_loss = 0.0
         total_critic2_loss = 0.0
+        valid_target_count = int(batch.demo_return_valid.sum().item()) if use_demo_return_target else int(batch_size)
+        if use_demo_return_target and valid_target_count <= 0:
+            raise ValueError("critic_pretrain_step requires at least one valid demo_return_target.")
+        normalization_count = max(valid_target_count, 1)
 
         for start, end in _chunk_ranges(batch_size, chunk_size):
             chunk_observations = _slice_observation_batch(observations, start, end)
@@ -502,48 +581,68 @@ class GraphTD3Learner:
             chunk_actions = actions[start:end]
             chunk_rewards = rewards[start:end]
             chunk_dones = dones[start:end]
+            chunk_valid_mask = batch.demo_return_valid[start:end].bool()
 
-            with torch.no_grad():
-                target_outputs = self.target_actor.deterministic_action_tensor_batch(chunk_next_observations)
-                if target_outputs.logits is None:
-                    raise ValueError("Target actor must provide logits for TD3 target smoothing.")
-                target_actions = self.target_explorer.apply_to_logits(
-                    logits=target_outputs.logits,
-                    ego_mask=chunk_next_observations["local_mask"],
-                    pool_values=chunk_next_observations["pool_grown"],
-                    noise_std=self.config.target_logit_noise_std,
-                    noise_clip=self.config.target_logit_noise_clip,
-                ).allocation
-                target_q1, target_q2 = self.target_critics.forward_tensor_batch(
-                    chunk_next_observations,
-                    target_actions,
-                )
-                target_q = chunk_rewards + (
-                    self.config.gamma * (1.0 - chunk_dones) * torch.minimum(target_q1, target_q2)
-                )
+            if use_demo_return_target:
+                target_q = batch.demo_return_target[start:end]
+            else:
+                with torch.no_grad():
+                    target_outputs = self.target_actor.deterministic_action_tensor_batch(chunk_next_observations)
+                    if target_outputs.logits is None:
+                        raise ValueError("Target actor must provide logits for TD3 target smoothing.")
+                    target_actions = self.target_explorer.apply_to_logits(
+                        logits=target_outputs.logits,
+                        ego_mask=chunk_next_observations["local_mask"],
+                        pool_values=chunk_next_observations["pool_grown"],
+                        noise_std=self.config.target_logit_noise_std,
+                        noise_clip=self.config.target_logit_noise_clip,
+                    ).allocation
+                    target_q1, target_q2 = self.target_critics.forward_tensor_batch(
+                        chunk_next_observations,
+                        target_actions,
+                    )
+                    target_q = chunk_rewards + (
+                        self.config.gamma * (1.0 - chunk_dones) * torch.minimum(target_q1, target_q2)
+                    )
 
             current_q1, current_q2 = self.critics.forward_tensor_batch(
                 chunk_observations,
                 chunk_actions,
             )
-            critic1_loss_sum = F.mse_loss(current_q1, target_q, reduction="sum")
-            critic2_loss_sum = F.mse_loss(current_q2, target_q, reduction="sum")
-            chunk_loss = (critic1_loss_sum + critic2_loss_sum) / float(batch_size)
+            critic1_loss_sum = self._critic_loss_sum(
+                current_q1,
+                target_q,
+                valid_mask=chunk_valid_mask if use_demo_return_target else None,
+            )
+            critic2_loss_sum = self._critic_loss_sum(
+                current_q2,
+                target_q,
+                valid_mask=chunk_valid_mask if use_demo_return_target else None,
+            )
+            chunk_loss = (critic1_loss_sum + critic2_loss_sum) / float(normalization_count)
             chunk_loss.backward()
 
             total_critic1_loss += float(critic1_loss_sum.item())
             total_critic2_loss += float(critic2_loss_sum.item())
 
+        critic_parameters = list(self.critics.critic1.parameters()) + list(self.critics.critic2.parameters())
+        if self.config.critic_grad_clip_norm is not None:
+            self.last_critic_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(critic_parameters, float(self.config.critic_grad_clip_norm)).item()
+            )
+        else:
+            self.last_critic_grad_norm = _gradient_norm(critic_parameters)
         self.critic_optimizer.step()
 
-        critic1_loss = total_critic1_loss / float(batch_size)
-        critic2_loss = total_critic2_loss / float(batch_size)
+        critic1_loss = total_critic1_loss / float(normalization_count)
+        critic2_loss = total_critic2_loss / float(normalization_count)
         critic_loss = critic1_loss + critic2_loss
 
         return {
             "critic1_loss": float(critic1_loss),
             "critic2_loss": float(critic2_loss),
             "critic_loss": float(critic_loss),
+            "critic_grad_norm": float(self.last_critic_grad_norm),
         }
 
     def update_actor(
@@ -552,6 +651,7 @@ class GraphTD3Learner:
         *,
         actor_q_enabled: bool,
         bc_coef: float,
+        actor_q_coef: float,
     ) -> dict[str, float]:
         observations = batch.obs
         target_actions = batch.action.allocation
@@ -614,8 +714,15 @@ class GraphTD3Learner:
                 (-float(self.config.actor_entropy_coef) * entropy_term)
                 + (float(self.config.actor_logit_l2_coef) * logit_l2_term)
             )
-            (actor_q_loss_chunk + actor_reg_loss_chunk + bc_loss_chunk).backward()
+            ((float(actor_q_coef) * actor_q_loss_chunk) + actor_reg_loss_chunk + bc_loss_chunk).backward()
 
+        actor_parameters = list(self.actor.parameters())
+        if self.config.actor_grad_clip_norm is not None:
+            self.last_actor_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(actor_parameters, float(self.config.actor_grad_clip_norm)).item()
+            )
+        else:
+            self.last_actor_grad_norm = _gradient_norm(actor_parameters)
         self.actor_optimizer.step()
 
         actor_q_loss = -(total_actor_q / float(batch_size))
@@ -630,7 +737,7 @@ class GraphTD3Learner:
             if total_demo_valid_entries > 0
             else 0.0
         )
-        actor_loss = actor_q_loss + actor_reg_loss + actor_bc_loss
+        actor_loss = (float(actor_q_coef) * actor_q_loss) + actor_reg_loss + actor_bc_loss
 
         self.last_actor_loss = float(actor_loss)
         self.last_actor_q_loss = float(actor_q_loss)
@@ -646,6 +753,8 @@ class GraphTD3Learner:
             "actor_reg_loss": self.last_actor_reg_loss,
             "actor_bc_loss": self.last_actor_bc_loss,
             "actor_bc_coef": self.last_actor_bc_coef,
+            "actor_q_coef": self.last_actor_q_coef,
+            "actor_grad_norm": self.last_actor_grad_norm,
         }
 
     def soft_update_targets(self) -> None:

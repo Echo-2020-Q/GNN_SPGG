@@ -313,6 +313,8 @@ def _serialize_replay_batch_to_shared_memory(batch: TensorReplayBatch) -> tuple[
             "collapse_flag": _store_tensor(batch.collapse_flag),
             "topology_id": _store_tensor(batch.topology_id),
             "pool_power_demo_flag": _store_tensor(batch.pool_power_demo_flag),
+            "demo_return_target": _store_tensor(batch.demo_return_target),
+            "demo_return_valid": _store_tensor(batch.demo_return_valid),
         },
         handles,
     )
@@ -341,6 +343,8 @@ def _deserialize_replay_batch_from_shared_memory(
             collapse_flag=_load_tensor(payload["collapse_flag"]),
             topology_id=_load_tensor(payload["topology_id"]),
             pool_power_demo_flag=_load_tensor(payload["pool_power_demo_flag"]),
+            demo_return_target=_load_tensor(payload["demo_return_target"]),
+            demo_return_valid=_load_tensor(payload["demo_return_valid"]),
         )
     except Exception:
         _close_shared_memory_handles(handles, unlink=False)
@@ -372,6 +376,12 @@ class RolloutResult:
 
     def release_shared_memory(self) -> None:
         _close_shared_memory_handles(list(self.shared_memory_handles), unlink=True)
+
+
+@dataclass
+class _CollectedTransitionRecord:
+    slot_index: int
+    transition: TensorTransition
 
 
 class RandomizedEnvFactory:
@@ -566,6 +576,103 @@ class RolloutWorker:
                 self.envs.append(env)
         self.current_warmup_behavior_sources = list(current_warmup_behavior_source_list)
 
+    def _total_rollout_env_steps(self) -> int:
+        return int(self.train_config.total_updates) * int(self.train_config.steps_per_update) * int(self.train_config.num_workers)
+
+    def _current_teacher_takeover_prob(self, global_env_step: int) -> float:
+        if not bool(self.train_config.teacher_takeover_enabled):
+            return 0.0
+
+        warmup_end_step = int(self.train_config.warmup_steps)
+        total_rollout_env_steps = self._total_rollout_env_steps()
+        decay_end_step = int(round(float(total_rollout_env_steps) * float(self.train_config.teacher_takeover_decay_end_fraction)))
+        decay_end_step = max(warmup_end_step, decay_end_step)
+        current_step = max(0, int(global_env_step))
+
+        if current_step < warmup_end_step:
+            return float(self.train_config.teacher_takeover_start_prob)
+        if current_step >= decay_end_step or decay_end_step <= warmup_end_step:
+            return float(self.train_config.teacher_takeover_end_prob)
+
+        progress = float(current_step - warmup_end_step) / float(decay_end_step - warmup_end_step)
+        progress = min(max(progress, 0.0), 1.0)
+        start_prob = float(self.train_config.teacher_takeover_start_prob)
+        end_prob = float(self.train_config.teacher_takeover_end_prob)
+        return start_prob + (end_prob - start_prob) * progress
+
+    def _annotate_demo_return_targets(
+        self,
+        records: list[_CollectedTransitionRecord],
+        *,
+        mode: str,
+        n_step: int,
+    ) -> None:
+        by_slot: dict[int, list[int]] = {}
+        for index, record in enumerate(records):
+            by_slot.setdefault(int(record.slot_index), []).append(index)
+
+        gamma = float(self.train_config.gamma)
+        horizon = max(1, int(n_step))
+
+        def _reward_at(record_index: int) -> float:
+            return float(records[record_index].transition.reward.item())
+
+        def _done_at(record_index: int) -> bool:
+            return bool(records[record_index].transition.done.item() > 0.5)
+
+        for slot_indices in by_slot.values():
+            if mode == "n_step":
+                for local_index, record_index in enumerate(slot_indices):
+                    discounted_return = 0.0
+                    discount = 1.0
+                    for step_offset in range(horizon):
+                        future_index_position = local_index + step_offset
+                        if future_index_position >= len(slot_indices):
+                            break
+                        future_record_index = slot_indices[future_index_position]
+                        discounted_return += discount * _reward_at(future_record_index)
+                        if _done_at(future_record_index):
+                            break
+                        discount *= gamma
+                    records[record_index].transition = replace(
+                        records[record_index].transition,
+                        demo_return_target=torch.tensor(discounted_return, dtype=torch.float32, device="cpu"),
+                        demo_return_valid=torch.tensor(True, dtype=torch.bool, device="cpu"),
+                    )
+                continue
+
+            episode_start = 0
+            while episode_start < len(slot_indices):
+                episode_end = None
+                for cursor in range(episode_start, len(slot_indices)):
+                    if _done_at(slot_indices[cursor]):
+                        episode_end = cursor
+                        break
+                if episode_end is None:
+                    for cursor in range(episode_start, len(slot_indices)):
+                        record_index = slot_indices[cursor]
+                        records[record_index].transition = replace(
+                            records[record_index].transition,
+                            demo_return_target=torch.tensor(0.0, dtype=torch.float32, device="cpu"),
+                            demo_return_valid=torch.tensor(False, dtype=torch.bool, device="cpu"),
+                        )
+                    break
+
+                episode_rewards = [_reward_at(slot_indices[cursor]) for cursor in range(episode_start, episode_end + 1)]
+                for cursor in range(episode_start, episode_end + 1):
+                    discounted_return = 0.0
+                    discount = 1.0
+                    for reward_value in episode_rewards[cursor - episode_start :]:
+                        discounted_return += discount * reward_value
+                        discount *= gamma
+                    record_index = slot_indices[cursor]
+                    records[record_index].transition = replace(
+                        records[record_index].transition,
+                        demo_return_target=torch.tensor(discounted_return, dtype=torch.float32, device="cpu"),
+                        demo_return_valid=torch.tensor(True, dtype=torch.bool, device="cpu"),
+                    )
+                episode_start = episode_end + 1
+
     def collect(
         self,
         num_steps: int,
@@ -573,6 +680,9 @@ class RolloutWorker:
         forced_behavior_source: str | None = None,
         mark_as_demo: bool | None = None,
         count_env_steps: bool = True,
+        global_env_start_step: int = 0,
+        demo_return_target_mode: str | None = None,
+        demo_return_n_step: int | None = None,
     ) -> RolloutResult:
         collect_start = perf_counter()
         rewards: list[float] = []
@@ -584,7 +694,7 @@ class RolloutWorker:
         mean_payoffs: list[float] = []
         mean_pool_growns: list[float] = []
         mean_pool_raws: list[float] = []
-        transitions: list[TensorTransition] = []
+        transition_records: list[_CollectedTransitionRecord] = []
         warmup_budget = max(0, int(global_warmup_steps))
         env_step_seconds = 0.0
         inference_wait_seconds = 0.0
@@ -594,9 +704,33 @@ class RolloutWorker:
         transition_encode_seconds = 0.0
         inference_batch_sizes: list[int] = []
         collected_steps = 0
+        teacher_takeover_probs: list[float] = []
+        open_episode_indices_by_slot: dict[int, list[int]] = {
+            slot_index: [] for slot_index in range(self.num_envs_per_worker)
+        }
+        compute_demo_returns = (
+            forced_behavior_source is not None
+            and bool(mark_as_demo if mark_as_demo is not None else True)
+            and str(forced_behavior_source) == str(self.train_config.demo_collection_behavior_source)
+            and demo_return_target_mode in {"n_step", "mc"}
+        )
+        resolved_demo_return_mode = str(demo_return_target_mode) if compute_demo_returns else None
+        resolved_demo_return_n_step = max(1, int(demo_return_n_step or self.train_config.demo_critic_pretrain_n_step))
 
-        while collected_steps < num_steps:
-            batch_slots = list(range(min(self.num_envs_per_worker, num_steps - collected_steps)))
+        while True:
+            if collected_steps < num_steps:
+                batch_slots = list(range(min(self.num_envs_per_worker, num_steps - collected_steps)))
+            elif resolved_demo_return_mode == "mc":
+                batch_slots = [
+                    slot_index
+                    for slot_index, episode_indices in open_episode_indices_by_slot.items()
+                    if episode_indices
+                ]
+            else:
+                break
+
+            if not batch_slots:
+                break
             for slot_index in batch_slots:
                 self._ensure_environment(slot_index)
 
@@ -622,6 +756,18 @@ class RolloutWorker:
                 is_warmup = (collected_steps + batch_offset) < warmup_budget
                 if is_warmup:
                     behavior_source = self._resolve_warmup_behavior_source(slot_index)
+                    actions_by_slot[slot_index] = self._sample_warmup_action(observation, behavior_source)
+                    is_demo_by_slot[slot_index] = True
+                    behavior_source_by_slot[slot_index] = behavior_source
+                    behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
+                    continue
+                current_global_step = int(global_env_start_step) + int(collected_steps + batch_offset)
+                teacher_takeover_prob = self._current_teacher_takeover_prob(current_global_step)
+                teacher_takeover_probs.append(float(teacher_takeover_prob))
+                if teacher_takeover_prob > 0.0 and (
+                    self.rng.random() < teacher_takeover_prob
+                ):
+                    behavior_source = str(self.train_config.teacher_takeover_behavior_source)
                     actions_by_slot[slot_index] = self._sample_warmup_action(observation, behavior_source)
                     is_demo_by_slot[slot_index] = True
                     behavior_source_by_slot[slot_index] = behavior_source
@@ -738,7 +884,10 @@ class RolloutWorker:
                     ),
                 )
                 transition_encode_seconds += perf_counter() - transition_encode_start
-                transitions.append(transition)
+                transition_records.append(
+                    _CollectedTransitionRecord(slot_index=int(slot_index), transition=transition)
+                )
+                open_episode_indices_by_slot[int(slot_index)].append(len(transition_records) - 1)
 
                 rewards.append(float(reward))
                 cooperation_rates.append(actual_cooperation_rate)
@@ -753,13 +902,22 @@ class RolloutWorker:
                 self.observations[slot_index] = next_observation
                 if done:
                     completed_episodes += 1
-                    self._reset_environment(slot_index)
+                    open_episode_indices_by_slot[int(slot_index)] = []
+                    if collected_steps < num_steps or resolved_demo_return_mode != "mc":
+                        self._reset_environment(slot_index)
+
+        if compute_demo_returns and transition_records:
+            self._annotate_demo_return_targets(
+                transition_records,
+                mode=str(resolved_demo_return_mode),
+                n_step=resolved_demo_return_n_step,
+            )
 
         metrics = {
             "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
             "episodes_completed": float(completed_episodes),
             "env_steps": float(self.total_env_steps),
-            "steps_collected": float(len(transitions)),
+            "steps_collected": float(len(transition_records)),
             "mean_actual_cooperation_rate": float(np.mean(cooperation_rates)) if cooperation_rates else 0.0,
             "mean_resource": float(np.mean(mean_resources)) if mean_resources else 0.0,
             "mean_gini": float(np.mean(gini_values)) if gini_values else 0.0,
@@ -776,9 +934,10 @@ class RolloutWorker:
             "inference_batch_size_mean": float(np.mean(inference_batch_sizes)) if inference_batch_sizes else 0.0,
             "inference_batch_size_max": float(max(inference_batch_sizes)) if inference_batch_sizes else 0.0,
             "behavior_source_counts": behavior_source_counts,
+            "teacher_takeover_prob_mean": float(np.mean(teacher_takeover_probs)) if teacher_takeover_probs else 0.0,
         }
         replay_stack_start = perf_counter()
-        replay_batch = stack_tensor_transitions(transitions)
+        replay_batch = stack_tensor_transitions([record.transition for record in transition_records])
         metrics["stack_transitions_seconds"] = float(perf_counter() - replay_stack_start)
         return RolloutResult(replay_batch=replay_batch, metrics=metrics)
 
@@ -1156,6 +1315,9 @@ def _parallel_rollout_worker_main(
                         forced_behavior_source=message.get("forced_behavior_source"),
                         mark_as_demo=message.get("mark_as_demo"),
                         count_env_steps=bool(message.get("count_env_steps", True)),
+                        global_env_start_step=int(message.get("global_env_start_step", 0)),
+                        demo_return_target_mode=message.get("demo_return_target_mode"),
+                        demo_return_n_step=message.get("demo_return_n_step"),
                     )
                     shared_memory_serialize_start = perf_counter()
                     serialized_result, shared_memory_handles = _serialize_rollout_result(collect_result)
@@ -1289,6 +1451,9 @@ class ParallelRolloutWorker:
         forced_behavior_source: str | None = None,
         mark_as_demo: bool | None = None,
         count_env_steps: bool = True,
+        global_env_start_step: int = 0,
+        demo_return_target_mode: str | None = None,
+        demo_return_n_step: int | None = None,
     ) -> None:
         if self._collect_inflight:
             raise RuntimeError("Collect request already in flight for worker {0}.".format(self.config.worker_id))
@@ -1300,6 +1465,9 @@ class ParallelRolloutWorker:
                 "forced_behavior_source": forced_behavior_source,
                 "mark_as_demo": mark_as_demo,
                 "count_env_steps": bool(count_env_steps),
+                "global_env_start_step": int(global_env_start_step),
+                "demo_return_target_mode": demo_return_target_mode,
+                "demo_return_n_step": demo_return_n_step,
             }
         )
         self._collect_inflight = True
@@ -1335,6 +1503,9 @@ class ParallelRolloutWorker:
         forced_behavior_source: str | None = None,
         mark_as_demo: bool | None = None,
         count_env_steps: bool = True,
+        global_env_start_step: int = 0,
+        demo_return_target_mode: str | None = None,
+        demo_return_n_step: int | None = None,
     ) -> RolloutResult:
         self.start_collect(
             num_steps=num_steps,
@@ -1342,6 +1513,9 @@ class ParallelRolloutWorker:
             forced_behavior_source=forced_behavior_source,
             mark_as_demo=mark_as_demo,
             count_env_steps=count_env_steps,
+            global_env_start_step=global_env_start_step,
+            demo_return_target_mode=demo_return_target_mode,
+            demo_return_n_step=demo_return_n_step,
         )
         return self.finish_collect()
 

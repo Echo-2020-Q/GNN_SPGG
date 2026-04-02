@@ -488,7 +488,7 @@ BASE_EXPERIMENT = {
         "replay_demo_behavior_source": "pool_power_mix",
 
         # learner 每次更新采样的 batch 大小。
-        "batch_size": 512,
+        "batch_size": 256,
 
         # learner 内部做图张量化时的微批大小。
         # 这是为了避免把整个 replay batch 一次性展开成 dense [B, N, N, H] 图张量后显存占用过高。
@@ -588,6 +588,54 @@ BASE_EXPERIMENT = {
         # 可选：把 demo 预收集得到的 replay batch 落盘成一个 .pt 文件。
         # 设为 None 时，只放进 replay，不额外保存到磁盘。
         "demo_dataset_save_path": None,
+
+        # demo critic 预训练使用的目标类型：
+        # - "n_step" ：teacher 轨迹自身的纯 n-step return
+        # - "mc"     ：teacher 轨迹自身的整局 Monte Carlo return
+        "demo_critic_pretrain_target_mode": "n_step",
+
+        # 当 demo_critic_pretrain_target_mode="n_step" 时使用的步长 n。
+        "demo_critic_pretrain_n_step": 20,
+
+        # warm-up 结束后，是否让 teacher 先和 actor 混合接管，而不是立刻纯 actor。
+        "teacher_takeover_enabled": True,
+
+        # teacher takeover 阶段使用的启发式行为源。
+        # 当前只支持 "pool_power_mix"。
+        "teacher_takeover_behavior_source": "pool_power_mix",
+
+        # teacher takeover 起始概率。
+        # 例如 0.8 表示刚脱离 warm-up 时，80% 概率仍由 teacher 接管。
+        "teacher_takeover_start_prob": 0.8,
+
+        # teacher takeover 结束概率。
+        "teacher_takeover_end_prob": 0.0,
+
+        # teacher takeover 线性衰减到 end_prob 的总 rollout 步数比例。
+        "teacher_takeover_decay_end_fraction": 0.30,
+
+        # online 阶段 actor 的 Q 项初始系数。
+        # 早期让 actor loss 以 BC 为主，Q 为辅。
+        "online_actor_q_coef_initial": 0.2,
+
+        # online 阶段 actor 的 Q 项最终系数。
+        "online_actor_q_coef_final": 1.0,
+
+        # actor Q 系数从 initial 线性升到 final 的总 rollout 步数比例。
+        "online_actor_q_coef_ramp_end_fraction": 0.30,
+
+        # critic 损失类型：
+        # - "mse"
+        # - "huber"
+        "critic_loss_type": "huber",
+
+        # Huber critic loss 的 delta。
+        "critic_huber_delta": 1.0,
+
+        # Actor / Critic 的梯度裁剪范数。
+        # 设为 None 表示关闭裁剪。
+        "actor_grad_clip_norm": 5.0,
+        "critic_grad_clip_norm": 5.0,
 
         # 每隔多少个外层训练迭代做一次 learner 更新。
         "train_every": 1,
@@ -804,8 +852,8 @@ BASE_EXPERIMENT = {
             {
                 "label": "regular__scale_free__erdos_renyi",
                 "portion": 0.40,
-                "train_network_types": ["regular", "small_world", "erdos_renyi"],
-                "train_network_type_weights": [0.4, 0.2, 0.4],
+                "train_network_types": ["regular", "small_world", "erdos_renyi","scale_free"],
+                "train_network_type_weights": [0.25, 0.25, 0.25,25],
                 "eval_network_types": ["regular", "small_world", "erdos_renyi"],
             },
             {
@@ -1667,6 +1715,20 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         critic_pretrain_updates=training.get("critic_pretrain_updates", 0),
         demo_pretrain_batch_size=training.get("demo_pretrain_batch_size"),
         demo_dataset_save_path=training.get("demo_dataset_save_path"),
+        demo_critic_pretrain_target_mode=training.get("demo_critic_pretrain_target_mode", "n_step"),
+        demo_critic_pretrain_n_step=training.get("demo_critic_pretrain_n_step", 20),
+        teacher_takeover_enabled=training.get("teacher_takeover_enabled", True),
+        teacher_takeover_behavior_source=training.get("teacher_takeover_behavior_source", "pool_power_mix"),
+        teacher_takeover_start_prob=training.get("teacher_takeover_start_prob", 0.8),
+        teacher_takeover_end_prob=training.get("teacher_takeover_end_prob", 0.0),
+        teacher_takeover_decay_end_fraction=training.get("teacher_takeover_decay_end_fraction", 0.30),
+        online_actor_q_coef_initial=training.get("online_actor_q_coef_initial", 0.2),
+        online_actor_q_coef_final=training.get("online_actor_q_coef_final", 1.0),
+        online_actor_q_coef_ramp_end_fraction=training.get("online_actor_q_coef_ramp_end_fraction", 0.30),
+        critic_loss_type=training.get("critic_loss_type", "huber"),
+        critic_huber_delta=training.get("critic_huber_delta", 1.0),
+        actor_grad_clip_norm=training.get("actor_grad_clip_norm", 5.0),
+        critic_grad_clip_norm=training.get("critic_grad_clip_norm", 5.0),
         train_every=training["train_every"],
         gradient_steps_per_update=training["gradient_steps_per_update"],
         policy_delay=training["policy_delay"],
@@ -2511,12 +2573,17 @@ def _format_console_recent_stats_lines(
         ("actor_logit_l2", "actor_logit_l2"),
         ("actor_bc_loss", "actor_bc_loss"),
         ("actor_bc_coef", "actor_bc_coef"),
+        ("actor_q_coef", "actor_q_coef"),
+        ("actor_grad_norm", "actor_grad_norm"),
+        ("critic_grad_norm", "critic_grad_norm"),
         ("actor_lr", "actor_lr"),
         ("critic_lr", "critic_lr"),
         ("replay_size", "replay_size"),
         ("replay_demo_frac", "replay_demo"),
         ("replay_pool_power_demo_frac", "replay_pool_demo"),
+        ("replay_teacher_frac", "replay_teacher"),
         ("replay_collapse_frac", "replay_collapse"),
+        ("teacher_takeover_prob", "teacher_takeover"),
         ("profile_rollout_steps_per_second", "rollout_sps"),
         ("profile_rollout_collect_seconds", "rollout_collect_s"),
         ("profile_rollout_collect_worker_seconds", "worker_collect_s"),
@@ -2615,6 +2682,7 @@ def _tensorboard_tag_for_metric(metric_name: str) -> Optional[str]:
     if metric_name in {
         "replay_demo_frac",
         "replay_pool_power_demo_frac",
+        "replay_teacher_frac",
         "replay_collapse_frac",
         "replay_sample_size",
     }:
@@ -2727,6 +2795,25 @@ def _log_tensorboard_static_metadata(
         "static/training/demo_collection_env_steps": float(spec["training"].get("demo_collection_env_steps", 0)),
         "static/training/actor_bc_pretrain_updates": float(spec["training"].get("actor_bc_pretrain_updates", 0)),
         "static/training/critic_pretrain_updates": float(spec["training"].get("critic_pretrain_updates", 0)),
+        "static/training/demo_critic_pretrain_n_step": float(spec["training"].get("demo_critic_pretrain_n_step", 20)),
+        "static/training/teacher_takeover_enabled": float(
+            1.0 if spec["training"].get("teacher_takeover_enabled", True) else 0.0
+        ),
+        "static/training/teacher_takeover_start_prob": float(spec["training"].get("teacher_takeover_start_prob", 0.8)),
+        "static/training/teacher_takeover_end_prob": float(spec["training"].get("teacher_takeover_end_prob", 0.0)),
+        "static/training/teacher_takeover_decay_end_fraction": float(
+            spec["training"].get("teacher_takeover_decay_end_fraction", 0.30)
+        ),
+        "static/training/online_actor_q_coef_initial": float(
+            spec["training"].get("online_actor_q_coef_initial", 0.2)
+        ),
+        "static/training/online_actor_q_coef_final": float(
+            spec["training"].get("online_actor_q_coef_final", 1.0)
+        ),
+        "static/training/online_actor_q_coef_ramp_end_fraction": float(
+            spec["training"].get("online_actor_q_coef_ramp_end_fraction", 0.30)
+        ),
+        "static/training/critic_huber_delta": float(spec["training"].get("critic_huber_delta", 1.0)),
         "static/training/rollout_inference_batch_timeout_ms": float(
             spec["training"].get("rollout_inference_batch_timeout_ms", 2.0)
         ),
@@ -2757,6 +2844,21 @@ def _log_tensorboard_static_metadata(
     writer.add_text(
         "static/training/demo_collection_behavior_source",
         str(spec["training"].get("demo_collection_behavior_source", "pool_power_mix")),
+        0,
+    )
+    writer.add_text(
+        "static/training/demo_critic_pretrain_target_mode",
+        str(spec["training"].get("demo_critic_pretrain_target_mode", "n_step")),
+        0,
+    )
+    writer.add_text(
+        "static/training/teacher_takeover_behavior_source",
+        str(spec["training"].get("teacher_takeover_behavior_source", "pool_power_mix")),
+        0,
+    )
+    writer.add_text(
+        "static/training/critic_loss_type",
+        str(spec["training"].get("critic_loss_type", "huber")),
         0,
     )
     replay_topology_names_value = spec["training"].get("replay_topology_names")
@@ -2811,6 +2913,8 @@ def _log_tensorboard_demo_pretrain_summary(
         "critic_pretrain_updates": "demo_pretrain/critic_pretrain_updates",
         "actor_bc_loss_last": "demo_pretrain/actor_bc_loss_last",
         "critic_loss_last": "demo_pretrain/critic_loss_last",
+        "demo_return_target_mean": "demo_pretrain/demo_return_target_mean",
+        "demo_return_target_std": "demo_pretrain/demo_return_target_std",
         "seconds_collection": "demo_pretrain/seconds_collection",
         "seconds_actor_bc": "demo_pretrain/seconds_actor_bc",
         "seconds_critic": "demo_pretrain/seconds_critic",
@@ -2820,6 +2924,8 @@ def _log_tensorboard_demo_pretrain_summary(
             writer.add_scalar(tag, float(summary[key]), 0)
     if "behavior_source" in summary and summary["behavior_source"] is not None:
         writer.add_text("demo_pretrain/behavior_source", str(summary["behavior_source"]), 0)
+    if "critic_target_mode" in summary and summary["critic_target_mode"] is not None:
+        writer.add_text("demo_pretrain/critic_target_mode", str(summary["critic_target_mode"]), 0)
     if "dataset_path" in summary and summary["dataset_path"] is not None:
         writer.add_text("demo_pretrain/dataset_path", str(summary["dataset_path"]), 0)
 
@@ -3146,19 +3252,36 @@ def run_gnn_training_mode(
                 )
             )
             print(
-                "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, actor_bc_updates={4}, critic_pretrain_updates={5}, batch_size={6}, dataset_path={7}".format(
+                "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, actor_bc_updates={4}, critic_pretrain_updates={5}, critic_target={6}, n_step={7}, batch_size={8}, dataset_path={9}".format(
                     trainer_config.demo_collection_env_steps,
                     trainer_config.demo_collection_behavior_source,
                     trainer_config.demo_collection_use_domain_randomization,
                     demo_collection_network_types,
                     trainer_config.actor_bc_pretrain_updates,
                     trainer_config.critic_pretrain_updates,
+                    trainer_config.demo_critic_pretrain_target_mode,
+                    trainer_config.demo_critic_pretrain_n_step,
                     trainer_config.demo_pretrain_batch_size
                     if trainer_config.demo_pretrain_batch_size is not None
                     else trainer_config.batch_size,
                     trainer_config.demo_dataset_save_path or "None",
                 )
             )
+        print(
+            "Stab CFG : teacher_takeover={0}({1}->{2}, end@{3}), actor_q_coef={4}->{5} end@{6}, critic_loss={7}, huber_delta={8}, grad_clip(actor={9}, critic={10})".format(
+                trainer_config.teacher_takeover_enabled,
+                trainer_config.teacher_takeover_start_prob,
+                trainer_config.teacher_takeover_end_prob,
+                trainer_config.teacher_takeover_decay_end_fraction,
+                trainer_config.online_actor_q_coef_initial,
+                trainer_config.online_actor_q_coef_final,
+                trainer_config.online_actor_q_coef_ramp_end_fraction,
+                trainer_config.critic_loss_type,
+                trainer_config.critic_huber_delta,
+                trainer_config.actor_grad_clip_norm,
+                trainer_config.critic_grad_clip_norm,
+            )
+        )
         print(
             "Eval CFG  : mode={0}, periodic_eval_episodes={1}, eval_interval_env_steps={2} ({3}), eval_interval_updates={4}".format(
                 "custom_env_families({0})".format(len(eval_env_factories))
@@ -3355,10 +3478,13 @@ def run_gnn_training_mode(
         )
         if demo_pretrain_summary is not None:
             print(
-                "Demo Summary: replay={0:.0f}, actor_bc_updates={1:.0f}, critic_pretrain_updates={2:.0f}, actor_bc_loss_last={3:.6f}, critic_loss_last={4:.6f}, seconds={{collection:{5:.3f}, actor_bc:{6:.3f}, critic:{7:.3f}}}".format(
+                "Demo Summary: replay={0:.0f}, actor_bc_updates={1:.0f}, critic_pretrain_updates={2:.0f}, critic_target={3}, target_mean={4:.6f}, target_std={5:.6f}, actor_bc_loss_last={6:.6f}, critic_loss_last={7:.6f}, seconds={{collection:{8:.3f}, actor_bc:{9:.3f}, critic:{10:.3f}}}".format(
                     float(demo_pretrain_summary.get("demo_replay_size_after_collection", 0.0)),
                     float(demo_pretrain_summary.get("actor_bc_updates", 0.0)),
                     float(demo_pretrain_summary.get("critic_pretrain_updates", 0.0)),
+                    str(demo_pretrain_summary.get("critic_target_mode", "n_step")),
+                    float(demo_pretrain_summary.get("demo_return_target_mean", 0.0)),
+                    float(demo_pretrain_summary.get("demo_return_target_std", 0.0)),
                     float(demo_pretrain_summary.get("actor_bc_loss_last", 0.0)),
                     float(demo_pretrain_summary.get("critic_loss_last", 0.0)),
                     float(demo_pretrain_summary.get("seconds_collection", 0.0)),

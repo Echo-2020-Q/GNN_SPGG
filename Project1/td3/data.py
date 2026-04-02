@@ -187,6 +187,8 @@ class TensorTransition:
     collapse_flag: Tensor
     topology_id: Tensor
     pool_power_demo_flag: Tensor
+    demo_return_target: Tensor
+    demo_return_valid: Tensor
 
     @classmethod
     def from_step(
@@ -200,6 +202,8 @@ class TensorTransition:
         collapse_flag: bool = False,
         topology_name: str | None = None,
         pool_power_demo_flag: bool = False,
+        demo_return_target: float = 0.0,
+        demo_return_valid: bool = False,
     ) -> "TensorTransition":
         if isinstance(action, TensorActionRecord):
             replay_action = TensorReplayActionRecord(
@@ -217,6 +221,8 @@ class TensorTransition:
             collapse_flag=torch.tensor(bool(collapse_flag), dtype=torch.bool, device="cpu"),
             topology_id=torch.tensor(topology_name_to_id(topology_name), dtype=torch.int64, device="cpu"),
             pool_power_demo_flag=torch.tensor(bool(pool_power_demo_flag), dtype=torch.bool, device="cpu"),
+            demo_return_target=torch.tensor(float(demo_return_target), dtype=torch.float32, device="cpu"),
+            demo_return_valid=torch.tensor(bool(demo_return_valid), dtype=torch.bool, device="cpu"),
         )
 
     @classmethod
@@ -231,6 +237,8 @@ class TensorTransition:
             collapse_flag=bool(transition.metadata.get("collapse_flag", False)),
             topology_name=str(transition.metadata.get("topology_name", "unknown")),
             pool_power_demo_flag=bool(transition.metadata.get("pool_power_demo_flag", False)),
+            demo_return_target=float(transition.metadata.get("demo_return_target", 0.0)),
+            demo_return_valid=bool(transition.metadata.get("demo_return_valid", False)),
         )
 
     def clone(self) -> "TensorTransition":
@@ -244,6 +252,8 @@ class TensorTransition:
             collapse_flag=self.collapse_flag.detach().cpu().clone(),
             topology_id=self.topology_id.detach().cpu().clone(),
             pool_power_demo_flag=self.pool_power_demo_flag.detach().cpu().clone(),
+            demo_return_target=self.demo_return_target.detach().cpu().clone(),
+            demo_return_valid=self.demo_return_valid.detach().cpu().clone(),
         )
 
 
@@ -258,6 +268,8 @@ class TensorReplayBatch:
     collapse_flag: Tensor
     topology_id: Tensor
     pool_power_demo_flag: Tensor
+    demo_return_target: Tensor
+    demo_return_valid: Tensor
 
     def to(self, device: torch.device | str) -> "TensorReplayBatch":
         return TensorReplayBatch(
@@ -270,6 +282,8 @@ class TensorReplayBatch:
             collapse_flag=self.collapse_flag.to(device=device),
             topology_id=self.topology_id.to(device=device),
             pool_power_demo_flag=self.pool_power_demo_flag.to(device=device),
+            demo_return_target=self.demo_return_target.to(device=device),
+            demo_return_valid=self.demo_return_valid.to(device=device),
         )
 
     def __len__(self) -> int:
@@ -286,6 +300,8 @@ class TensorReplayBatch:
             collapse_flag=self.collapse_flag.detach().cpu().clone(),
             topology_id=self.topology_id.detach().cpu().clone(),
             pool_power_demo_flag=self.pool_power_demo_flag.detach().cpu().clone(),
+            demo_return_target=self.demo_return_target.detach().cpu().clone(),
+            demo_return_valid=self.demo_return_valid.detach().cpu().clone(),
         )
 
 
@@ -311,6 +327,8 @@ def stack_tensor_transitions(transitions: Sequence[TensorTransition]) -> TensorR
     collapse_flag = torch.stack([transition.collapse_flag for transition in transitions], dim=0)
     topology_id = torch.stack([transition.topology_id for transition in transitions], dim=0)
     pool_power_demo_flag = torch.stack([transition.pool_power_demo_flag for transition in transitions], dim=0)
+    demo_return_target = torch.stack([transition.demo_return_target for transition in transitions], dim=0)
+    demo_return_valid = torch.stack([transition.demo_return_valid for transition in transitions], dim=0)
     return TensorReplayBatch(
         obs=obs,
         action=action,
@@ -321,4 +339,6 @@ def stack_tensor_transitions(transitions: Sequence[TensorTransition]) -> TensorR
         collapse_flag=collapse_flag,
         topology_id=topology_id,
         pool_power_demo_flag=pool_power_demo_flag,
+        demo_return_target=demo_return_target,
+        demo_return_valid=demo_return_valid,
     )

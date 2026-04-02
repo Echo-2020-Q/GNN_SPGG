@@ -43,6 +43,8 @@ def _concat_replay_batches(batches: Sequence[TensorReplayBatch]) -> TensorReplay
         collapse_flag=torch.cat([batch.collapse_flag for batch in batches], dim=0),
         topology_id=torch.cat([batch.topology_id for batch in batches], dim=0),
         pool_power_demo_flag=torch.cat([batch.pool_power_demo_flag for batch in batches], dim=0),
+        demo_return_target=torch.cat([batch.demo_return_target for batch in batches], dim=0),
+        demo_return_valid=torch.cat([batch.demo_return_valid for batch in batches], dim=0),
     )
 
 
@@ -59,6 +61,8 @@ def _slice_replay_batch(batch: TensorReplayBatch, indices: Tensor) -> TensorRepl
         collapse_flag=batch.collapse_flag.index_select(0, indices),
         topology_id=batch.topology_id.index_select(0, indices),
         pool_power_demo_flag=batch.pool_power_demo_flag.index_select(0, indices),
+        demo_return_target=batch.demo_return_target.index_select(0, indices),
+        demo_return_valid=batch.demo_return_valid.index_select(0, indices),
     )
 
 
@@ -115,6 +119,8 @@ class _TensorReplayStorage:
         self._collapse_flag_buffer: Tensor | None = None
         self._topology_id_buffer: Tensor | None = None
         self._pool_power_demo_flag_buffer: Tensor | None = None
+        self._demo_return_target_buffer: Tensor | None = None
+        self._demo_return_valid_buffer: Tensor | None = None
 
     def __len__(self) -> int:
         return int(self._size)
@@ -148,6 +154,16 @@ class _TensorReplayStorage:
             dtype=transition.pool_power_demo_flag.dtype,
             device="cpu",
         )
+        self._demo_return_target_buffer = torch.empty(
+            self.capacity,
+            dtype=transition.demo_return_target.dtype,
+            device="cpu",
+        )
+        self._demo_return_valid_buffer = torch.empty(
+            self.capacity,
+            dtype=transition.demo_return_valid.dtype,
+            device="cpu",
+        )
 
     def _allocate_from_batch(self, batch: TensorReplayBatch) -> None:
         self._obs_buffers = {
@@ -173,6 +189,16 @@ class _TensorReplayStorage:
         self._pool_power_demo_flag_buffer = torch.empty(
             self.capacity,
             dtype=batch.pool_power_demo_flag.dtype,
+            device="cpu",
+        )
+        self._demo_return_target_buffer = torch.empty(
+            self.capacity,
+            dtype=batch.demo_return_target.dtype,
+            device="cpu",
+        )
+        self._demo_return_valid_buffer = torch.empty(
+            self.capacity,
+            dtype=batch.demo_return_valid.dtype,
             device="cpu",
         )
 
@@ -211,6 +237,18 @@ class _TensorReplayStorage:
             or transition.pool_power_demo_flag.dtype != self._pool_power_demo_flag_buffer.dtype
         ):
             raise ValueError("Transition field 'pool_power_demo_flag' is incompatible with replay buffer schema.")
+        if (
+            self._demo_return_target_buffer is None
+            or transition.demo_return_target.shape != torch.Size([])
+            or transition.demo_return_target.dtype != self._demo_return_target_buffer.dtype
+        ):
+            raise ValueError("Transition field 'demo_return_target' is incompatible with replay buffer schema.")
+        if (
+            self._demo_return_valid_buffer is None
+            or transition.demo_return_valid.shape != torch.Size([])
+            or transition.demo_return_valid.dtype != self._demo_return_valid_buffer.dtype
+        ):
+            raise ValueError("Transition field 'demo_return_valid' is incompatible with replay buffer schema.")
 
     def _validate_batch_structure(self, batch: TensorReplayBatch) -> None:
         if set(batch.obs.keys()) != set(self._obs_buffers.keys()):
@@ -245,6 +283,18 @@ class _TensorReplayStorage:
             or batch.pool_power_demo_flag.dtype != self._pool_power_demo_flag_buffer.dtype
         ):
             raise ValueError("Replay batch field 'pool_power_demo_flag' is incompatible with replay buffer schema.")
+        if (
+            self._demo_return_target_buffer is None
+            or batch.demo_return_target.ndim != 1
+            or batch.demo_return_target.dtype != self._demo_return_target_buffer.dtype
+        ):
+            raise ValueError("Replay batch field 'demo_return_target' is incompatible with replay buffer schema.")
+        if (
+            self._demo_return_valid_buffer is None
+            or batch.demo_return_valid.ndim != 1
+            or batch.demo_return_valid.dtype != self._demo_return_valid_buffer.dtype
+        ):
+            raise ValueError("Replay batch field 'demo_return_valid' is incompatible with replay buffer schema.")
 
     @staticmethod
     def _batch_is_cpu(batch: TensorReplayBatch) -> bool:
@@ -256,6 +306,8 @@ class _TensorReplayStorage:
             batch.collapse_flag,
             batch.topology_id,
             batch.pool_power_demo_flag,
+            batch.demo_return_target,
+            batch.demo_return_valid,
         ] + list(batch.next_obs.values())
         return all(tensor.device.type == "cpu" for tensor in tensors)
 
@@ -271,12 +323,16 @@ class _TensorReplayStorage:
         assert self._collapse_flag_buffer is not None
         assert self._topology_id_buffer is not None
         assert self._pool_power_demo_flag_buffer is not None
+        assert self._demo_return_target_buffer is not None
+        assert self._demo_return_valid_buffer is not None
         self._reward_buffer[index] = transition.reward
         self._done_buffer[index] = transition.done
         self._is_demo_buffer[index] = transition.is_demo
         self._collapse_flag_buffer[index] = transition.collapse_flag
         self._topology_id_buffer[index] = transition.topology_id
         self._pool_power_demo_flag_buffer[index] = transition.pool_power_demo_flag
+        self._demo_return_target_buffer[index] = transition.demo_return_target
+        self._demo_return_valid_buffer[index] = transition.demo_return_valid
 
     def _write_batch_at_indices(self, indices: Tensor, batch: TensorReplayBatch) -> None:
         for key, value in batch.obs.items():
@@ -290,12 +346,16 @@ class _TensorReplayStorage:
         assert self._collapse_flag_buffer is not None
         assert self._topology_id_buffer is not None
         assert self._pool_power_demo_flag_buffer is not None
+        assert self._demo_return_target_buffer is not None
+        assert self._demo_return_valid_buffer is not None
         self._reward_buffer.index_copy_(0, indices, batch.reward)
         self._done_buffer.index_copy_(0, indices, batch.done)
         self._is_demo_buffer.index_copy_(0, indices, batch.is_demo)
         self._collapse_flag_buffer.index_copy_(0, indices, batch.collapse_flag)
         self._topology_id_buffer.index_copy_(0, indices, batch.topology_id)
         self._pool_power_demo_flag_buffer.index_copy_(0, indices, batch.pool_power_demo_flag)
+        self._demo_return_target_buffer.index_copy_(0, indices, batch.demo_return_target)
+        self._demo_return_valid_buffer.index_copy_(0, indices, batch.demo_return_valid)
 
     def _select_write_index(self) -> int | None:
         if self.replacement_policy == "ring":
@@ -528,6 +588,8 @@ class _TensorReplayStorage:
         assert self._collapse_flag_buffer is not None
         assert self._topology_id_buffer is not None
         assert self._pool_power_demo_flag_buffer is not None
+        assert self._demo_return_target_buffer is not None
+        assert self._demo_return_valid_buffer is not None
         return TensorReplayBatch(
             obs=obs,
             action=TensorReplayActionRecord(
@@ -540,6 +602,8 @@ class _TensorReplayStorage:
             collapse_flag=self._collapse_flag_buffer.index_select(0, indices),
             topology_id=self._topology_id_buffer.index_select(0, indices),
             pool_power_demo_flag=self._pool_power_demo_flag_buffer.index_select(0, indices),
+            demo_return_target=self._demo_return_target_buffer.index_select(0, indices),
+            demo_return_valid=self._demo_return_valid_buffer.index_select(0, indices),
         )
 
     def sample_filtered_up_to(
@@ -579,6 +643,8 @@ class _TensorReplayStorage:
         assert self._collapse_flag_buffer is not None
         assert self._topology_id_buffer is not None
         assert self._pool_power_demo_flag_buffer is not None
+        assert self._demo_return_target_buffer is not None
+        assert self._demo_return_valid_buffer is not None
         return TensorReplayBatch(
             obs=obs,
             action=TensorReplayActionRecord(
@@ -591,6 +657,8 @@ class _TensorReplayStorage:
             collapse_flag=self._collapse_flag_buffer.index_select(0, indices),
             topology_id=self._topology_id_buffer.index_select(0, indices),
             pool_power_demo_flag=self._pool_power_demo_flag_buffer.index_select(0, indices),
+            demo_return_target=self._demo_return_target_buffer.index_select(0, indices),
+            demo_return_valid=self._demo_return_valid_buffer.index_select(0, indices),
         )
 
     def sample(
@@ -796,6 +864,16 @@ class _TensorReplayStorage:
                 if self._pool_power_demo_flag_buffer is None
                 else self._pool_power_demo_flag_buffer.detach().cpu().clone()
             ),
+            "demo_return_target_buffer": (
+                None
+                if self._demo_return_target_buffer is None
+                else self._demo_return_target_buffer.detach().cpu().clone()
+            ),
+            "demo_return_valid_buffer": (
+                None
+                if self._demo_return_valid_buffer is None
+                else self._demo_return_valid_buffer.detach().cpu().clone()
+            ),
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -822,6 +900,8 @@ class _TensorReplayStorage:
             self._collapse_flag_buffer = None
             self._topology_id_buffer = None
             self._pool_power_demo_flag_buffer = None
+            self._demo_return_target_buffer = None
+            self._demo_return_valid_buffer = None
             return
 
         self._obs_buffers = {
@@ -842,6 +922,8 @@ class _TensorReplayStorage:
         collapse_flag_buffer = state_dict.get("collapse_flag_buffer")
         topology_id_buffer = state_dict.get("topology_id_buffer")
         pool_power_demo_flag_buffer = state_dict.get("pool_power_demo_flag_buffer")
+        demo_return_target_buffer = state_dict.get("demo_return_target_buffer")
+        demo_return_valid_buffer = state_dict.get("demo_return_valid_buffer")
         self._reward_buffer = None if reward_buffer is None else torch.as_tensor(reward_buffer, device="cpu").detach().clone()
         self._done_buffer = None if done_buffer is None else torch.as_tensor(done_buffer, device="cpu").detach().clone()
         self._is_demo_buffer = (
@@ -863,6 +945,16 @@ class _TensorReplayStorage:
             torch.zeros(self.capacity, dtype=torch.bool, device="cpu")
             if pool_power_demo_flag_buffer is None
             else torch.as_tensor(pool_power_demo_flag_buffer, device="cpu").detach().clone()
+        )
+        self._demo_return_target_buffer = (
+            torch.zeros(self.capacity, dtype=torch.float32, device="cpu")
+            if demo_return_target_buffer is None
+            else torch.as_tensor(demo_return_target_buffer, device="cpu").detach().clone()
+        )
+        self._demo_return_valid_buffer = (
+            torch.zeros(self.capacity, dtype=torch.bool, device="cpu")
+            if demo_return_valid_buffer is None
+            else torch.as_tensor(demo_return_valid_buffer, device="cpu").detach().clone()
         )
 
     def _load_legacy_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -887,6 +979,8 @@ class _TensorReplayStorage:
         self._collapse_flag_buffer = None
         self._topology_id_buffer = None
         self._pool_power_demo_flag_buffer = None
+        self._demo_return_target_buffer = None
+        self._demo_return_valid_buffer = None
 
         first_transition = next((item for item in buffer_state if item is not None), None)
         if first_transition is None:

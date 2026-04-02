@@ -257,6 +257,8 @@ class TensorReplayTests(unittest.TestCase):
                     done=False,
                     topology_name="regular" if index % 2 == 0 else "scale_free",
                     pool_power_demo_flag=(index % 2 == 0),
+                    demo_return_target=1.5 + float(index),
+                    demo_return_valid=(index % 2 == 0),
                 )
             )
 
@@ -269,3 +271,5 @@ class TensorReplayTests(unittest.TestCase):
 
         self.assertTrue(torch.equal(original_batch.topology_id, restored_batch.topology_id))
         self.assertTrue(torch.equal(original_batch.pool_power_demo_flag, restored_batch.pool_power_demo_flag))
+        self.assertTrue(torch.equal(original_batch.demo_return_target, restored_batch.demo_return_target))
+        self.assertTrue(torch.equal(original_batch.demo_return_valid, restored_batch.demo_return_valid))

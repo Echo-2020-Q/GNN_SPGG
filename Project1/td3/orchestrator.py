@@ -363,6 +363,8 @@ class GraphTD3Trainer:
         forced_behavior_source: str | None = None,
         mark_as_demo: bool | None = None,
         count_env_steps: bool = True,
+        demo_return_target_mode: str | None = None,
+        demo_return_n_step: int | None = None,
     ) -> list[RolloutResult]:
         if len(step_allocations) != len(self.workers):
             raise ValueError("step_allocations must align with workers.")
@@ -388,6 +390,9 @@ class GraphTD3Trainer:
                     forced_behavior_source=forced_behavior_source,
                     mark_as_demo=mark_as_demo,
                     count_env_steps=count_env_steps,
+                    global_env_start_step=int(self.global_env_steps),
+                    demo_return_target_mode=demo_return_target_mode,
+                    demo_return_n_step=demo_return_n_step,
                 )
             ]
         else:
@@ -402,6 +407,9 @@ class GraphTD3Trainer:
                         forced_behavior_source=forced_behavior_source,
                         mark_as_demo=mark_as_demo,
                         count_env_steps=count_env_steps,
+                        global_env_start_step=int(self.global_env_steps),
+                        demo_return_target_mode=demo_return_target_mode,
+                        demo_return_n_step=demo_return_n_step,
                     )
                     started_workers.append(worker)
                     pending_workers[worker.connection] = worker
@@ -494,6 +502,8 @@ class GraphTD3Trainer:
                 "source": "pool_power_mix_demo_collection",
                 "num_batches": int(len(replay_batches)),
                 "replay_batches": [batch.clone() for batch in replay_batches],
+                "critic_target_mode": str(self.config.demo_critic_pretrain_target_mode),
+                "critic_n_step": int(self.config.demo_critic_pretrain_n_step),
             },
             dataset_path,
         )
@@ -513,6 +523,9 @@ class GraphTD3Trainer:
             "seconds_critic": 0.0,
             "dataset_path": None,
             "behavior_source": str(self.config.demo_collection_behavior_source),
+            "critic_target_mode": str(self.config.demo_critic_pretrain_target_mode),
+            "demo_return_target_mean": 0.0,
+            "demo_return_target_std": 0.0,
         }
         if not bool(self.config.demo_pretrain_enabled):
             self.demo_pretrain_completed = False
@@ -520,6 +533,7 @@ class GraphTD3Trainer:
             return dict(summary)
 
         demo_batches_to_save: list[Any] = []
+        demo_return_targets: list[np.ndarray] = []
         demo_collection_steps = max(0, int(self.config.demo_collection_env_steps))
         if demo_collection_steps > 0:
             print(
@@ -543,12 +557,20 @@ class GraphTD3Trainer:
                         forced_behavior_source=str(self.config.demo_collection_behavior_source),
                         mark_as_demo=True,
                         count_env_steps=False,
+                        demo_return_target_mode=str(self.config.demo_critic_pretrain_target_mode),
+                        demo_return_n_step=int(self.config.demo_critic_pretrain_n_step),
                     )
                     collected_now = sum(len(result.replay_batch) for result in rollout_results)
                     if collected_now <= 0:
                         raise RuntimeError("Demo collection produced zero transitions.")
                     if self.config.demo_dataset_save_path:
                         demo_batches_to_save.extend(result.replay_batch.clone() for result in rollout_results)
+                    for result in rollout_results:
+                        valid_mask = result.replay_batch.demo_return_valid.detach().cpu().numpy().astype(np.bool_, copy=False)
+                        if np.any(valid_mask):
+                            demo_return_targets.append(
+                                result.replay_batch.demo_return_target.detach().cpu().numpy().astype(np.float32, copy=False)[valid_mask]
+                            )
                     remaining_steps -= collected_now
             finally:
                 for worker in self.workers:
@@ -557,9 +579,16 @@ class GraphTD3Trainer:
             summary["seconds_collection"] = float(perf_counter() - demo_collection_start)
             summary["demo_replay_size_after_collection"] = float(self.replay_buffer.demo_size())
             summary["dataset_path"] = self._save_demo_dataset(demo_batches_to_save)
+            if demo_return_targets:
+                concatenated_demo_returns = np.concatenate(demo_return_targets, axis=0)
+                summary["demo_return_target_mean"] = float(np.mean(concatenated_demo_returns))
+                summary["demo_return_target_std"] = float(np.std(concatenated_demo_returns))
             print(
-                "Demo Pretrain | collection done | demo_replay_size={0:.0f} | seconds={1:.3f}".format(
+                "Demo Pretrain | collection done | demo_replay_size={0:.0f} | return_mode={1} | target_mean={2:.6f} | target_std={3:.6f} | seconds={4:.3f}".format(
                     float(summary["demo_replay_size_after_collection"]),
+                    str(summary["critic_target_mode"]),
+                    float(summary["demo_return_target_mean"]),
+                    float(summary["demo_return_target_std"]),
                     float(summary["seconds_collection"]),
                 )
             )
@@ -615,6 +644,7 @@ class GraphTD3Trainer:
             self.workers[0].collect(
                 num_steps=int(self.workers[0].config.rollout_steps_per_sync),
                 global_warmup_steps=int(warmup_allocations[0]) if warmup_allocations else 0,
+                global_env_start_step=int(self.global_env_steps),
             )
         ]
         try:
@@ -639,6 +669,7 @@ class GraphTD3Trainer:
             worker.start_collect(
                 num_steps=int(worker.config.rollout_steps_per_sync),
                 global_warmup_steps=int(warmup_steps),
+                global_env_start_step=int(self.global_env_steps),
             )
         self._rollout_collect_inflight = True
 
@@ -803,6 +834,7 @@ class GraphTD3Trainer:
             mean_rollout_shared_memory_deserialize_seconds = float(np.mean([item.get("shared_memory_deserialize_seconds", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
             mean_rollout_inference_batch_size = float(np.mean([item.get("inference_batch_size_mean", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
             max_rollout_inference_batch_size = float(max((item.get("inference_batch_size_max", 0.0) for item in rollout_metrics), default=0.0))
+            mean_teacher_takeover_prob = float(np.mean([item.get("teacher_takeover_prob_mean", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
             total_rollout_steps_collected = float(sum(item.get("steps_collected", 0.0) for item in rollout_metrics))
             rollout_steps_per_second = (
                 total_rollout_steps_collected / rollout_collect_seconds
@@ -833,7 +865,9 @@ class GraphTD3Trainer:
                 "replay_size": float(len(self.replay_buffer)),
                 "replay_demo_frac": float(learner_metrics.get("replay_demo_frac", 0.0)),
                 "replay_pool_power_demo_frac": float(learner_metrics.get("replay_pool_power_demo_frac", 0.0)),
+                "replay_teacher_frac": float(learner_metrics.get("replay_teacher_frac", 0.0)),
                 "replay_collapse_frac": float(learner_metrics.get("replay_collapse_frac", 0.0)),
+                "teacher_takeover_prob": mean_teacher_takeover_prob,
                 "mean_rollout_reward": mean_rollout_reward,
                 "actor_lr": float(learner_metrics["actor_lr"]),
                 "critic_lr": float(learner_metrics["critic_lr"]),
@@ -869,6 +903,9 @@ class GraphTD3Trainer:
                 "profile_target_soft_update_seconds": float(
                     learner_metrics.get("profile_target_soft_update_seconds", 0.0)
                 ),
+                "actor_grad_norm": float(learner_metrics.get("actor_grad_norm", 0.0)),
+                "critic_grad_norm": float(learner_metrics.get("critic_grad_norm", 0.0)),
+                "actor_q_coef": float(learner_metrics.get("actor_q_coef", 0.0)),
                 "profile_eval_seconds": evaluation_seconds,
                 "global_env_steps": float(self.global_env_steps),
                 **rollout_sync_metrics,

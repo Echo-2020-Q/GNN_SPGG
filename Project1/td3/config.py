@@ -63,6 +63,20 @@ class GraphTD3Config:
     critic_pretrain_updates: int = 0
     demo_pretrain_batch_size: int | None = None
     demo_dataset_save_path: str | None = None
+    demo_critic_pretrain_target_mode: str = "n_step"
+    demo_critic_pretrain_n_step: int = 20
+    teacher_takeover_enabled: bool = True
+    teacher_takeover_behavior_source: str = "pool_power_mix"
+    teacher_takeover_start_prob: float = 0.8
+    teacher_takeover_end_prob: float = 0.0
+    teacher_takeover_decay_end_fraction: float = 0.30
+    online_actor_q_coef_initial: float = 0.2
+    online_actor_q_coef_final: float = 1.0
+    online_actor_q_coef_ramp_end_fraction: float = 0.30
+    critic_loss_type: str = "huber"
+    critic_huber_delta: float = 1.0
+    actor_grad_clip_norm: float | None = 5.0
+    critic_grad_clip_norm: float | None = 5.0
     train_every: int = 1
     gradient_steps_per_update: int = 1
     policy_delay: int = 2
@@ -211,6 +225,34 @@ class GraphTD3Config:
             raise ValueError("critic_pretrain_updates must be non-negative.")
         if self.demo_pretrain_batch_size is not None and self.demo_pretrain_batch_size <= 0:
             raise ValueError("demo_pretrain_batch_size must be positive when provided.")
+        if self.demo_critic_pretrain_target_mode not in {"n_step", "mc"}:
+            raise ValueError("demo_critic_pretrain_target_mode must be one of {'n_step', 'mc'}.")
+        if self.demo_critic_pretrain_n_step <= 0:
+            raise ValueError("demo_critic_pretrain_n_step must be positive.")
+        if not isinstance(self.teacher_takeover_enabled, bool):
+            raise ValueError("teacher_takeover_enabled must be a bool.")
+        if self.teacher_takeover_behavior_source not in {"pool_power_mix"}:
+            raise ValueError("teacher_takeover_behavior_source currently only supports 'pool_power_mix'.")
+        if self.teacher_takeover_start_prob < 0.0 or self.teacher_takeover_start_prob > 1.0:
+            raise ValueError("teacher_takeover_start_prob must be in [0, 1].")
+        if self.teacher_takeover_end_prob < 0.0 or self.teacher_takeover_end_prob > 1.0:
+            raise ValueError("teacher_takeover_end_prob must be in [0, 1].")
+        if self.teacher_takeover_decay_end_fraction < 0.0 or self.teacher_takeover_decay_end_fraction > 1.0:
+            raise ValueError("teacher_takeover_decay_end_fraction must be in [0, 1].")
+        if self.online_actor_q_coef_initial < 0.0:
+            raise ValueError("online_actor_q_coef_initial must be non-negative.")
+        if self.online_actor_q_coef_final < 0.0:
+            raise ValueError("online_actor_q_coef_final must be non-negative.")
+        if self.online_actor_q_coef_ramp_end_fraction < 0.0 or self.online_actor_q_coef_ramp_end_fraction > 1.0:
+            raise ValueError("online_actor_q_coef_ramp_end_fraction must be in [0, 1].")
+        if self.critic_loss_type not in {"mse", "huber"}:
+            raise ValueError("critic_loss_type must be one of {'mse', 'huber'}.")
+        if self.critic_huber_delta <= 0.0:
+            raise ValueError("critic_huber_delta must be positive.")
+        if self.actor_grad_clip_norm is not None and self.actor_grad_clip_norm <= 0.0:
+            raise ValueError("actor_grad_clip_norm must be positive when provided.")
+        if self.critic_grad_clip_norm is not None and self.critic_grad_clip_norm <= 0.0:
+            raise ValueError("critic_grad_clip_norm must be positive when provided.")
         if self.warmup_behavior_mode == "heuristic_mix":
             warmup_mix_total = (
                 self.warmup_uniform_prob

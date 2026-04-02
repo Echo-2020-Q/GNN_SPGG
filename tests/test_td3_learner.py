@@ -66,6 +66,8 @@ class GraphTD3LearnerPretrainTests(unittest.TestCase):
                     collapse_flag=bool(info.get("actual_cooperation_rate", 0.0) < 0.1),
                     topology_name="regular",
                     pool_power_demo_flag=True,
+                    demo_return_target=float(reward) + 1.0,
+                    demo_return_valid=True,
                 )
             )
 
@@ -94,6 +96,7 @@ class GraphTD3LearnerPretrainTests(unittest.TestCase):
             critic_lr=1e-3,
             warmup_actor_bc_coef=1.0,
             warmup_steps=1,
+            critic_loss_type="huber",
             device="cpu",
         )
         return GraphTD3Learner(
@@ -132,3 +135,32 @@ class GraphTD3LearnerPretrainTests(unittest.TestCase):
         self.assertGreaterEqual(float(metrics["critic_loss"]), 0.0)
         self.assertTrue(all(torch.allclose(before, after) for before, after in zip(actor_before, actor_after)))
         self.assertTrue(any(not torch.allclose(before, after) for before, after in zip(critic_before, critic_after)))
+
+    def test_critic_pretrain_step_ignores_target_actor_bootstrap(self) -> None:
+        learner = self._make_learner()
+        for parameter in learner.target_actor.parameters():
+            parameter.data.fill_(float("nan"))
+        for parameter in learner.target_critics.parameters():
+            parameter.data.fill_(float("nan"))
+
+        metrics = learner.critic_pretrain_step()
+
+        self.assertTrue(torch.isfinite(torch.tensor(float(metrics["critic_loss"]))))
+
+    def test_train_step_reports_actor_q_coef_schedule(self) -> None:
+        learner = self._make_learner()
+        learner.config.warmup_steps = 0
+        learner.config.policy_delay = 1
+        learner.config.total_updates = 10
+        learner.config.steps_per_update = 1
+        learner.config.num_workers = 1
+        learner.config.online_actor_q_coef_initial = 0.2
+        learner.config.online_actor_q_coef_final = 1.0
+        learner.config.online_actor_q_coef_ramp_end_fraction = 0.5
+
+        early_metrics = learner.train_step(global_env_steps=0)
+        late_metrics = learner.train_step(global_env_steps=10)
+
+        self.assertAlmostEqual(float(early_metrics["actor_q_coef"]), 0.2, places=6)
+        self.assertAlmostEqual(float(late_metrics["actor_q_coef"]), 1.0, places=6)
+        self.assertGreaterEqual(float(late_metrics["critic_grad_norm"]), 0.0)
