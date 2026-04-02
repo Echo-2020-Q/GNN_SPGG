@@ -102,7 +102,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "spgg_GNN_12workers_TureFermi_20M_DemoPretain_BetterBuffer",
+    "experiment_name": "spgg_GNN_12workers_100length_Qlearn_Teacher-Return_Critic",
 
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -237,7 +237,7 @@ BASE_EXPERIMENT = {
         # - "q_learning_2x2"：每个节点使用 2状态×2动作 Q-learning，
         #                     状态=自己上一轮动作，动作=本轮选 C/D
         # - "imitate_best" ：最优邻居模仿 / Best-takes-over
-        "strategy_update_rule": "fermi",
+        "strategy_update_rule": "q_learning",
 
         # beta：同步 Fermi 更新的选择强度。
         # 仅当 strategy_update_rule == "fermi" 时使用。
@@ -253,7 +253,7 @@ BASE_EXPERIMENT = {
 
         # 每个 episode 的时间步上限。
         # 到达这个步数后，本 episode 结束。
-        "episode_length": 200, #150 10000
+        "episode_length": 100, #150 10000
 
         # 所有节点统一的初始资源。
         "initial_resource": 20.0,#10
@@ -595,7 +595,7 @@ BASE_EXPERIMENT = {
         "demo_critic_pretrain_target_mode": "n_step",
 
         # 当 demo_critic_pretrain_target_mode="n_step" 时使用的步长 n。
-        "demo_critic_pretrain_n_step": 20,
+        "demo_critic_pretrain_n_step": 10,
 
         # warm-up 结束后，是否让 teacher 先和 actor 混合接管，而不是立刻纯 actor。
         "teacher_takeover_enabled": True,
@@ -697,7 +697,7 @@ BASE_EXPERIMENT = {
         # 默认建议先用 "cpu"，让 worker 侧保持最简单、最稳定的本地 CPU rollout。
         # 如果后面要专门做 rollout 推理加速，再改成某张 GPU 或多张 GPU 列表。
         # learner 训练设备仍由下面的 device 单独控制。
-        "rollout_device": "cuda:0",
+        "rollout_device": "cuda:2",
 
         # rollout 推理模式：
         # - "local"       ：每个 worker 自己持有 actor，并在本地前向
@@ -853,8 +853,8 @@ BASE_EXPERIMENT = {
                 "label": "regular__scale_free__erdos_renyi",
                 "portion": 0.40,
                 "train_network_types": ["regular", "small_world", "erdos_renyi","scale_free"],
-                "train_network_type_weights": [0.25, 0.25, 0.25,25],
-                "eval_network_types": ["regular", "small_world", "erdos_renyi"],
+                "train_network_type_weights": [0.25, 0.25, 0.25,0.25],
+                "eval_network_types": ["regular", "small_world", "erdos_renyi","scale_free"],
             },
             {
                 "label": "all_topologies",
