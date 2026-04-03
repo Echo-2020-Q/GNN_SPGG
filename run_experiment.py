@@ -340,7 +340,7 @@ BASE_EXPERIMENT = {
         # 程序内部会按：
         #   total_updates = ceil((warmup_env_steps + total_env_steps) / (num_workers * effective_steps_per_update))
         # 自动换算成 update 次数。
-        "total_env_steps": 30_000_000,#episode需要用总的steps除以episode_length=150
+        "total_env_steps": 50_000_000,#episode需要用总的steps除以episode_length=150
 
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
@@ -673,13 +673,13 @@ BASE_EXPERIMENT = {
         "adaptive_teacher_release_enabled": True,
 
         # online eval return 至少达到 pretrain best quick-eval 的多少比例，才允许 teacher 开始退场。
-        "adaptive_teacher_release_min_return_ratio": 0.90,
+        "adaptive_teacher_release_min_return_ratio": 0.85,
 
         # online actor_bc_val_loss 最多放大到 pretrain best 的多少倍，仍视为稳定。
-        "adaptive_teacher_release_max_actor_bc_val_ratio": 1.20,
+        "adaptive_teacher_release_max_actor_bc_val_ratio": 1.2,
 
         # online critic_val_loss 最多放大到 pretrain best 的多少倍，仍视为稳定。
-        "adaptive_teacher_release_max_critic_val_ratio": 1.20,
+        "adaptive_teacher_release_max_critic_val_ratio": 1.50,
 
         # 连续多少次 online eval 达标后，才真正解锁 teacher 退场。
         "adaptive_teacher_release_required_evals": 3,
