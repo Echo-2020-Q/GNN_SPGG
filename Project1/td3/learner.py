@@ -410,6 +410,19 @@ class GraphTD3Learner:
             raise ValueError("Pretrain batch size must be positive.")
         return resolved
 
+    def _resolve_pretrain_validation_batch_size(self, batch_size: int | None) -> int:
+        if batch_size is not None:
+            resolved = int(batch_size)
+        elif self.config.demo_pretrain_validation_batch_size is not None:
+            resolved = int(self.config.demo_pretrain_validation_batch_size)
+        elif self.config.demo_pretrain_batch_size is not None:
+            resolved = min(int(self.config.demo_pretrain_batch_size), 128)
+        else:
+            resolved = min(int(self.config.batch_size), 128)
+        if resolved <= 0:
+            raise ValueError("Pretrain validation batch size must be positive.")
+        return resolved
+
     def evaluate_actor_bc_on_demo_batch(
         self,
         cpu_batch: TensorReplayBatch,
@@ -421,7 +434,7 @@ class GraphTD3Learner:
                 "actor_bc_val_num_entries": 0.0,
             }
 
-        resolved_batch_size = self._resolve_pretrain_batch_size(batch_size)
+        resolved_batch_size = self._resolve_pretrain_validation_batch_size(batch_size)
         total_squared_error = 0.0
         total_entries = 0
         with torch.no_grad():
@@ -460,7 +473,7 @@ class GraphTD3Learner:
                 "critic_error_std": 0.0,
             }
 
-        resolved_batch_size = self._resolve_pretrain_batch_size(batch_size)
+        resolved_batch_size = self._resolve_pretrain_validation_batch_size(batch_size)
         total_loss_q1 = 0.0
         total_loss_q2 = 0.0
         total_targets = 0

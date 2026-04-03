@@ -608,6 +608,11 @@ BASE_EXPERIMENT = {
         # 设为 None 时，回退到 training.batch_size。
         "demo_pretrain_batch_size": 256,
 
+        # demo 验证阶段的 batch 大小。
+        # 为了避免 validation/quick-check 一次占用过多显存，默认比训练 batch 更小。
+        # 设为 None 时，会自动取 min(demo_pretrain_batch_size, 128)。
+        "demo_pretrain_validation_batch_size": 128,
+
         # demo hold-out 验证集比例。
         # 这些样本不会进入 train replay，只用于 pretrain 阶段的验证与 early stopping。
         "demo_validation_fraction": 0.10,
@@ -640,7 +645,7 @@ BASE_EXPERIMENT = {
 
         # demo critic 预训练使用的目标类型：
         # - "n_step" ：teacher 轨迹自身的纯 n-step return
-        # - "mc"     ：teacher 轨迹自身的整局 Monte Carlo return
+        # - "mc"     ：teacher 轨迹自身的整局 Monte Ca  rlo return
         "demo_critic_pretrain_target_mode": "n_step",
 
         # 当 demo_critic_pretrain_target_mode="n_step" 时使用的步长 n。
@@ -915,7 +920,7 @@ BASE_EXPERIMENT = {
                 "label": "regular__small_world",
                 "portion": 0.15,
                 "train_network_types": ["regular","small_world","erdos_renyi","scale_free"],
-                "train_network_type_weights": [0.3, 0.3,0.2,0.2],
+                "train_network_type_weights": [0.25, 0.25,0.25,0.25],
                 "eval_network_types": ["regular", "small_world","erdos_renyi","scale_free"],
             },
             {
@@ -929,7 +934,7 @@ BASE_EXPERIMENT = {
                 "label": "all_topologies",
                 "portion": 0.45,
                 "train_network_types": ["regular", "scale_free", "erdos_renyi", "small_world"],
-                "train_network_type_weights": [0.2, 0.5, 0.15, 0.15],
+                "train_network_type_weights": [0.25, 0.25, 0.25, 0.25],
                 "eval_network_types": ["regular", "scale_free", "erdos_renyi", "small_world"],
             },
         ],
@@ -1788,6 +1793,7 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         actor_bc_pretrain_updates=training.get("actor_bc_pretrain_updates", 0),
         critic_pretrain_updates=training.get("critic_pretrain_updates", 0),
         demo_pretrain_batch_size=training.get("demo_pretrain_batch_size"),
+        demo_pretrain_validation_batch_size=training.get("demo_pretrain_validation_batch_size"),
         demo_validation_fraction=training.get("demo_validation_fraction", 0.10),
         demo_pretrain_eval_interval=training.get("demo_pretrain_eval_interval", 200),
         demo_pretrain_patience=training.get("demo_pretrain_patience", 5),
@@ -2481,6 +2487,16 @@ def run_external_demo_collection(
         "demo_train_replay_size_after_split": float(replay_buffer.demo_size()),
         "demo_val_replay_size_after_split": float(sum(len(batch) for batch in validation_batches)),
         "demo_validation_fraction": float(trainer_config.demo_validation_fraction),
+        "demo_pretrain_validation_batch_size": float(
+            trainer_config.demo_pretrain_validation_batch_size
+            if trainer_config.demo_pretrain_validation_batch_size is not None
+            else min(
+                trainer_config.demo_pretrain_batch_size
+                if trainer_config.demo_pretrain_batch_size is not None
+                else trainer_config.batch_size,
+                128,
+            )
+        ),
         "demo_pretrain_eval_interval": float(trainer_config.demo_pretrain_eval_interval),
         "demo_pretrain_patience": float(trainer_config.demo_pretrain_patience),
         "demo_pretrain_min_relative_improvement": float(
@@ -3856,7 +3872,7 @@ def run_gnn_training_mode(
                 )
             )
             print(
-                "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, runtime={4}, actor_bc_updates={5}, critic_pretrain_updates={6}, critic_target={7}, n_step={8}, batch_size={9}, val_frac={10}, eval_interval={11}, patience={12}, min_improve={13}, dataset_path={14}, save_ckpt={15}, ckpt_name={16}, stop_after={17}".format(
+                "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, runtime={4}, actor_bc_updates={5}, critic_pretrain_updates={6}, critic_target={7}, n_step={8}, batch_size={9}, val_batch_size={10}, val_frac={11}, eval_interval={12}, patience={13}, min_improve={14}, dataset_path={15}, save_ckpt={16}, ckpt_name={17}, stop_after={18}".format(
                     trainer_config.demo_collection_env_steps,
                     trainer_config.demo_collection_behavior_source,
                     trainer_config.demo_collection_use_domain_randomization,
@@ -3869,6 +3885,14 @@ def run_gnn_training_mode(
                     trainer_config.demo_pretrain_batch_size
                     if trainer_config.demo_pretrain_batch_size is not None
                     else trainer_config.batch_size,
+                    trainer_config.demo_pretrain_validation_batch_size
+                    if trainer_config.demo_pretrain_validation_batch_size is not None
+                    else min(
+                        trainer_config.demo_pretrain_batch_size
+                        if trainer_config.demo_pretrain_batch_size is not None
+                        else trainer_config.batch_size,
+                        128,
+                    ),
                     trainer_config.demo_validation_fraction,
                     trainer_config.demo_pretrain_eval_interval,
                     trainer_config.demo_pretrain_patience,
