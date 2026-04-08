@@ -390,6 +390,10 @@ class DomainRandomizationConfig:
     enabled: bool = False
     network_types: tuple[str, ...] = ("regular",)
     network_type_weights: tuple[float, ...] | None = None
+    fixed_graph_bank_enabled: bool = False
+    fixed_graph_bank_size_per_type: int = 0
+    fixed_graph_bank_seed: int = 0
+    fixed_graph_bank_sampling: str = "uniform"
     num_nodes_choices: tuple[int, ...] = (100,)
     regular_degree_choices: tuple[int, ...] = (4,)
     er_mean_degree_choices: tuple[float, ...] = (4.0,)
@@ -412,6 +416,14 @@ class DomainRandomizationConfig:
                 raise ValueError("network_type_weights must be non-negative.")
             if sum(self.network_type_weights) <= 0.0:
                 raise ValueError("network_type_weights must sum to a positive value.")
+        if not isinstance(self.fixed_graph_bank_enabled, bool):
+            raise ValueError("fixed_graph_bank_enabled must be a bool.")
+        if self.fixed_graph_bank_size_per_type < 0:
+            raise ValueError("fixed_graph_bank_size_per_type must be non-negative.")
+        if self.fixed_graph_bank_enabled and self.fixed_graph_bank_size_per_type <= 0:
+            raise ValueError("fixed_graph_bank_size_per_type must be positive when fixed_graph_bank_enabled is True.")
+        if self.fixed_graph_bank_sampling not in {"uniform", "round_robin"}:
+            raise ValueError("fixed_graph_bank_sampling must be one of {'uniform', 'round_robin'}.")
 
 
 @dataclass

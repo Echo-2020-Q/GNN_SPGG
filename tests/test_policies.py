@@ -194,3 +194,44 @@ class GNNPolicyTests(unittest.TestCase):
         self.assertTrue(torch.allclose(sampled.allocation_matrix.sum(dim=1), torch.ones(4), atol=1e-5))
         self.assertTrue(torch.isfinite(sampled.log_prob))
         self.assertTrue(torch.isfinite(sampled.entropy))
+
+    def test_dirichlet_policy_batch_interfaces_are_valid(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(alpha=0.0, r=0.5, p_max=5.0, beta=1.0, episode_length=2),
+            make_grid_graph(2, 2),
+        )
+        observation = env.reset(seed=0)
+        batched_observation = {
+            key: torch.stack([torch.as_tensor(value), torch.as_tensor(value)], dim=0)
+            for key, value in observation.items()
+        }
+
+        policy = GNNAllocationPolicy(
+            GNNPolicyConfig(
+                hidden_dim=16,
+                num_message_passing_layers=2,
+                action_distribution="dirichlet",
+            )
+        )
+
+        sampled = policy.sample_action_tensor_batch(batched_observation)
+        evaluated = policy.evaluate_action_tensor_batch(batched_observation, sampled.allocation_matrix)
+        local_mask = torch.stack(
+            [
+                torch.as_tensor(observation["local_mask"], dtype=torch.bool),
+                torch.as_tensor(observation["local_mask"], dtype=torch.bool),
+            ],
+            dim=0,
+        )
+
+        self.assertEqual(tuple(sampled.allocation_matrix.shape), (2, 4, 4))
+        self.assertTrue(torch.allclose(sampled.allocation_matrix[~local_mask], torch.zeros_like(sampled.allocation_matrix[~local_mask])))
+        self.assertTrue(torch.allclose(sampled.allocation_matrix.sum(dim=-1), torch.ones((2, 4)), atol=1e-5))
+        self.assertIsNotNone(sampled.log_prob)
+        self.assertIsNotNone(sampled.entropy)
+        self.assertIsNotNone(sampled.concentration)
+        self.assertTrue(torch.isfinite(sampled.log_prob).all())
+        self.assertTrue(torch.isfinite(sampled.entropy).all())
+        self.assertTrue(torch.isfinite(evaluated.log_prob).all())
+        self.assertTrue(torch.isfinite(evaluated.entropy).all())
+        self.assertEqual(tuple(evaluated.value.shape), (2,))

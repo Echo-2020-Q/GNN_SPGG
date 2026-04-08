@@ -5,6 +5,7 @@ from typing import Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
+from torch.distributions import Dirichlet
 from torch import Tensor, nn
 
 from Project1.env import Observation
@@ -18,6 +19,8 @@ class GNNPolicyConfig:
     score_hidden_dim: int | None = None
     critic_hidden_dim: int | None = None
     temperature: float = 1.0
+    action_distribution: str = "softmax"
+    dirichlet_alpha_floor: float = 1e-3
 
     def __post_init__(self) -> None:
         if self.hidden_dim <= 0:
@@ -38,6 +41,10 @@ class GNNPolicyConfig:
             raise ValueError("critic_hidden_dim must be positive.")
         if self.temperature <= 0.0:
             raise ValueError("temperature must be positive.")
+        if self.action_distribution not in {"softmax", "dirichlet"}:
+            raise ValueError("action_distribution must be one of {'softmax', 'dirichlet'}.")
+        if self.dirichlet_alpha_floor <= 0.0:
+            raise ValueError("dirichlet_alpha_floor must be positive.")
 
 
 @dataclass(frozen=True)
@@ -182,6 +189,9 @@ class BatchedPolicyOutput:
     incoming_resources: Tensor
     value: Tensor
     logits: Tensor | None = None
+    log_prob: Tensor | None = None
+    entropy: Tensor | None = None
+    concentration: Tensor | None = None
 
 
 
@@ -821,14 +831,21 @@ class ScoreReadout(nn.Module):
 
 
 class AllocationHead(nn.Module):
-    """Applies ego-local softmax to obtain alpha_ij and x_ij = P_i * alpha_ij."""
+    """Builds row-wise allocation parameters for either softmax or Dirichlet policies."""
 
-    def __init__(self, temperature: float):
+    def __init__(self, temperature: float, dirichlet_alpha_floor: float):
         super().__init__()
         self.temperature = float(temperature)
+        self.dirichlet_alpha_floor = float(dirichlet_alpha_floor)
 
     def logits(self, scores: Tensor) -> Tensor:
         return scores / self.temperature
+
+    def concentration(self, scores: Tensor, valid_mask: Tensor | None = None) -> Tensor:
+        concentration = F.softplus(self.logits(scores)) + self.dirichlet_alpha_floor
+        if valid_mask is not None:
+            concentration = torch.where(valid_mask, concentration, torch.zeros_like(concentration))
+        return concentration
 
     def forward(self, scores: Tensor, pool_value: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         logits = self.logits(scores)
@@ -880,7 +897,10 @@ class GNNAllocationPolicy(nn.Module):
             local_hidden_dim=config.local_hidden_dim,
             hidden_dim=config.score_hidden_dim,
         )
-        self.allocation_head = AllocationHead(config.temperature)
+        self.allocation_head = AllocationHead(
+            config.temperature,
+            dirichlet_alpha_floor=config.dirichlet_alpha_floor,
+        )
         self.critic = GlobalCritic(
             global_hidden_dim=config.hidden_dim,
             hidden_dim=config.critic_hidden_dim,
@@ -933,15 +953,14 @@ class GNNAllocationPolicy(nn.Module):
 
         return score_matrix
 
-    def _forward_batched_backbone_output(self, backbone_output: BackboneOutput) -> BatchedPolicyOutput:
+    def _compute_local_policy_inputs(
+        self,
+        backbone_output: BackboneOutput,
+    ) -> tuple[BackboneOutput, FlattenedBatchedEgoSubgraphs, Tensor, Tensor, Tensor]:
         backbone_output = ensure_batched_backbone_output(backbone_output)
         batch_size, num_nodes = backbone_output.node_embeddings.shape[:2]
-        dtype = backbone_output.node_embeddings.dtype
         device = backbone_output.node_embeddings.device
-        masked_score_value = torch.finfo(dtype).min
-        allocation_matrix = torch.zeros((batch_size, num_nodes, num_nodes), dtype=dtype, device=device)
-        transferred_resources = torch.zeros_like(allocation_matrix)
-        score_matrix = torch.full((batch_size, num_nodes, num_nodes), masked_score_value, dtype=dtype, device=device)
+        masked_score_value = torch.finfo(backbone_output.node_embeddings.dtype).min
         ego_subgraph = extract_batched_center_chunk_ego_subgraphs(
             backbone_output,
             torch.arange(num_nodes, device=device, dtype=torch.int64),
@@ -956,10 +975,89 @@ class GNNAllocationPolicy(nn.Module):
             local_scores,
             torch.full_like(local_scores, masked_score_value),
         )
-        local_logits, local_allocation, local_transferred = self.allocation_head(
-            local_scores,
-            ego_subgraph.pool_value,
-        )
+        local_logits = self.allocation_head.logits(local_scores)
+        local_concentration = self.allocation_head.concentration(local_scores, valid_local_nodes)
+        return backbone_output, ego_subgraph, valid_local_nodes, local_logits, local_concentration
+
+    @staticmethod
+    def _normalize_local_simplex(local_allocation: Tensor, valid_local_nodes: Tensor, eps: float = 1e-8) -> Tensor:
+        masked_allocation = torch.where(valid_local_nodes, local_allocation, torch.zeros_like(local_allocation))
+        safe_allocation = torch.clamp(masked_allocation, min=eps)
+        safe_allocation = torch.where(valid_local_nodes, safe_allocation, torch.zeros_like(safe_allocation))
+        normalizer = safe_allocation.sum(dim=-1, keepdim=True).clamp_min(eps)
+        return safe_allocation / normalizer
+
+    def _sample_dirichlet_local_allocations(
+        self,
+        local_concentration: Tensor,
+        valid_local_nodes: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        local_allocation = torch.zeros_like(local_concentration)
+        row_log_prob = local_concentration.new_zeros(local_concentration.size(0))
+        row_entropy = local_concentration.new_zeros(local_concentration.size(0))
+        for row_index in range(local_concentration.size(0)):
+            valid_mask = valid_local_nodes[row_index]
+            valid_count = int(valid_mask.sum().item())
+            if valid_count <= 0:
+                raise RuntimeError("Each local policy row must contain at least one valid action.")
+            if valid_count == 1:
+                local_allocation[row_index, valid_mask] = 1.0
+                continue
+            distribution = Dirichlet(local_concentration[row_index, valid_mask])
+            sample = distribution.rsample()
+            local_allocation[row_index, valid_mask] = sample
+            row_log_prob[row_index] = distribution.log_prob(sample)
+            row_entropy[row_index] = distribution.entropy()
+        return local_allocation, row_log_prob, row_entropy
+
+    def _evaluate_dirichlet_local_allocations(
+        self,
+        local_concentration: Tensor,
+        valid_local_nodes: Tensor,
+        local_allocation: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        normalized_allocation = self._normalize_local_simplex(local_allocation, valid_local_nodes)
+        row_log_prob = local_concentration.new_zeros(local_concentration.size(0))
+        row_entropy = local_concentration.new_zeros(local_concentration.size(0))
+        for row_index in range(local_concentration.size(0)):
+            valid_mask = valid_local_nodes[row_index]
+            valid_count = int(valid_mask.sum().item())
+            if valid_count <= 0:
+                raise RuntimeError("Each local policy row must contain at least one valid action.")
+            if valid_count == 1:
+                normalized_allocation[row_index, valid_mask] = 1.0
+                continue
+            distribution = Dirichlet(local_concentration[row_index, valid_mask])
+            action = normalized_allocation[row_index, valid_mask]
+            row_log_prob[row_index] = distribution.log_prob(action)
+            row_entropy[row_index] = distribution.entropy()
+        return normalized_allocation, row_log_prob, row_entropy
+
+    def _assemble_batched_output(
+        self,
+        backbone_output: BackboneOutput,
+        ego_subgraph: FlattenedBatchedEgoSubgraphs,
+        valid_local_nodes: Tensor,
+        local_logits: Tensor,
+        local_concentration: Tensor,
+        local_allocation: Tensor,
+        row_log_prob: Tensor | None = None,
+        row_entropy: Tensor | None = None,
+    ) -> BatchedPolicyOutput:
+        backbone_output = ensure_batched_backbone_output(backbone_output)
+        batch_size, num_nodes = backbone_output.node_embeddings.shape[:2]
+        dtype = backbone_output.node_embeddings.dtype
+        device = backbone_output.node_embeddings.device
+        masked_score_value = torch.finfo(dtype).min
+        allocation_matrix = torch.zeros((batch_size, num_nodes, num_nodes), dtype=dtype, device=device)
+        transferred_resources = torch.zeros_like(allocation_matrix)
+        score_matrix = torch.full((batch_size, num_nodes, num_nodes), masked_score_value, dtype=dtype, device=device)
+        concentration_matrix = torch.zeros((batch_size, num_nodes, num_nodes), dtype=dtype, device=device)
+
+        if ego_subgraph.pool_value.ndim > 0:
+            local_transferred = local_allocation * ego_subgraph.pool_value.unsqueeze(-1)
+        else:
+            local_transferred = local_allocation * ego_subgraph.pool_value
 
         scatter_batch_indices = ego_subgraph.batch_indices.unsqueeze(1).expand_as(ego_subgraph.member_indices)
         scatter_center_indices = ego_subgraph.center_indices.unsqueeze(1).expand_as(ego_subgraph.member_indices)
@@ -979,15 +1077,74 @@ class GNNAllocationPolicy(nn.Module):
             scatter_center_indices[valid_positions],
             ego_subgraph.member_indices[valid_positions],
         ] = local_logits[valid_positions]
+        concentration_matrix[
+            scatter_batch_indices[valid_positions],
+            scatter_center_indices[valid_positions],
+            ego_subgraph.member_indices[valid_positions],
+        ] = local_concentration[valid_positions]
 
         value = self.critic(backbone_output.global_embedding)
         incoming_resources = transferred_resources.sum(dim=1)
+        log_prob: Tensor | None = None
+        entropy: Tensor | None = None
+        if row_log_prob is not None:
+            log_prob = value.new_zeros(batch_size)
+            log_prob.scatter_add_(0, ego_subgraph.batch_indices, row_log_prob.to(dtype=value.dtype))
+        if row_entropy is not None:
+            entropy = value.new_zeros(batch_size)
+            entropy.scatter_add_(0, ego_subgraph.batch_indices, row_entropy.to(dtype=value.dtype))
         return BatchedPolicyOutput(
             allocation_matrix=allocation_matrix,
             transferred_resources=transferred_resources,
             incoming_resources=incoming_resources,
             value=value,
             logits=score_matrix,
+            log_prob=log_prob,
+            entropy=entropy,
+            concentration=concentration_matrix,
+        )
+
+    def _forward_batched_backbone_output(self, backbone_output: BackboneOutput) -> BatchedPolicyOutput:
+        backbone_output, ego_subgraph, valid_local_nodes, local_logits, local_concentration = self._compute_local_policy_inputs(
+            backbone_output
+        )
+        if self.config.action_distribution == "dirichlet":
+            local_allocation = local_concentration / local_concentration.sum(dim=-1, keepdim=True).clamp_min(
+                self.config.dirichlet_alpha_floor
+            )
+        else:
+            local_allocation = torch.softmax(local_logits, dim=-1)
+        return self._assemble_batched_output(
+            backbone_output,
+            ego_subgraph,
+            valid_local_nodes,
+            local_logits,
+            local_concentration,
+            local_allocation,
+        )
+
+    def _sample_batched_backbone_output(self, backbone_output: BackboneOutput) -> BatchedPolicyOutput:
+        backbone_output, ego_subgraph, valid_local_nodes, local_logits, local_concentration = self._compute_local_policy_inputs(
+            backbone_output
+        )
+        if self.config.action_distribution == "dirichlet":
+            local_allocation, row_log_prob, row_entropy = self._sample_dirichlet_local_allocations(
+                local_concentration,
+                valid_local_nodes,
+            )
+        else:
+            local_allocation = torch.softmax(local_logits, dim=-1)
+            row_log_prob = local_concentration.new_zeros(local_concentration.size(0))
+            row_entropy = local_concentration.new_zeros(local_concentration.size(0))
+        return self._assemble_batched_output(
+            backbone_output,
+            ego_subgraph,
+            valid_local_nodes,
+            local_logits,
+            local_concentration,
+            local_allocation,
+            row_log_prob=row_log_prob,
+            row_entropy=row_entropy,
         )
 
     def _forward_batched_graph_input(self, graph_input: GraphTensorInput) -> BatchedPolicyOutput:
@@ -1035,10 +1192,10 @@ class GNNAllocationPolicy(nn.Module):
             transferred_resources=batched_output.transferred_resources[0],
             incoming_resources=batched_output.incoming_resources[0],
             value=batched_output.value[0],
-            log_prob=zero_scalar,
-            entropy=zero_scalar,
+            log_prob=zero_scalar if batched_output.log_prob is None else batched_output.log_prob[0],
+            entropy=zero_scalar if batched_output.entropy is None else batched_output.entropy[0],
             logits=batched_output.logits[0] if batched_output.logits is not None else None,
-            concentration=None,
+            concentration=batched_output.concentration[0] if batched_output.concentration is not None else None,
             global_embedding=backbone_output.global_embedding,
             node_embeddings=backbone_output.node_embeddings,
             edge_embeddings=backbone_output.edge_embeddings,
@@ -1062,10 +1219,12 @@ class GNNAllocationPolicy(nn.Module):
                     transferred_resources=batched_output.transferred_resources[batch_index],
                     incoming_resources=batched_output.incoming_resources[batch_index],
                     value=batched_output.value[batch_index],
-                    log_prob=zero_scalar,
-                    entropy=zero_scalar,
+                    log_prob=zero_scalar if batched_output.log_prob is None else batched_output.log_prob[batch_index],
+                    entropy=zero_scalar if batched_output.entropy is None else batched_output.entropy[batch_index],
                     logits=batched_output.logits[batch_index] if batched_output.logits is not None else None,
-                    concentration=None,
+                    concentration=(
+                        batched_output.concentration[batch_index] if batched_output.concentration is not None else None
+                    ),
                     global_embedding=None,
                     node_embeddings=None,
                     edge_embeddings=None,
@@ -1078,6 +1237,70 @@ class GNNAllocationPolicy(nn.Module):
         backbone_output = self.encode_graph(graph_input)
         return self.critic(backbone_output.global_embedding)
 
+    def sample_action_tensor_batch(self, observations: Mapping[str, Tensor]) -> BatchedPolicyOutput:
+        device = next(self.parameters()).device
+        graph_input = self.graph_builder.build_tensor_batch(observations, device=device)
+        return self._sample_batched_backbone_output(self.encode_graph_batch(graph_input))
+
+    def evaluate_action_tensor_batch(
+        self,
+        observations: Mapping[str, Tensor],
+        allocation_matrix: Tensor,
+    ) -> BatchedPolicyOutput:
+        device = next(self.parameters()).device
+        graph_input = self.graph_builder.build_tensor_batch(observations, device=device)
+        action_tensor = torch.as_tensor(allocation_matrix, dtype=torch.float32, device=device)
+        backbone_output, ego_subgraph, valid_local_nodes, local_logits, local_concentration = self._compute_local_policy_inputs(
+            self.encode_graph_batch(graph_input)
+        )
+        gathered_allocation = action_tensor[
+            ego_subgraph.batch_indices.unsqueeze(1).expand_as(ego_subgraph.member_indices),
+            ego_subgraph.center_indices.unsqueeze(1).expand_as(ego_subgraph.member_indices),
+            ego_subgraph.member_indices,
+        ]
+        if self.config.action_distribution != "dirichlet":
+            zero_rows = local_concentration.new_zeros(local_concentration.size(0))
+            return self._assemble_batched_output(
+                backbone_output,
+                ego_subgraph,
+                valid_local_nodes,
+                local_logits,
+                local_concentration,
+                self._normalize_local_simplex(gathered_allocation, valid_local_nodes),
+                row_log_prob=zero_rows,
+                row_entropy=zero_rows,
+            )
+        normalized_allocation, row_log_prob, row_entropy = self._evaluate_dirichlet_local_allocations(
+            local_concentration,
+            valid_local_nodes,
+            gathered_allocation,
+        )
+        return self._assemble_batched_output(
+            backbone_output,
+            ego_subgraph,
+            valid_local_nodes,
+            local_logits,
+            local_concentration,
+            normalized_allocation,
+            row_log_prob=row_log_prob,
+            row_entropy=row_entropy,
+        )
+
     def sample_action(self, observation: Observation) -> PolicyOutput:
-        # The current actor is deterministic by construction.
-        return self.forward(observation)
+        graph_input = self.build_graph_input(observation)
+        backbone_output = self.encode_graph(graph_input)
+        batched = self._sample_batched_backbone_output(backbone_output)
+        zero_scalar = batched.value[0].new_zeros(())
+        return PolicyOutput(
+            allocation_matrix=batched.allocation_matrix[0],
+            transferred_resources=batched.transferred_resources[0],
+            incoming_resources=batched.incoming_resources[0],
+            value=batched.value[0],
+            log_prob=zero_scalar if batched.log_prob is None else batched.log_prob[0],
+            entropy=zero_scalar if batched.entropy is None else batched.entropy[0],
+            logits=batched.logits[0] if batched.logits is not None else None,
+            concentration=batched.concentration[0] if batched.concentration is not None else None,
+            global_embedding=None,
+            node_embeddings=None,
+            edge_embeddings=None,
+        )

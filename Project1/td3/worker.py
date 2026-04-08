@@ -44,6 +44,10 @@ def _clone_graph_from_env(env: SPGGEnv) -> dict[int, list[int]]:
     return {node: list(neighbors) for node, neighbors in enumerate(env.graph.neighbors)}
 
 
+def _clone_graph_dict(graph: Mapping[int, list[int] | tuple[int, ...]]) -> dict[int, list[int]]:
+    return {int(node): [int(neighbor) for neighbor in neighbors] for node, neighbors in graph.items()}
+
+
 def _copy_module_state_to_cpu(module: nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
 
@@ -392,8 +396,12 @@ class RandomizedEnvFactory:
         randomization: DomainRandomizationConfig | None = None,
     ):
         self.base_config = base_config
-        self.base_graph = {node: list(neighbors) for node, neighbors in base_graph.items()}
+        self.base_graph = _clone_graph_dict(base_graph)
         self.randomization = randomization or DomainRandomizationConfig(enabled=False)
+        self._fixed_graph_bank = self._build_fixed_graph_bank()
+        self._fixed_graph_bank_round_robin_positions = {
+            network_type: 0 for network_type in self._fixed_graph_bank
+        }
 
     @classmethod
     def from_env(
@@ -417,15 +425,61 @@ class RandomizedEnvFactory:
             weight_array = np.asarray(self.randomization.network_type_weights, dtype=np.float64)
             network_probabilities = weight_array / weight_array.sum()
         network_type = str(rng.choice(self.randomization.network_types, p=network_probabilities))
-        num_nodes = int(rng.choice(self.randomization.num_nodes_choices))
-        graph = self._sample_graph(network_type, num_nodes, rng)
+        bank_entry = self._sample_graph_bank_entry(network_type, rng)
+        graph_bank_index = None
+        if bank_entry is not None:
+            graph_bank_index, num_nodes, graph = bank_entry
+        else:
+            num_nodes = int(rng.choice(self.randomization.num_nodes_choices))
+            graph = self._sample_graph(network_type, num_nodes, rng)
         config = self._sample_config(rng, num_nodes=num_nodes)
         env = SPGGEnv(config, graph)
         metadata = {
             "network_type": network_type,
             "num_nodes": num_nodes,
         }
+        if graph_bank_index is not None:
+            metadata["graph_bank_index"] = int(graph_bank_index)
         return env, metadata
+
+    def _fixed_graph_bank_enabled(self) -> bool:
+        return bool(self.randomization.enabled) and bool(self.randomization.fixed_graph_bank_enabled)
+
+    def _build_fixed_graph_bank(self) -> dict[str, tuple[tuple[int, dict[int, list[int]]], ...]]:
+        if not self._fixed_graph_bank_enabled():
+            return {}
+
+        bank_size = int(self.randomization.fixed_graph_bank_size_per_type)
+        seed_base = int(self.randomization.fixed_graph_bank_seed)
+        graph_bank: dict[str, tuple[tuple[int, dict[int, list[int]]], ...]] = {}
+        for network_type in self.randomization.network_types:
+            type_seed = seed_base + sum((index + 1) * ord(char) for index, char in enumerate(str(network_type)))
+            type_rng = np.random.default_rng(type_seed)
+            entries: list[tuple[int, dict[int, list[int]]]] = []
+            for _ in range(bank_size):
+                num_nodes = int(type_rng.choice(self.randomization.num_nodes_choices))
+                entries.append((num_nodes, self._sample_graph(str(network_type), num_nodes, type_rng)))
+            graph_bank[str(network_type)] = tuple(entries)
+        return graph_bank
+
+    def _sample_graph_bank_entry(
+        self,
+        network_type: str,
+        rng: np.random.Generator,
+    ) -> tuple[int, int, dict[int, list[int]]] | None:
+        entries = self._fixed_graph_bank.get(str(network_type))
+        if not entries:
+            return None
+
+        if self.randomization.fixed_graph_bank_sampling == "round_robin":
+            current_position = int(self._fixed_graph_bank_round_robin_positions.get(str(network_type), 0))
+            bank_index = current_position % len(entries)
+            self._fixed_graph_bank_round_robin_positions[str(network_type)] = (bank_index + 1) % len(entries)
+        else:
+            bank_index = int(rng.integers(0, len(entries)))
+
+        num_nodes, graph = entries[bank_index]
+        return bank_index, int(num_nodes), _clone_graph_dict(graph)
 
     def _sample_graph(self, network_type: str, num_nodes: int, rng: np.random.Generator) -> dict[int, list[int]]:
         seed = int(rng.integers(0, 2**31 - 1))

@@ -12,7 +12,7 @@ if NUMPY_AVAILABLE and TORCH_AVAILABLE:
 
     from Project1.env import RewardConfig, SPGGConfig, SPGGEnv, make_grid_graph
     from Project1.policies.gnn_rl import GNNAllocationPolicy, GNNPolicyConfig
-    from Project1.td3.config import GraphTD3Config, WorkerConfig
+    from Project1.td3.config import DomainRandomizationConfig, GraphTD3Config, WorkerConfig
     from Project1.td3.exploration import LogitSpaceExplorer
     from Project1.td3.worker import RandomizedEnvFactory, RolloutWorker
 
@@ -136,3 +136,74 @@ class RolloutWorkerTeacherTests(unittest.TestCase):
         self.assertTrue(np.all(result.replay_batch.pool_power_demo_flag.detach().cpu().numpy()))
         self.assertGreater(result.metrics["teacher_takeover_prob_mean"], 0.0)
         self.assertGreater(result.metrics["behavior_source_counts"].get("pool_power_mix", 0), 0)
+
+
+@unittest.skipUnless(NUMPY_AVAILABLE and TORCH_AVAILABLE, "numpy and torch are required for worker tests")
+class RandomizedEnvFactoryFixedGraphBankTests(unittest.TestCase):
+    def _make_base_env(self) -> SPGGEnv:
+        return SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.5,
+                p_max=5.0,
+                beta=1.0,
+                episode_length=4,
+                reward=RewardConfig(lambda_payoff=1.0, lambda_cooperation=0.5, lambda_gini=0.1),
+            ),
+            make_grid_graph(2, 2),
+        )
+
+    @staticmethod
+    def _graph_signature(env: SPGGEnv) -> tuple[tuple[int, tuple[int, ...]], ...]:
+        return tuple((node, tuple(neighbors)) for node, neighbors in enumerate(env.graph.neighbors))
+
+    def test_fixed_graph_bank_uniform_uses_only_k_graphs_per_topology(self) -> None:
+        base_env = self._make_base_env()
+        for network_type in ("regular", "erdos_renyi", "small_world", "scale_free"):
+            factory = RandomizedEnvFactory.from_env(
+                base_env,
+                randomization=DomainRandomizationConfig(
+                    enabled=True,
+                    network_types=(network_type,),
+                    fixed_graph_bank_enabled=True,
+                    fixed_graph_bank_size_per_type=2,
+                    fixed_graph_bank_seed=12345,
+                    fixed_graph_bank_sampling="uniform",
+                    num_nodes_choices=(12,),
+                    regular_degree_choices=(4,),
+                    er_mean_degree_choices=(4.0,),
+                    ws_degree_choices=(4,),
+                    ws_rewiring_choices=(0.10,),
+                    ba_attachment_choices=(2,),
+                ),
+            )
+            rng = np.random.default_rng(0)
+            seen_indices: set[int] = set()
+            seen_graphs: set[tuple[tuple[int, tuple[int, ...]], ...]] = set()
+            for _ in range(50):
+                sampled_env, metadata = factory.sample_environment(rng)
+                seen_indices.add(int(metadata["graph_bank_index"]))
+                seen_graphs.add(self._graph_signature(sampled_env))
+            self.assertLessEqual(len(seen_graphs), 2)
+            self.assertEqual(seen_indices, {0, 1})
+
+    def test_fixed_graph_bank_round_robin_cycles_graph_indices(self) -> None:
+        factory = RandomizedEnvFactory.from_env(
+            self._make_base_env(),
+            randomization=DomainRandomizationConfig(
+                enabled=True,
+                network_types=("regular",),
+                fixed_graph_bank_enabled=True,
+                fixed_graph_bank_size_per_type=3,
+                fixed_graph_bank_seed=7,
+                fixed_graph_bank_sampling="round_robin",
+                num_nodes_choices=(12,),
+                regular_degree_choices=(4,),
+            ),
+        )
+        rng = np.random.default_rng(0)
+        sampled_indices = []
+        for _ in range(7):
+            _, metadata = factory.sample_environment(rng)
+            sampled_indices.append(int(metadata["graph_bank_index"]))
+        self.assertEqual(sampled_indices, [0, 1, 2, 0, 1, 2, 0])

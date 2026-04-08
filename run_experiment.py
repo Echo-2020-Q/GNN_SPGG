@@ -329,12 +329,21 @@ BASE_EXPERIMENT = {
         # 当前已真实接入 actor 的局部 softmax：alpha_i = softmax(score_i / temperature)。
         # 越小分配越尖锐，越大分配越平滑。
         "temperature": 1,
+
+        # Dirichlet policy 的 concentration 下界。
+        # 仅当 training.algo == "ppo" 时使用。
+        "dirichlet_alpha_floor": 1e-3,
     },
 
     # ---------------------------
     # 训练参数
     # ---------------------------
     "training": {
+        # 训练算法：
+        # - "td3"：保留现有 off-policy Graph-TD3 路径
+        # - "ppo"：新的 on-policy Graph-PPO 路径
+        "algo": "td3",
+
         # 训练总环境步数（不含 warm-up）。
         # 这是推荐直接调的“训练阶段全局总步数”入口，单位与 warmup / eval_interval 保持一致。
         # 程序内部会按：
@@ -369,6 +378,40 @@ BASE_EXPERIMENT = {
 
         # 折扣因子 gamma。
         "gamma": 0.99,
+
+        # PPO rollout horizon。
+        # 当 training.algo == "ppo" 时，会覆盖 steps_per_update。
+        "ppo_rollout_horizon": 256,
+
+        # PPO 每次 rollout 后的优化 epoch 数。
+        "ppo_update_epochs": 4,
+
+        # PPO minibatch 大小。
+        "ppo_minibatch_size": 256,
+
+        # PPO clipped objective 的裁剪系数。
+        "ppo_clip_ratio": 0.2,
+
+        # PPO value loss 权重。
+        "ppo_value_coef": 0.5,
+
+        # PPO entropy bonus 权重。
+        "ppo_entropy_coef": 1e-3,
+
+        # PPO GAE-Lambda 参数。
+        "ppo_gae_lambda": 0.95,
+
+        # PPO 梯度裁剪阈值。
+        "ppo_max_grad_norm": 0.5,
+
+        # PPO 近似 KL 早停阈值。
+        "ppo_target_kl": 0.03,
+
+        # PPO 是否启用 reward normalization。
+        "ppo_reward_normalization": False,
+
+        # PPO 是否启用 advantage normalization。
+        "ppo_advantage_normalization": True,
 
         # 共享学习率。
         # 如果 actor_lr / critic_lr 为 None，就回退到这里。
@@ -641,7 +684,7 @@ BASE_EXPERIMENT = {
         "demo_pretrain_checkpoint_name": "demo_pretrained.pt",
 
         # 是否在 demo pretrain 完成并保存 checkpoint 后直接退出，不进入 online training。
-        "stop_after_demo_pretrain": False,
+        "stop_after_demo_pretrain": True,
 
         # demo critic 预训练使用的目标类型：
         # - "n_step" ：teacher 轨迹自身的纯 n-step return
@@ -817,6 +860,22 @@ BASE_EXPERIMENT = {
         # 与上面 network_types 一一对应的采样权重。
         # 设为 None 时，默认对这些网络类型均匀采样。
         "network_type_weights": None,
+
+        # 是否为每种拓扑预生成固定的 k 张图，并在训练 / demo collection 时只从这组图里抽样。
+        # False: 每次 reset 都按随机 seed 重新生成图。
+        # True : 每种 network_type 都先固定一组图，后续只在这组图内抽取。
+        "fixed_graph_bank_enabled": True,
+
+        # 当 fixed_graph_bank_enabled=True 时，每种拓扑预生成多少张固定图。
+        "fixed_graph_bank_size_per_type": 10,
+
+        # 固定图库的随机种子。建议固定，便于复现实验。
+        "fixed_graph_bank_seed": 666,
+
+        # 固定图库的取样方式：
+        # - "uniform"     : 每次从该拓扑的固定图库里均匀随机抽一张
+        # - "round_robin" : 按顺序循环取图
+        "fixed_graph_bank_sampling": "uniform",
 
         # 允许采样的节点数集合。
         "num_nodes_choices": [20],
@@ -1197,6 +1256,52 @@ def deep_update(base: Dict[str, Any], overrides: Mapping[str, Any]) -> Dict[str,
         else:
             base[key] = value
     return base
+
+
+PPO_BASELINE_EXPERIMENT = deep_update(
+    deepcopy(BASE_EXPERIMENT),
+    {
+        "experiment_name": "ppo_baseline_regular20_fermi",
+        "dynamics": {
+            "strategy_update_rule": "fermi",
+        },
+        "training": {
+            "algo": "ppo",
+            "warmup_env_steps": 0,
+            "steps_per_update": 256,
+            "ppo_rollout_horizon": 256,
+            "ppo_update_epochs": 4,
+            "ppo_minibatch_size": 256,
+            "ppo_clip_ratio": 0.2,
+            "ppo_value_coef": 0.5,
+            "ppo_entropy_coef": 1e-3,
+            "ppo_gae_lambda": 0.95,
+            "ppo_max_grad_norm": 0.5,
+            "ppo_target_kl": 0.03,
+            "ppo_reward_normalization": False,
+            "ppo_advantage_normalization": True,
+            "num_workers": 1,
+            "num_envs_per_worker": 1,
+            "rollout_device": "cpu",
+            "rollout_inference_mode": "local",
+            "overlap_rollout_and_update": False,
+            "demo_pretrain_enabled": False,
+            "teacher_takeover_enabled": False,
+            "adaptive_teacher_release_enabled": False,
+            "save_demo_pretrain_checkpoint": False,
+            "stop_after_demo_pretrain": False,
+        },
+        "domain_randomization": {
+            "enabled": False,
+        },
+        "curriculum": {
+            "enabled": False,
+        },
+        "evaluation": {
+            "use_custom_env_families": False,
+        },
+    },
+)
 
 
 def _format_float_token(value: float) -> str:
@@ -1625,6 +1730,7 @@ def build_gnn_policy(spec: Mapping[str, Any]) -> Any:
     from Project1.policies.gnn_rl import GNNAllocationPolicy, GNNPolicyConfig
 
     gnn = spec["gnn"]
+    algo = _resolve_training_algo(spec)
     return GNNAllocationPolicy(
         GNNPolicyConfig(
             hidden_dim=gnn["hidden_dim"],
@@ -1633,12 +1739,23 @@ def build_gnn_policy(spec: Mapping[str, Any]) -> Any:
             critic_hidden_dim=gnn.get("critic_hidden_dim"),
             num_message_passing_layers=gnn["num_message_passing_layers"],
             temperature=gnn["temperature"],
+            action_distribution="dirichlet" if algo == "ppo" else "softmax",
+            dirichlet_alpha_floor=gnn.get("dirichlet_alpha_floor", 1e-3),
         )
     )
 
 
+def _resolve_training_algo(spec: Mapping[str, Any]) -> str:
+    algo = str(spec.get("training", {}).get("algo", "td3")).strip().lower()
+    if algo not in {"td3", "ppo"}:
+        raise ValueError("training.algo must be one of {'td3', 'ppo'}.")
+    return algo
+
+
 def _resolve_effective_steps_per_update(spec: Mapping[str, Any]) -> int:
     training = spec["training"]
+    if _resolve_training_algo(spec) == "ppo":
+        return int(training.get("ppo_rollout_horizon", training["steps_per_update"]))
     if training.get("use_episode_length_as_steps_per_update", False):
         return int(spec["dynamics"]["episode_length"])
     return int(training["steps_per_update"])
@@ -1646,24 +1763,33 @@ def _resolve_effective_steps_per_update(spec: Mapping[str, Any]) -> int:
 
 def _resolve_training_schedule(spec: Mapping[str, Any]) -> Dict[str, Any]:
     training = spec["training"]
+    algo = _resolve_training_algo(spec)
     effective_steps_per_update = _resolve_effective_steps_per_update(spec)
     num_workers = int(training["num_workers"])
-    global_env_steps_per_update = effective_steps_per_update * num_workers
-
-    warmup_env_steps_config = training.get("warmup_env_steps")
-    if warmup_env_steps_config is not None:
-        warmup_env_steps = int(warmup_env_steps_config)
-        if warmup_env_steps < 0:
-            raise ValueError("training.warmup_env_steps must be non-negative when provided.")
-        warmup_steps_source = "training.warmup_env_steps"
+    num_envs_per_worker = int(training.get("num_envs_per_worker", 1))
+    if algo == "ppo":
+        global_env_steps_per_update = effective_steps_per_update * num_workers * num_envs_per_worker
     else:
-        warmup_steps_raw = training.get("warmup_steps")
-        if warmup_steps_raw is None:
-            raise ValueError("Either training.warmup_env_steps or training.warmup_steps must be provided.")
-        warmup_env_steps = int(warmup_steps_raw)
-        if warmup_env_steps < 0:
-            raise ValueError("training.warmup_steps must be non-negative when provided.")
-        warmup_steps_source = "training.warmup_steps"
+        global_env_steps_per_update = effective_steps_per_update * num_workers
+
+    if algo == "ppo":
+        warmup_env_steps = 0
+        warmup_steps_source = "ignored_for_ppo"
+    else:
+        warmup_env_steps_config = training.get("warmup_env_steps")
+        if warmup_env_steps_config is not None:
+            warmup_env_steps = int(warmup_env_steps_config)
+            if warmup_env_steps < 0:
+                raise ValueError("training.warmup_env_steps must be non-negative when provided.")
+            warmup_steps_source = "training.warmup_env_steps"
+        else:
+            warmup_steps_raw = training.get("warmup_steps")
+            if warmup_steps_raw is None:
+                raise ValueError("Either training.warmup_env_steps or training.warmup_steps must be provided.")
+            warmup_env_steps = int(warmup_steps_raw)
+            if warmup_env_steps < 0:
+                raise ValueError("training.warmup_steps must be non-negative when provided.")
+            warmup_steps_source = "training.warmup_steps"
 
     total_env_steps_config = training.get("total_env_steps")
     if total_env_steps_config is not None:
@@ -1723,10 +1849,47 @@ def _resolve_training_schedule(spec: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def build_trainer_config(spec: Mapping[str, Any]) -> Any:
-    from Project1.trainer import TrainerConfig
-
+    algo = _resolve_training_algo(spec)
     training = spec["training"]
     training_schedule = _resolve_training_schedule(spec)
+    if algo == "ppo":
+        from Project1.ppo.config import GraphPPOConfig
+
+        return GraphPPOConfig(
+            total_updates=training_schedule["total_updates"],
+            steps_per_update=training_schedule["effective_steps_per_update"],
+            gamma=training["gamma"],
+            learning_rate=training["learning_rate"],
+            lr_schedule_type=training["lr_schedule_type"],
+            lr_final=training["lr_final"],
+            lr_decay_rate=training["lr_decay_rate"],
+            lr_decay_steps=training["lr_decay_steps"],
+            weight_decay=training.get("actor_weight_decay", 0.0),
+            ppo_update_epochs=training.get("ppo_update_epochs", 4),
+            ppo_minibatch_size=training.get("ppo_minibatch_size", training.get("batch_size", 256)),
+            ppo_clip_ratio=training.get("ppo_clip_ratio", 0.2),
+            ppo_value_coef=training.get("ppo_value_coef", 0.5),
+            ppo_entropy_coef=training.get("ppo_entropy_coef", 0.0),
+            ppo_gae_lambda=training.get("ppo_gae_lambda", 0.95),
+            ppo_max_grad_norm=training.get("ppo_max_grad_norm", 0.5),
+            ppo_target_kl=training.get("ppo_target_kl", 0.03),
+            ppo_reward_normalization=training.get("ppo_reward_normalization", False),
+            ppo_advantage_normalization=training.get("ppo_advantage_normalization", True),
+            eval_interval=training_schedule["eval_interval_updates"],
+            eval_episodes=training["eval_episodes"],
+            device=training["device"],
+            seed=spec["seed"],
+            num_workers=training["num_workers"],
+            num_envs_per_worker=training.get("num_envs_per_worker", 1),
+            rollout_device=training.get("rollout_device", training["device"]),
+            rollout_inference_mode=training.get("rollout_inference_mode", "local"),
+            rollout_inference_batch_timeout_ms=training.get("rollout_inference_batch_timeout_ms", 0.0),
+            rollout_num_threads=training.get("rollout_num_threads"),
+            overlap_rollout_and_update=training.get("overlap_rollout_and_update", False),
+            collapse_resource_threshold=training.get("collapse_resource_threshold", 1e-6),
+        )
+
+    from Project1.trainer import TrainerConfig
     replay_topology_names_override = training.get("replay_topology_names")
     if replay_topology_names_override is None:
         randomization = spec.get("domain_randomization", {})
@@ -1884,6 +2047,10 @@ def build_domain_randomization_config(spec: Mapping[str, Any]) -> Any:
         enabled=bool(randomization.get("enabled", False)),
         network_types=network_types,
         network_type_weights=network_type_weights,
+        fixed_graph_bank_enabled=bool(randomization.get("fixed_graph_bank_enabled", False)),
+        fixed_graph_bank_size_per_type=int(randomization.get("fixed_graph_bank_size_per_type", 0)),
+        fixed_graph_bank_seed=int(randomization.get("fixed_graph_bank_seed", spec["seed"])),
+        fixed_graph_bank_sampling=str(randomization.get("fixed_graph_bank_sampling", "uniform")),
         num_nodes_choices=tuple(int(item) for item in randomization.get("num_nodes_choices", (int(spec["network"]["num_nodes"]),))),
         regular_degree_choices=tuple(int(item) for item in randomization.get("regular_degree_choices", (int(spec["network"]["regular_degree"]),))),
         er_mean_degree_choices=tuple(
@@ -3793,8 +3960,17 @@ def run_gnn_training_mode(
     env_config: SPGGConfig,
     output_dir: Path,
 ) -> Dict[str, Any]:
-    from Project1.trainer import CentralizedActorCriticTrainer
     import torch
+
+    algo = _resolve_training_algo(spec)
+    if algo == "ppo":
+        from Project1.ppo.trainer import GraphPPOTrainer
+
+        trainer_class: Any = GraphPPOTrainer
+    else:
+        from Project1.trainer import CentralizedActorCriticTrainer
+
+        trainer_class = CentralizedActorCriticTrainer
 
     env = SPGGEnv(env_config, graph)
     eval_env = SPGGEnv(env_config, graph)
@@ -3814,9 +3990,13 @@ def run_gnn_training_mode(
     policy: Any = None
     trainer: Any = None
     steps_source = (
+        "training.ppo_rollout_horizon"
+        if algo == "ppo"
+        else (
         "dynamics.episode_length"
         if training.get("use_episode_length_as_steps_per_update", False)
         else "training.steps_per_update"
+        )
     )
     writer: Any = None
     try:
@@ -3849,85 +4029,102 @@ def run_gnn_training_mode(
                 trainer_config.overlap_rollout_and_update,
             )
         )
-        print(
-            "Replay CFG: strategy={0}, capacity={1}, topology_names={2}, recent={3:.2f}, long_term={4:.2f}, demo={5:.2f}, demo_source={6}, collapse_cap_per_topology={7:.2f}".format(
-                trainer_config.replay_strategy,
-                trainer_config.replay_capacity,
-                ",".join(trainer_config.replay_topology_names),
-                trainer_config.replay_recent_fraction,
-                trainer_config.replay_long_term_fraction,
-                trainer_config.replay_demo_fraction,
-                trainer_config.replay_demo_behavior_source,
-                trainer_config.replay_max_collapse_sample_ratio,
-            )
-        )
-        if bool(trainer_config.demo_pretrain_enabled):
-            demo_collection_network_types = (
-                ",".join(trainer_config.demo_collection_network_types)
-                if trainer_config.demo_collection_network_types
-                else (
-                    ",".join(randomization_config.network_types)
-                    if bool(trainer_config.demo_collection_use_domain_randomization) and bool(randomization_config.enabled)
-                    else "fixed"
+        if algo == "ppo":
+            print(
+                "PPO CFG  : horizon={0}, epochs={1}, minibatch={2}, clip={3}, value_coef={4}, entropy_coef={5}, gae_lambda={6}, grad_clip={7}, target_kl={8}, reward_norm={9}, advantage_norm={10}".format(
+                    trainer_config.steps_per_update,
+                    trainer_config.ppo_update_epochs,
+                    trainer_config.ppo_minibatch_size,
+                    trainer_config.ppo_clip_ratio,
+                    trainer_config.ppo_value_coef,
+                    trainer_config.ppo_entropy_coef,
+                    trainer_config.ppo_gae_lambda,
+                    trainer_config.ppo_max_grad_norm,
+                    trainer_config.ppo_target_kl,
+                    trainer_config.ppo_reward_normalization,
+                    trainer_config.ppo_advantage_normalization,
                 )
             )
+        else:
             print(
-                "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, runtime={4}, actor_bc_updates={5}, critic_pretrain_updates={6}, critic_target={7}, n_step={8}, batch_size={9}, val_batch_size={10}, val_frac={11}, eval_interval={12}, patience={13}, min_improve={14}, dataset_path={15}, save_ckpt={16}, ckpt_name={17}, stop_after={18}".format(
-                    trainer_config.demo_collection_env_steps,
-                    trainer_config.demo_collection_behavior_source,
-                    trainer_config.demo_collection_use_domain_randomization,
-                    demo_collection_network_types,
-                    trainer_config.demo_collection_runtime,
-                    trainer_config.actor_bc_pretrain_updates,
-                    trainer_config.critic_pretrain_updates,
-                    trainer_config.demo_critic_pretrain_target_mode,
-                    trainer_config.demo_critic_pretrain_n_step,
-                    trainer_config.demo_pretrain_batch_size
-                    if trainer_config.demo_pretrain_batch_size is not None
-                    else trainer_config.batch_size,
-                    trainer_config.demo_pretrain_validation_batch_size
-                    if trainer_config.demo_pretrain_validation_batch_size is not None
-                    else min(
+                "Replay CFG: strategy={0}, capacity={1}, topology_names={2}, recent={3:.2f}, long_term={4:.2f}, demo={5:.2f}, demo_source={6}, collapse_cap_per_topology={7:.2f}".format(
+                    trainer_config.replay_strategy,
+                    trainer_config.replay_capacity,
+                    ",".join(trainer_config.replay_topology_names),
+                    trainer_config.replay_recent_fraction,
+                    trainer_config.replay_long_term_fraction,
+                    trainer_config.replay_demo_fraction,
+                    trainer_config.replay_demo_behavior_source,
+                    trainer_config.replay_max_collapse_sample_ratio,
+                )
+            )
+            if bool(trainer_config.demo_pretrain_enabled):
+                demo_collection_network_types = (
+                    ",".join(trainer_config.demo_collection_network_types)
+                    if trainer_config.demo_collection_network_types
+                    else (
+                        ",".join(randomization_config.network_types)
+                        if bool(trainer_config.demo_collection_use_domain_randomization) and bool(randomization_config.enabled)
+                        else "fixed"
+                    )
+                )
+                print(
+                    "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, runtime={4}, actor_bc_updates={5}, critic_pretrain_updates={6}, critic_target={7}, n_step={8}, batch_size={9}, val_batch_size={10}, val_frac={11}, eval_interval={12}, patience={13}, min_improve={14}, dataset_path={15}, save_ckpt={16}, ckpt_name={17}, stop_after={18}".format(
+                        trainer_config.demo_collection_env_steps,
+                        trainer_config.demo_collection_behavior_source,
+                        trainer_config.demo_collection_use_domain_randomization,
+                        demo_collection_network_types,
+                        trainer_config.demo_collection_runtime,
+                        trainer_config.actor_bc_pretrain_updates,
+                        trainer_config.critic_pretrain_updates,
+                        trainer_config.demo_critic_pretrain_target_mode,
+                        trainer_config.demo_critic_pretrain_n_step,
                         trainer_config.demo_pretrain_batch_size
                         if trainer_config.demo_pretrain_batch_size is not None
                         else trainer_config.batch_size,
-                        128,
-                    ),
-                    trainer_config.demo_validation_fraction,
-                    trainer_config.demo_pretrain_eval_interval,
-                    trainer_config.demo_pretrain_patience,
-                    trainer_config.demo_pretrain_min_relative_improvement,
-                    trainer_config.demo_dataset_save_path or "None",
-                    bool(training.get("save_demo_pretrain_checkpoint", False)),
-                    str(training.get("demo_pretrain_checkpoint_name", "demo_pretrained.pt")),
-                    bool(training.get("stop_after_demo_pretrain", False)),
+                        trainer_config.demo_pretrain_validation_batch_size
+                        if trainer_config.demo_pretrain_validation_batch_size is not None
+                        else min(
+                            trainer_config.demo_pretrain_batch_size
+                            if trainer_config.demo_pretrain_batch_size is not None
+                            else trainer_config.batch_size,
+                            128,
+                        ),
+                        trainer_config.demo_validation_fraction,
+                        trainer_config.demo_pretrain_eval_interval,
+                        trainer_config.demo_pretrain_patience,
+                        trainer_config.demo_pretrain_min_relative_improvement,
+                        trainer_config.demo_dataset_save_path or "None",
+                        bool(training.get("save_demo_pretrain_checkpoint", False)),
+                        str(training.get("demo_pretrain_checkpoint_name", "demo_pretrained.pt")),
+                        bool(training.get("stop_after_demo_pretrain", False)),
+                    )
+                )
+            print(
+                "Stab CFG : teacher_takeover={0}({1}->{2}, end@{3}), adaptive_release={4}(return>={5:.2f}x, actor_bc<={6:.2f}x, critic<={7:.2f}x, need={8}/{9}), q_filter={10}(margin={11}, online_only={12}, require_release={13}), actor_q_coef={14}->{15} end@{16}, critic_loss={17}, huber_delta={18}, grad_clip(actor={19}, critic={20})".format(
+                    trainer_config.teacher_takeover_enabled,
+                    trainer_config.teacher_takeover_start_prob,
+                    trainer_config.teacher_takeover_end_prob,
+                    trainer_config.teacher_takeover_decay_end_fraction,
+                    trainer_config.adaptive_teacher_release_enabled,
+                    trainer_config.adaptive_teacher_release_min_return_ratio,
+                    trainer_config.adaptive_teacher_release_max_actor_bc_val_ratio,
+                    trainer_config.adaptive_teacher_release_max_critic_val_ratio,
+                    trainer_config.adaptive_teacher_release_required_evals,
+                    trainer_config.adaptive_teacher_release_min_criteria,
+                    trainer_config.actor_bc_q_filter_enabled,
+                    trainer_config.actor_bc_q_filter_margin,
+                    trainer_config.actor_bc_q_filter_online_only,
+                    trainer_config.actor_bc_q_filter_require_teacher_release,
+                    trainer_config.online_actor_q_coef_initial,
+                    trainer_config.online_actor_q_coef_final,
+                    trainer_config.online_actor_q_coef_ramp_end_fraction,
+                    trainer_config.critic_loss_type,
+                    trainer_config.critic_huber_delta,
+                    trainer_config.actor_grad_clip_norm,
+                    trainer_config.critic_grad_clip_norm,
                 )
             )
-        print(
-            "Stab CFG : teacher_takeover={0}({1}->{2}, end@{3}), adaptive_release={4}(return>={5:.2f}x, actor_bc<={6:.2f}x, critic<={7:.2f}x, need={8}/{9}), q_filter={10}(margin={11}, online_only={12}, require_release={13}), actor_q_coef={14}->{15} end@{16}, critic_loss={17}, huber_delta={18}, grad_clip(actor={19}, critic={20})".format(
-                trainer_config.teacher_takeover_enabled,
-                trainer_config.teacher_takeover_start_prob,
-                trainer_config.teacher_takeover_end_prob,
-                trainer_config.teacher_takeover_decay_end_fraction,
-                trainer_config.adaptive_teacher_release_enabled,
-                trainer_config.adaptive_teacher_release_min_return_ratio,
-                trainer_config.adaptive_teacher_release_max_actor_bc_val_ratio,
-                trainer_config.adaptive_teacher_release_max_critic_val_ratio,
-                trainer_config.adaptive_teacher_release_required_evals,
-                trainer_config.adaptive_teacher_release_min_criteria,
-                trainer_config.actor_bc_q_filter_enabled,
-                trainer_config.actor_bc_q_filter_margin,
-                trainer_config.actor_bc_q_filter_online_only,
-                trainer_config.actor_bc_q_filter_require_teacher_release,
-                trainer_config.online_actor_q_coef_initial,
-                trainer_config.online_actor_q_coef_final,
-                trainer_config.online_actor_q_coef_ramp_end_fraction,
-                trainer_config.critic_loss_type,
-                trainer_config.critic_huber_delta,
-                trainer_config.actor_grad_clip_norm,
-                trainer_config.critic_grad_clip_norm,
-            )
-        )
         print(
             "Eval CFG  : mode={0}, periodic_eval_episodes={1}, eval_interval_env_steps={2} ({3}), eval_interval_updates={4}".format(
                 "custom_env_families({0})".format(len(eval_env_factories))
@@ -3956,7 +4153,7 @@ def run_gnn_training_mode(
             ]
             print("Curriculum: {0}".format(" | ".join(stage_parts)))
 
-        if _should_use_external_demo_collection(
+        if algo == "td3" and _should_use_external_demo_collection(
             trainer_config,
             resume_from_checkpoint=resume_from_checkpoint,
         ):
@@ -3970,7 +4167,7 @@ def run_gnn_training_mode(
             effective_trainer_config = replace(trainer_config, demo_collection_env_steps=0)
 
         policy = build_gnn_policy(spec)
-        trainer = CentralizedActorCriticTrainer(
+        trainer = trainer_class(
             env=env,
             policy=policy,
             eval_env=eval_env,
@@ -3979,7 +4176,7 @@ def run_gnn_training_mode(
             eval_env_factories=eval_env_factories,
             curriculum_stages=curriculum_stages,
         )
-        if external_demo_replay is not None:
+        if algo == "td3" and external_demo_replay is not None:
             trainer.preload_demo_replay(
                 external_demo_replay,
                 external_demo_summary,
@@ -3990,9 +4187,9 @@ def run_gnn_training_mode(
         should_save_checkpoints = bool(training.get("save_checkpoints", False))
         save_final_checkpoint = bool(training.get("save_final_checkpoint", True))
         save_best_checkpoint = bool(training.get("save_best_checkpoint", True))
-        save_demo_pretrain_checkpoint = bool(training.get("save_demo_pretrain_checkpoint", False))
+        save_demo_pretrain_checkpoint = bool(training.get("save_demo_pretrain_checkpoint", False)) if algo == "td3" else False
         demo_pretrain_checkpoint_name = str(training.get("demo_pretrain_checkpoint_name", "demo_pretrained.pt"))
-        stop_after_demo_pretrain = bool(training.get("stop_after_demo_pretrain", False))
+        stop_after_demo_pretrain = bool(training.get("stop_after_demo_pretrain", False)) if algo == "td3" else False
         if stop_after_demo_pretrain and not save_demo_pretrain_checkpoint:
             raise ValueError(
                 "training.stop_after_demo_pretrain=True requires "
@@ -4014,7 +4211,7 @@ def run_gnn_training_mode(
         console_recent_window_updates = int(tensorboard.get("console_recent_window_updates", 50))
         tensorboard_stage_log_state: Dict[str, Any] = {"last_stage_index": None}
         training_start_time = time.time()
-        effective_steps_per_update = int(trainer_config.steps_per_update) * int(trainer_config.num_workers)
+        effective_steps_per_update = int(training_schedule["global_env_steps_per_update"])
         total_env_steps = int(training_schedule["total_env_steps_effective"])
         warmup_env_steps = int(training_schedule["warmup_env_steps"])
         recent_metrics: deque[dict[str, float]] = deque(maxlen=max(console_recent_window_updates, 1))
@@ -4205,9 +4402,11 @@ def run_gnn_training_mode(
                     print(line)
 
         should_run_demo_pretrain = (
+            algo == "td3"
+            and
             int(trainer.completed_updates) == 0
             and not bool(getattr(trainer, "demo_pretrain_completed", False))
-            and bool(effective_trainer_config.demo_pretrain_enabled)
+            and bool(getattr(effective_trainer_config, "demo_pretrain_enabled", False))
         )
         if should_run_demo_pretrain:
             trainer._run_demo_pretrain()
