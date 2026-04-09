@@ -361,6 +361,7 @@ class GraphTD3Trainer:
     def _update_adaptive_teacher_release(
         self,
         *,
+        online_eval_cooperation_mean: float,
         online_eval_return_mean: float,
         actor_bc_val_loss: float | None,
         critic_val_loss: float | None,
@@ -378,6 +379,38 @@ class GraphTD3Trainer:
             return metrics
         if self.teacher_takeover_release_env_step is not None:
             metrics["teacher_release_unlocked"] = 1.0
+            return metrics
+        if str(self.config.adaptive_teacher_release_mode) == "eval_cooperation":
+            available = 1
+            passed = 1 if float(online_eval_cooperation_mean) >= float(
+                self.config.adaptive_teacher_release_min_cooperation
+            ) else 0
+            gate_passed = passed >= 1
+            if gate_passed:
+                self.teacher_takeover_stable_eval_count += 1
+            else:
+                self.teacher_takeover_stable_eval_count = 0
+
+            if self.teacher_takeover_stable_eval_count >= int(self.config.adaptive_teacher_release_required_evals):
+                self.teacher_takeover_release_env_step = int(self.global_env_steps)
+                print(
+                    "Teacher Release | unlocked at t_env={0} | eval_f_c={1:.6f} | threshold={2:.6f}".format(
+                        int(self.global_env_steps),
+                        float(online_eval_cooperation_mean),
+                        float(self.config.adaptive_teacher_release_min_cooperation),
+                    )
+                )
+                metrics["teacher_release_just_unlocked"] = 1.0
+
+            metrics.update(
+                {
+                    "teacher_release_unlocked": 1.0 if self.teacher_takeover_release_env_step is not None else 0.0,
+                    "teacher_release_stable_eval_count": float(self.teacher_takeover_stable_eval_count),
+                    "teacher_release_gate_pass_count": float(passed),
+                    "teacher_release_gate_available_count": float(available),
+                    "teacher_release_passed": 1.0 if gate_passed else 0.0,
+                }
+            )
             return metrics
         demo_summary = self.demo_pretrain_summary or {}
         baseline_return = float(demo_summary.get("quick_eval_return_best", 0.0))
@@ -2070,6 +2103,7 @@ class GraphTD3Trainer:
                 metrics["online_critic_error_mean"] = float(demo_validation_metrics.get("critic_error_mean", 0.0))
                 metrics["online_critic_error_std"] = float(demo_validation_metrics.get("critic_error_std", 0.0))
                 teacher_release_metrics = self._update_adaptive_teacher_release(
+                    online_eval_cooperation_mean=float(evaluation.get("cooperation_mean", 0.0)),
                     online_eval_return_mean=float(evaluation.get("return_mean", 0.0)),
                     actor_bc_val_loss=float(demo_validation_metrics.get("actor_bc_val_loss", 0.0)),
                     critic_val_loss=float(demo_validation_metrics.get("critic_val_loss", 0.0)),

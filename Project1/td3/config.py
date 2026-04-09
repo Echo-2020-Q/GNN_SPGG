@@ -100,6 +100,8 @@ class GraphTD3Config:
     teacher_takeover_end_prob: float = 0.0
     teacher_takeover_decay_end_fraction: float = 0.30
     adaptive_teacher_release_enabled: bool = False
+    adaptive_teacher_release_mode: str = "legacy"
+    adaptive_teacher_release_min_cooperation: float = 0.80
     adaptive_teacher_release_min_return_ratio: float = 0.90
     adaptive_teacher_release_max_actor_bc_val_ratio: float = 1.20
     adaptive_teacher_release_max_critic_val_ratio: float = 1.20
@@ -347,6 +349,10 @@ class GraphTD3Config:
             raise ValueError("teacher_takeover_decay_end_fraction must be in [0, 1].")
         if not isinstance(self.adaptive_teacher_release_enabled, bool):
             raise ValueError("adaptive_teacher_release_enabled must be a bool.")
+        if self.adaptive_teacher_release_mode not in {"legacy", "eval_cooperation"}:
+            raise ValueError("adaptive_teacher_release_mode must be one of {'legacy', 'eval_cooperation'}.")
+        if self.adaptive_teacher_release_min_cooperation < 0.0 or self.adaptive_teacher_release_min_cooperation > 1.0:
+            raise ValueError("adaptive_teacher_release_min_cooperation must be in [0, 1].")
         if self.adaptive_teacher_release_min_return_ratio < 0.0:
             raise ValueError("adaptive_teacher_release_min_return_ratio must be non-negative.")
         if self.adaptive_teacher_release_max_actor_bc_val_ratio <= 0.0:

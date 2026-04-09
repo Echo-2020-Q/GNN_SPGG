@@ -146,3 +146,42 @@ class RunExperimentTensorboardTests(unittest.TestCase):
                 ],
             ],
         )
+        self.assertEqual(
+            eval_only["return_mean"],
+            [
+                "Multiline",
+                [
+                    "eval/return_mean",
+                    "eval/return_mean/regular",
+                    "eval/return_mean/erdos_renyi",
+                    "eval/return_mean/small_world",
+                    "eval/return_mean/scale_free",
+                ],
+            ],
+        )
+        self.assertEqual(
+            eval_only["R_mean"],
+            [
+                "Multiline",
+                [
+                    "eval/R_mean",
+                    "eval/R_mean/regular",
+                    "eval/R_mean/erdos_renyi",
+                    "eval/R_mean/small_world",
+                    "eval/R_mean/scale_free",
+                ],
+            ],
+        )
+        self.assertEqual(
+            eval_only["gini"],
+            [
+                "Multiline",
+                [
+                    "eval/gini",
+                    "eval/gini/regular",
+                    "eval/gini/erdos_renyi",
+                    "eval/gini/small_world",
+                    "eval/gini/scale_free",
+                ],
+            ],
+        )

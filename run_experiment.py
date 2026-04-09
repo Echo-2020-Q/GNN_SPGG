@@ -790,6 +790,15 @@ BASE_EXPERIMENT = {
         # 启用后，teacher 会先保持在高权重，直到 online 评估显示 actor/critic 达到稳定阈值，再开始按 teacher_takeover_* 的 schedule 衰减。
         "adaptive_teacher_release_enabled": True,
 
+        # teacher 脱手门控模式：
+        # - "legacy"           : 使用 return / actor_bc_val / critic_val 的联合门槛
+        # - "eval_cooperation" : 只看 periodic eval 的合作比例 f_c
+        "adaptive_teacher_release_mode": "eval_cooperation",
+
+        # 当 adaptive_teacher_release_mode="eval_cooperation" 时，
+        # 只要 periodic eval 的 f_c >= 该阈值，就记为一次达标评估。
+        "adaptive_teacher_release_min_cooperation": 0.80,
+
         # online eval return 至少达到 pretrain best quick-eval 的多少比例，才允许 teacher 开始退场。
         "adaptive_teacher_release_min_return_ratio": 0.85,
 
@@ -2088,6 +2097,8 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         teacher_takeover_end_prob=training.get("teacher_takeover_end_prob", 0.0),
         teacher_takeover_decay_end_fraction=training.get("teacher_takeover_decay_end_fraction", 0.30),
         adaptive_teacher_release_enabled=training.get("adaptive_teacher_release_enabled", False),
+        adaptive_teacher_release_mode=str(training.get("adaptive_teacher_release_mode", "legacy")),
+        adaptive_teacher_release_min_cooperation=training.get("adaptive_teacher_release_min_cooperation", 0.80),
         adaptive_teacher_release_min_return_ratio=training.get("adaptive_teacher_release_min_return_ratio", 0.90),
         adaptive_teacher_release_max_actor_bc_val_ratio=training.get(
             "adaptive_teacher_release_max_actor_bc_val_ratio",
@@ -3777,6 +3788,36 @@ def _log_tensorboard_custom_layout(writer: Any) -> None:
                         "eval/f_c/scale_free",
                     ],
                 ],
+                "return_mean": [
+                    "Multiline",
+                    [
+                        "eval/return_mean",
+                        "eval/return_mean/regular",
+                        "eval/return_mean/erdos_renyi",
+                        "eval/return_mean/small_world",
+                        "eval/return_mean/scale_free",
+                    ],
+                ],
+                "R_mean": [
+                    "Multiline",
+                    [
+                        "eval/R_mean",
+                        "eval/R_mean/regular",
+                        "eval/R_mean/erdos_renyi",
+                        "eval/R_mean/small_world",
+                        "eval/R_mean/scale_free",
+                    ],
+                ],
+                "gini": [
+                    "Multiline",
+                    [
+                        "eval/gini",
+                        "eval/gini/regular",
+                        "eval/gini/erdos_renyi",
+                        "eval/gini/small_world",
+                        "eval/gini/scale_free",
+                    ],
+                ],
                 "collapse_rate": [
                     "Multiline",
                     [
@@ -4309,15 +4350,21 @@ def run_gnn_training_mode(
                 )
             )
             print(
-                "Stab CFG : teacher_takeover={0}({1}->{2}, end@{3}), adaptive_release={4}(return>={5:.2f}x, actor_bc<={6:.2f}x, critic<={7:.2f}x, need={8}/{9}), q_filter={10}(margin={11}, online_only={12}, require_release={13}), actor_q_coef={14}->{15} end@{16}, critic_loss={17}, huber_delta={18}, grad_clip(actor={19}, critic={20})".format(
+                "Stab CFG : teacher_takeover={0}({1}->{2}, end@{3}), adaptive_release={4}({5}, need={6}/{7}), q_filter={8}(margin={9}, online_only={10}, require_release={11}), actor_q_coef={12}->{13} end@{14}, critic_loss={15}, huber_delta={16}, grad_clip(actor={17}, critic={18})".format(
                     trainer_config.teacher_takeover_enabled,
                     trainer_config.teacher_takeover_start_prob,
                     trainer_config.teacher_takeover_end_prob,
                     trainer_config.teacher_takeover_decay_end_fraction,
                     trainer_config.adaptive_teacher_release_enabled,
-                    trainer_config.adaptive_teacher_release_min_return_ratio,
-                    trainer_config.adaptive_teacher_release_max_actor_bc_val_ratio,
-                    trainer_config.adaptive_teacher_release_max_critic_val_ratio,
+                    (
+                        "eval_f_c>={0:.2f}".format(trainer_config.adaptive_teacher_release_min_cooperation)
+                        if str(trainer_config.adaptive_teacher_release_mode) == "eval_cooperation"
+                        else "return>={0:.2f}x, actor_bc<={1:.2f}x, critic<={2:.2f}x".format(
+                            trainer_config.adaptive_teacher_release_min_return_ratio,
+                            trainer_config.adaptive_teacher_release_max_actor_bc_val_ratio,
+                            trainer_config.adaptive_teacher_release_max_critic_val_ratio,
+                        )
+                    ),
                     trainer_config.adaptive_teacher_release_required_evals,
                     trainer_config.adaptive_teacher_release_min_criteria,
                     trainer_config.actor_bc_q_filter_enabled,

@@ -544,11 +544,13 @@ class TrainerSmokeTests(unittest.TestCase):
             }
             trainer.global_env_steps = 123
             first = trainer._update_adaptive_teacher_release(
+                online_eval_cooperation_mean=0.0,
                 online_eval_return_mean=9.5,
                 actor_bc_val_loss=0.55,
                 critic_val_loss=2.1,
             )
             second = trainer._update_adaptive_teacher_release(
+                online_eval_cooperation_mean=0.0,
                 online_eval_return_mean=9.6,
                 actor_bc_val_loss=0.56,
                 critic_val_loss=2.2,
@@ -556,6 +558,55 @@ class TrainerSmokeTests(unittest.TestCase):
             self.assertEqual(float(first["teacher_release_unlocked"]), 0.0)
             self.assertEqual(float(second["teacher_release_unlocked"]), 1.0)
             self.assertEqual(int(trainer.teacher_takeover_release_env_step or -1), 123)
+        finally:
+            trainer.close()
+
+    def test_adaptive_teacher_release_can_unlock_from_eval_cooperation_threshold(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.5,
+                p_max=5.0,
+                beta=1.0,
+                episode_length=4,
+                reward=RewardConfig(lambda_payoff=1.0, lambda_cooperation=0.5, lambda_gini=0.1),
+            ),
+            make_grid_graph(2, 2),
+        )
+        policy = GNNAllocationPolicy(GNNPolicyConfig(hidden_dim=16, num_message_passing_layers=2))
+        trainer = CentralizedActorCriticTrainer(
+            env=env,
+            policy=policy,
+            config=TrainerConfig(
+                total_updates=2,
+                steps_per_update=4,
+                eval_interval=1,
+                eval_episodes=1,
+                adaptive_teacher_release_enabled=True,
+                adaptive_teacher_release_mode="eval_cooperation",
+                adaptive_teacher_release_min_cooperation=0.8,
+                adaptive_teacher_release_required_evals=2,
+                warmup_steps=0,
+                seed=0,
+            ),
+        )
+        try:
+            trainer.global_env_steps = 456
+            first = trainer._update_adaptive_teacher_release(
+                online_eval_cooperation_mean=0.81,
+                online_eval_return_mean=0.0,
+                actor_bc_val_loss=None,
+                critic_val_loss=None,
+            )
+            second = trainer._update_adaptive_teacher_release(
+                online_eval_cooperation_mean=0.83,
+                online_eval_return_mean=0.0,
+                actor_bc_val_loss=None,
+                critic_val_loss=None,
+            )
+            self.assertEqual(float(first["teacher_release_unlocked"]), 0.0)
+            self.assertEqual(float(second["teacher_release_unlocked"]), 1.0)
+            self.assertEqual(int(trainer.teacher_takeover_release_env_step or -1), 456)
         finally:
             trainer.close()
 
