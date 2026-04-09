@@ -103,7 +103,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "0409_test_spgg_GNN_20Nodes_150length_Fermi_FixedTopology",#CUDACUDACUDA
+    "experiment_name": "0409_spgg_GNN_50Nodes_200length_Fermi_FixedTopology_Reward_freeze_actor_q",#CUDACUDACUDA
     #记得改CUDACUDACUDACUDACUDACUDACUDACUDACUDACUDACUDA
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -133,7 +133,7 @@ BASE_EXPERIMENT = {
         # 节点总数 n。
         # 对 regular / erdos_renyi / small_world / scale_free 都使用这个值。
         # 对 grid 网络，这个值会被 grid_rows * grid_cols 取代。
-        "num_nodes": 20,
+        "num_nodes": 50,
 
         # regular 网络参数：每个节点的度。
         # 例如 degree=4 表示每个节点都恰好连 4 条边。
@@ -254,7 +254,7 @@ BASE_EXPERIMENT = {
 
         # 每个 episode 的时间步上限。
         # 到达这个步数后，本 episode 结束。
-        "episode_length": 150, #150 10000
+        "episode_length": 200, #150 10000
 
         # 所有节点统一的初始资源。
         "initial_resource": 20.0,#10
@@ -287,14 +287,14 @@ BASE_EXPERIMENT = {
         # 下一时刻全局平均资源项的权重。
         # 单步使用 mean(next_resources)；跨时间平均后对应评估里的 mean_resource 口径。
         #Pc=50，Pmax=250,α=0.5，τ=0.1，\bar_{d}=4, R_M=370.83
-        "lambda_total_resource": 100/371.0,
+        "lambda_total_resource": 10/371.0,
 
         # 下一时刻“低资源/塌缩个体比例”惩罚项的权重。
         # 口径：mean(next_resources < degree + 1)。
-        "lambda_collapse": 1,
+        "lambda_collapse": 0,
 
         # Gini 不平等惩罚项的权重。
-        "lambda_gini": 1.0,
+        "lambda_gini": 0.0,
 
         # Gini 分母的极小修正项，通常不需要改。
         "epsilon": 1e-8,
@@ -349,7 +349,7 @@ BASE_EXPERIMENT = {
         # 程序内部会按：
         #   total_updates = ceil((warmup_env_steps + total_env_steps) / (num_workers * effective_steps_per_update))
         # 自动换算成 update 次数。
-        "total_env_steps": 30_000_000,#episode需要用总的steps除以episode_length=150
+        "total_env_steps": 50_000_000,#episode需要用总的steps除以episode_length=200
 
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
@@ -902,7 +902,7 @@ BASE_EXPERIMENT = {
         # 默认建议先用 "cpu"，让 worker 侧保持最简单、最稳定的本地 CPU rollout。
         # 如果后面要专门做 rollout 推理加速，再改成某张 GPU 或多张 GPU 列表。
         # learner 训练设备仍由下面的 device 单独控制。
-        "rollout_device": "cuda:0",
+        "rollout_device": "cuda:2",
 
         # rollout 推理模式：
         # - "local"       ：每个 worker 自己持有 actor，并在本地前向
@@ -917,7 +917,7 @@ BASE_EXPERIMENT = {
 
         # learner 训练设备：cpu / cuda / cuda:0 等。
         # 这只控制主进程里的 actor/critic 训练，不控制 rollout worker 的推理设备。
-        "device": "cuda:1",
+        "device": "cuda:3",
 
         # 并行 rollout worker 进程内的 PyTorch CPU 线程数。
         # 仅对多进程 worker 生效，用于减少小图前向时的线程争抢。
@@ -1024,23 +1024,23 @@ BASE_EXPERIMENT = {
         "env_families": [
             {
                 "network_type": "regular",
-                "num_nodes": 20,
+                "num_nodes": 50,
                 "regular_degree": 4,
             },
             {
                 "network_type": "erdos_renyi",
-                "num_nodes": 20,
+                "num_nodes": 50,
                 "er_target_mean_degree": 4.0,
             },
             {
                 "network_type": "small_world",
-                "num_nodes": 20,
+                "num_nodes": 50,
                 "ws_degree": 4,
                 "ws_rewiring_prob": 0.10,
             },
             {
                 "network_type": "scale_free",
-                "num_nodes": 20,
+                "num_nodes": 50,
                 "ba_attachments_per_new_node": 2,
             },
         ],
