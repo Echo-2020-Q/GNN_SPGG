@@ -309,6 +309,7 @@ class GraphTD3Trainer:
             quick_eval_episodes = max(1, min(int(self.config.eval_episodes), 4))
             quick_eval = self.evaluate(num_episodes=quick_eval_episodes)
             metrics["quick_eval_return_mean"] = float(quick_eval.get("return_mean", 0.0))
+            metrics["quick_eval_return_per_step_mean"] = float(quick_eval.get("return_per_step_mean", 0.0))
             metrics["quick_eval_cooperation_mean"] = float(quick_eval.get("cooperation_mean", 0.0))
             metrics["quick_eval_gini_mean"] = float(quick_eval.get("gini_mean", 0.0))
             metrics["quick_eval_collapse_rate"] = float(quick_eval.get("collapse_rate", 0.0))
@@ -996,6 +997,8 @@ class GraphTD3Trainer:
             "critic_val_loss_best": 0.0,
             "quick_eval_return_last": 0.0,
             "quick_eval_return_best": 0.0,
+            "quick_eval_return_per_step_last": 0.0,
+            "quick_eval_return_per_step_best": 0.0,
             "actor_bc_eval_count": 0.0,
             "critic_eval_count": 0.0,
             "actor_bc_early_stopped": False,
@@ -1177,6 +1180,7 @@ class GraphTD3Trainer:
             actor_no_improve = 0
             actor_best_state: dict[str, Any] | None = None
             actor_best_quick_eval: float | None = None
+            actor_best_quick_eval_per_step: float | None = None
             actor_best_val_loss: float | None = None
             actor_early_stopped = False
             executed_actor_updates = 0
@@ -1192,9 +1196,13 @@ class GraphTD3Trainer:
                     actor_eval_count += 1
                     validation_metrics = self._run_demo_pretrain_validation(include_quick_eval=True)
                     current_quick_eval = float(validation_metrics.get("quick_eval_return_mean", 0.0))
+                    current_quick_eval_per_step = float(
+                        validation_metrics.get("quick_eval_return_per_step_mean", 0.0)
+                    )
                     current_actor_val = float(validation_metrics.get("actor_bc_val_loss", 0.0))
                     summary["actor_bc_val_loss_last"] = current_actor_val
                     summary["quick_eval_return_last"] = current_quick_eval
+                    summary["quick_eval_return_per_step_last"] = current_quick_eval_per_step
                     quick_improved = self._metric_improved(
                         current_quick_eval,
                         actor_best_quick_eval,
@@ -1225,17 +1233,19 @@ class GraphTD3Trainer:
                     if better_than_best:
                         actor_best_state = self._current_learner_state()
                         actor_best_quick_eval = current_quick_eval
+                        actor_best_quick_eval_per_step = current_quick_eval_per_step
                         actor_best_val_loss = current_actor_val
                     if quick_improved or actor_val_improved or actor_best_state is None:
                         actor_no_improve = 0
                     else:
                         actor_no_improve += 1
                     print(
-                        "Demo Pretrain | actor_bc eval | update={0}/{1} | val_bc={2:.6f} | quick_eval_return={3:.6f} | patience={4}/{5}".format(
+                        "Demo Pretrain | actor_bc eval | update={0}/{1} | val_bc={2:.6f} | quick_eval_return={3:.6f} | quick_eval_return_per_step={4:.6f} | patience={5}/{6}".format(
                             update_index,
                             actor_updates,
                             current_actor_val,
                             current_quick_eval,
+                            current_quick_eval_per_step,
                             actor_no_improve,
                             int(self.config.demo_pretrain_patience),
                         )
@@ -1250,17 +1260,19 @@ class GraphTD3Trainer:
             summary["actor_bc_early_stopped"] = bool(actor_early_stopped)
             summary["actor_bc_val_loss_best"] = float(actor_best_val_loss or 0.0)
             summary["quick_eval_return_best"] = float(actor_best_quick_eval or 0.0)
+            summary["quick_eval_return_per_step_best"] = float(actor_best_quick_eval_per_step or 0.0)
             if actor_best_state is not None:
                 self.learner.load_checkpoint_state(actor_best_state)
                 self.learner.target_actor.load_state_dict(self.learner.actor.state_dict())
             if last_actor_logged < executed_actor_updates:
                 self._print_pretrain_progress("actor_bc", executed_actor_updates, actor_updates, actor_pretrain_start)
             print(
-                "Demo Pretrain | actor BC done | executed={0:.0f} | last_bc_loss={1:.6f} | best_val_bc={2:.6f} | best_quick_eval={3:.6f} | early_stopped={4} | seconds={5:.3f}".format(
+                "Demo Pretrain | actor BC done | executed={0:.0f} | last_bc_loss={1:.6f} | best_val_bc={2:.6f} | best_quick_eval={3:.6f} | best_quick_eval_per_step={4:.6f} | early_stopped={5} | seconds={6:.3f}".format(
                     float(summary["actor_bc_updates"]),
                     float(summary["actor_bc_loss_last"]),
                     float(summary["actor_bc_val_loss_best"]),
                     float(summary["quick_eval_return_best"]),
+                    float(summary["quick_eval_return_per_step_best"]),
                     bool(summary["actor_bc_early_stopped"]),
                     float(summary["seconds_actor_bc"]),
                 )

@@ -28,6 +28,7 @@ class GraphTD3Evaluator:
 
         episode_budget = int(num_episodes or self.config.num_episodes)
         returns: list[float] = []
+        returns_per_step: list[float] = []
         mean_resources: list[float] = []
         mean_total_resources: list[float] = []
         mean_payoffs: list[float] = []
@@ -39,6 +40,7 @@ class GraphTD3Evaluator:
 
         per_network_mean_resources: dict[str, list[float]] = {}
         per_network_returns: dict[str, list[float]] = {}
+        per_network_returns_per_step: dict[str, list[float]] = {}
         per_network_mean_total_resources: dict[str, list[float]] = {}
         per_network_mean_payoffs: dict[str, list[float]] = {}
         per_network_mean_pool_raws: dict[str, list[float]] = {}
@@ -54,6 +56,7 @@ class GraphTD3Evaluator:
                 observation = env.reset(seed=int(rng.integers(0, 2**31 - 1)))
                 done = False
                 episode_return = 0.0
+                episode_steps = 0
                 resource_mean_trace: list[float] = []
                 resource_trace: list[float] = []
                 payoff_mean_trace: list[float] = []
@@ -69,13 +72,16 @@ class GraphTD3Evaluator:
                     with torch.no_grad():
                         action_output = actor.deterministic_action(observation)
                     observation, reward, done, info = env.step(action_output.allocation_matrix.detach().cpu().numpy())
+                    episode_steps += 1
                     episode_return += float(reward)
                     if info is not None and "payoff" in info:
                         payoff_mean_trace.append(float(np.asarray(info["payoff"]).mean()))
                     final_info = info
 
                 final_mean_resource = float(np.asarray(observation["resources"]).mean())
+                episode_return_per_step = episode_return / float(max(episode_steps, 1))
                 returns.append(episode_return)
+                returns_per_step.append(episode_return_per_step)
                 mean_resource = float(np.mean(resource_mean_trace)) if resource_mean_trace else 0.0
                 mean_total_resource = float(np.mean(resource_trace)) if resource_trace else 0.0
                 mean_payoff = float(np.mean(payoff_mean_trace)) if payoff_mean_trace else 0.0
@@ -100,6 +106,7 @@ class GraphTD3Evaluator:
 
                 network_type = str(metadata.get("network_type", "unknown"))
                 per_network_returns.setdefault(network_type, []).append(episode_return)
+                per_network_returns_per_step.setdefault(network_type, []).append(episode_return_per_step)
                 per_network_mean_resources.setdefault(network_type, []).append(mean_resource)
                 per_network_mean_total_resources.setdefault(network_type, []).append(mean_total_resource)
                 per_network_mean_payoffs.setdefault(network_type, []).append(mean_payoff)
@@ -111,6 +118,7 @@ class GraphTD3Evaluator:
 
         metrics = {
             "return_mean": float(np.mean(returns)) if returns else 0.0,
+            "return_per_step_mean": float(np.mean(returns_per_step)) if returns_per_step else 0.0,
             "mean_resource": float(np.mean(mean_resources)) if mean_resources else 0.0,
             "mean_total_resource": float(np.mean(mean_total_resources)) if mean_total_resources else 0.0,
             "mean_payoff": float(np.mean(mean_payoffs)) if mean_payoffs else 0.0,
@@ -123,6 +131,8 @@ class GraphTD3Evaluator:
         }
         for network_type, values in per_network_returns.items():
             metrics["return_mean/{0}".format(network_type)] = float(np.mean(values))
+        for network_type, values in per_network_returns_per_step.items():
+            metrics["return_per_step_mean/{0}".format(network_type)] = float(np.mean(values))
         for network_type, values in per_network_mean_resources.items():
             metrics["mean_resource/{0}".format(network_type)] = float(np.mean(values))
         for network_type, values in per_network_mean_total_resources.items():
