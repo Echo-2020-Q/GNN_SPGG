@@ -103,7 +103,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "0408_spgg_GNN_20Nodes_150length_Fermi_FixedTopology",#CUDACUDACUDA
+    "experiment_name": "0409_test_spgg_GNN_20Nodes_150length_Fermi_FixedTopology",#CUDACUDACUDA
     #记得改CUDACUDACUDACUDACUDACUDACUDACUDACUDACUDACUDA
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -359,7 +359,7 @@ BASE_EXPERIMENT = {
 
         # 每隔多少个全局环境步做一次评估。
         # 程序内部会自动换算成 update 间隔。
-        "eval_interval_env_steps": 2_000_000,
+        "eval_interval_env_steps": 100_000,
 
         # 兼容旧配置的回退项：只有 total_env_steps 为 None 时才使用。
         "total_updates": None,
@@ -880,7 +880,7 @@ BASE_EXPERIMENT = {
         "fixed_graph_bank_enabled": True,
 
         # 当 fixed_graph_bank_enabled=True 时，每种拓扑预生成多少张固定图。
-        "fixed_graph_bank_size_per_type": 10,
+        "fixed_graph_bank_size_per_type": 5,
 
         # 固定图库的随机种子。建议固定，便于复现实验。
         "fixed_graph_bank_seed": 666,
