@@ -604,6 +604,10 @@ BASE_EXPERIMENT = {
         # True 时，BC 不再因为“release 很晚”而在解锁前几乎衰减光。
         "actor_demo_bc_decay_from_teacher_release": True,
 
+        # 是否按 handoff stage 控制 demo BC：
+        # stage 1 保持 BC 锚点，stage 2 才开始真正衰减。
+        "actor_demo_bc_stage_aware": True,
+
         # 是否启用 actor BC 的 Q-filter。
         # 启用后，online 阶段只在 critic 认为 demo 动作优于当前 actor 动作时，才对该 demo transition 施加 BC。
         "actor_bc_q_filter_enabled": True,
@@ -808,7 +812,7 @@ BASE_EXPERIMENT = {
 
         # 当 adaptive_teacher_release_mode="eval_cooperation" 时，
         # 只要 periodic eval 的 f_c >= 该阈值，就记为一次达标评估。
-        "adaptive_teacher_release_min_cooperation": 0.80,
+        "adaptive_teacher_release_min_cooperation": 0.85,
 
         # online eval return 至少达到 pretrain best quick-eval 的多少比例，才允许 teacher 开始退场。
         "adaptive_teacher_release_min_return_ratio": 0.85,
@@ -820,7 +824,7 @@ BASE_EXPERIMENT = {
         "adaptive_teacher_release_max_critic_val_ratio": 1.50,
 
         # 连续多少次 online eval 达标后，才真正解锁 teacher 退场。
-        "adaptive_teacher_release_required_evals": 3,
+        "adaptive_teacher_release_required_evals": 8,
 
         # 稳定条件至少满足多少条才算一次达标。
         # 当前条件包括：eval return、actor_bc_val、critic_val。
@@ -834,6 +838,11 @@ BASE_EXPERIMENT = {
 
         # 连续多少次 eval 同时满足“release gate 继续成立 + actor 行为占比足够”，才进入 full handoff。
         "adaptive_teacher_handoff_required_evals": 2,
+
+        # full handoff 之后，若 actor 行为占比明显跌破阈值，是否允许回退到 soft release。
+        "adaptive_teacher_handoff_rollback_enabled": True,
+        "adaptive_teacher_handoff_rollback_min_actor_behavior": 0.45,
+        "adaptive_teacher_handoff_rollback_required_evals": 2,
 
         # 是否在 adaptive teacher release 真正解锁前，一直禁止 actor 的 Q 更新。
         # 这样可以先保持 imitation 锚点，等 teacher 退场门槛满足后再做 RL 提升。
@@ -852,6 +861,10 @@ BASE_EXPERIMENT = {
         # 是否把 actor Q ramp 的起点对齐到 teacher release 时刻。
         # True 时，release 晚不会导致 actor_q 一解锁就接近满强度。
         "online_actor_q_ramp_from_teacher_release": True,
+
+        # 是否按 handoff stage 控制 actor Q：
+        # stage 1 维持 initial，stage 2 才开始真正 ramp。
+        "online_actor_q_stage_aware": True,
 
         # critic 损失类型：
         # - "mse"
@@ -2060,6 +2073,7 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
             "actor_demo_bc_decay_from_teacher_release",
             True,
         ),
+        actor_demo_bc_stage_aware=training.get("actor_demo_bc_stage_aware", True),
         actor_bc_q_filter_enabled=training.get("actor_bc_q_filter_enabled", False),
         actor_bc_q_filter_margin=training.get("actor_bc_q_filter_margin", 0.0),
         actor_bc_q_filter_online_only=training.get("actor_bc_q_filter_online_only", True),
@@ -2152,6 +2166,18 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
             "adaptive_teacher_handoff_required_evals",
             2,
         ),
+        adaptive_teacher_handoff_rollback_enabled=training.get(
+            "adaptive_teacher_handoff_rollback_enabled",
+            True,
+        ),
+        adaptive_teacher_handoff_rollback_min_actor_behavior=training.get(
+            "adaptive_teacher_handoff_rollback_min_actor_behavior",
+            0.45,
+        ),
+        adaptive_teacher_handoff_rollback_required_evals=training.get(
+            "adaptive_teacher_handoff_rollback_required_evals",
+            2,
+        ),
         freeze_actor_q_until_teacher_release=training.get("freeze_actor_q_until_teacher_release", False),
         online_actor_q_coef_initial=training.get("online_actor_q_coef_initial", 0.2),
         online_actor_q_coef_final=training.get("online_actor_q_coef_final", 1.0),
@@ -2160,6 +2186,7 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
             "online_actor_q_ramp_from_teacher_release",
             True,
         ),
+        online_actor_q_stage_aware=training.get("online_actor_q_stage_aware", True),
         critic_loss_type=training.get("critic_loss_type", "huber"),
         critic_huber_delta=training.get("critic_huber_delta", 1.0),
         actor_grad_clip_norm=training.get("actor_grad_clip_norm", 5.0),
@@ -3493,6 +3520,7 @@ def _format_console_recent_stats_lines(
         ("teacher_release_stable_eval_count", "teacher_release_stable"),
         ("teacher_handoff_stage", "handoff_stage"),
         ("teacher_handoff_stage_stable_eval_count", "handoff_stable"),
+        ("teacher_handoff_regression_eval_count", "handoff_regress"),
         ("profile_rollout_steps_per_second", "rollout_sps"),
         ("profile_rollout_collect_seconds", "rollout_collect_s"),
         ("profile_rollout_collect_worker_seconds", "worker_collect_s"),
@@ -3738,6 +3766,18 @@ def _log_tensorboard_static_metadata(
         "static/training/adaptive_teacher_handoff_required_evals": float(
             spec["training"].get("adaptive_teacher_handoff_required_evals", 2)
         ),
+        "static/training/adaptive_teacher_handoff_rollback_enabled": float(
+            1.0 if spec["training"].get("adaptive_teacher_handoff_rollback_enabled", True) else 0.0
+        ),
+        "static/training/adaptive_teacher_handoff_rollback_min_actor_behavior": float(
+            spec["training"].get("adaptive_teacher_handoff_rollback_min_actor_behavior", 0.45)
+        ),
+        "static/training/adaptive_teacher_handoff_rollback_required_evals": float(
+            spec["training"].get("adaptive_teacher_handoff_rollback_required_evals", 2)
+        ),
+        "static/training/actor_demo_bc_stage_aware": float(
+            1.0 if spec["training"].get("actor_demo_bc_stage_aware", True) else 0.0
+        ),
         "static/training/online_actor_q_coef_initial": float(
             spec["training"].get("online_actor_q_coef_initial", 0.2)
         ),
@@ -3746,6 +3786,9 @@ def _log_tensorboard_static_metadata(
         ),
         "static/training/online_actor_q_coef_ramp_end_fraction": float(
             spec["training"].get("online_actor_q_coef_ramp_end_fraction", 0.30)
+        ),
+        "static/training/online_actor_q_stage_aware": float(
+            1.0 if spec["training"].get("online_actor_q_stage_aware", True) else 0.0
         ),
         "static/training/critic_huber_delta": float(spec["training"].get("critic_huber_delta", 1.0)),
         "static/training/rollout_inference_batch_timeout_ms": float(
@@ -4420,7 +4463,7 @@ def run_gnn_training_mode(
                 )
             )
             print(
-                "Stab CFG : teacher_takeover={0}({1}->{2}, soft={3}, end@{4}, stage_transition@{5}), adaptive_release={6}({7}, need={8}/{9}, warmup_guard={10}), handoff(actor_logits>={11:.2f}, need={12}), q_filter={13}(margin={14}, online_only={15}, require_release={16}), actor_bc_decay={17}(from_release={18}), actor_q_coef={19}->{20} end@{21} (from_release={22}), critic_loss={23}, huber_delta={24}, grad_clip(actor={25}, critic={26})".format(
+                "Stab CFG : teacher_takeover={0}({1}->{2}, soft={3}, end@{4}, stage_transition@{5}), adaptive_release={6}({7}, need={8}/{9}, warmup_guard={10}), handoff(promote actor_logits>={11:.2f}, need={12}, rollback={13}@<{14:.2f} for {15}), q_filter={16}(margin={17}, online_only={18}, require_release={19}), actor_bc_decay={20}(from_release={21}, stage_aware={22}), actor_q_coef={23}->{24} end@{25} (from_release={26}, stage_aware={27}), critic_loss={28}, huber_delta={29}, grad_clip(actor={30}, critic={31})".format(
                     trainer_config.teacher_takeover_enabled,
                     trainer_config.teacher_takeover_start_prob,
                     trainer_config.teacher_takeover_end_prob,
@@ -4442,16 +4485,21 @@ def run_gnn_training_mode(
                     trainer_config.adaptive_teacher_release_require_warmup_complete,
                     trainer_config.adaptive_teacher_handoff_min_actor_behavior,
                     trainer_config.adaptive_teacher_handoff_required_evals,
+                    trainer_config.adaptive_teacher_handoff_rollback_enabled,
+                    trainer_config.adaptive_teacher_handoff_rollback_min_actor_behavior,
+                    trainer_config.adaptive_teacher_handoff_rollback_required_evals,
                     trainer_config.actor_bc_q_filter_enabled,
                     trainer_config.actor_bc_q_filter_margin,
                     trainer_config.actor_bc_q_filter_online_only,
                     trainer_config.actor_bc_q_filter_require_teacher_release,
                     trainer_config.actor_demo_bc_decay_end_fraction,
                     trainer_config.actor_demo_bc_decay_from_teacher_release,
+                    trainer_config.actor_demo_bc_stage_aware,
                     trainer_config.online_actor_q_coef_initial,
                     trainer_config.online_actor_q_coef_final,
                     trainer_config.online_actor_q_coef_ramp_end_fraction,
                     trainer_config.online_actor_q_ramp_from_teacher_release,
+                    trainer_config.online_actor_q_stage_aware,
                     trainer_config.critic_loss_type,
                     trainer_config.critic_huber_delta,
                     trainer_config.actor_grad_clip_norm,

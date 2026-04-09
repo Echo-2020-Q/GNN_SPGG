@@ -133,9 +133,11 @@ class GraphTD3Trainer:
         self.demo_validation_batch: TensorReplayBatch | None = None
         self.teacher_takeover_release_env_step: int | None = None
         self.teacher_takeover_stable_eval_count = 0
+        self.teacher_takeover_soft_release_env_step: int | None = None
         self.teacher_takeover_full_release_env_step: int | None = None
         self.teacher_handoff_stage = 0
         self.teacher_handoff_stable_eval_count = 0
+        self.teacher_handoff_regression_eval_count = 0
 
     def preload_demo_replay(
         self,
@@ -433,9 +435,13 @@ class GraphTD3Trainer:
             "teacher_handoff_soft_released": 1.0 if int(self.teacher_handoff_stage) >= 1 else 0.0,
             "teacher_handoff_full_released": 1.0 if int(self.teacher_handoff_stage) >= 2 else 0.0,
             "teacher_handoff_stage_stable_eval_count": float(self.teacher_handoff_stable_eval_count),
+            "teacher_handoff_regression_eval_count": float(self.teacher_handoff_regression_eval_count),
             "teacher_handoff_behavior_frac_actor_logits": float(behavior_frac_actor_logits),
             "teacher_handoff_behavior_gate_passed": 0.0,
+            "teacher_handoff_rollback_gate_passed": 1.0,
             "teacher_handoff_stage_just_advanced": 0.0,
+            "teacher_handoff_stage_just_regressed": 0.0,
+            "teacher_handoff_stage_just_changed": 0.0,
         }
         if not bool(self.config.adaptive_teacher_release_enabled):
             return metrics
@@ -445,8 +451,10 @@ class GraphTD3Trainer:
         ):
             self.teacher_takeover_stable_eval_count = 0
             self.teacher_handoff_stable_eval_count = 0
+            self.teacher_handoff_regression_eval_count = 0
             metrics["teacher_release_stable_eval_count"] = 0.0
             metrics["teacher_handoff_stage_stable_eval_count"] = 0.0
+            metrics["teacher_handoff_regression_eval_count"] = 0.0
             return metrics
 
         available, passed, gate_passed = self._evaluate_teacher_release_gate(
@@ -471,8 +479,11 @@ class GraphTD3Trainer:
 
             if self.teacher_takeover_stable_eval_count >= int(self.config.adaptive_teacher_release_required_evals):
                 self.teacher_takeover_release_env_step = int(self.global_env_steps)
+                self.teacher_takeover_soft_release_env_step = int(self.global_env_steps)
+                self.teacher_takeover_full_release_env_step = None
                 self.teacher_handoff_stage = 1
                 self.teacher_handoff_stable_eval_count = 0
+                self.teacher_handoff_regression_eval_count = 0
                 if str(self.config.adaptive_teacher_release_mode) == "eval_cooperation":
                     print(
                         "Teacher Release | stage=soft_release | unlocked at t_env={0} | eval_f_c={1:.6f} | threshold={2:.6f}".format(
@@ -492,11 +503,13 @@ class GraphTD3Trainer:
                     )
                 metrics["teacher_release_just_unlocked"] = 1.0
                 metrics["teacher_handoff_stage_just_advanced"] = 1.0
+                metrics["teacher_handoff_stage_just_changed"] = 1.0
 
             metrics["teacher_release_unlocked"] = 1.0 if self.teacher_takeover_release_env_step is not None else 0.0
             metrics["teacher_release_stable_eval_count"] = float(self.teacher_takeover_stable_eval_count)
             metrics["teacher_handoff_stage"] = float(self.teacher_handoff_stage)
             metrics["teacher_handoff_soft_released"] = 1.0 if int(self.teacher_handoff_stage) >= 1 else 0.0
+            metrics["teacher_handoff_regression_eval_count"] = float(self.teacher_handoff_regression_eval_count)
             return metrics
 
         metrics["teacher_release_unlocked"] = 1.0
@@ -504,36 +517,69 @@ class GraphTD3Trainer:
         metrics["teacher_handoff_stage"] = float(self.teacher_handoff_stage)
         metrics["teacher_handoff_soft_released"] = 1.0
 
-        if int(self.teacher_handoff_stage) >= 2:
-            metrics["teacher_handoff_full_released"] = 1.0
-            return metrics
-
         behavior_gate_passed = float(behavior_frac_actor_logits) >= float(
             self.config.adaptive_teacher_handoff_min_actor_behavior
         )
         metrics["teacher_handoff_behavior_gate_passed"] = 1.0 if behavior_gate_passed else 0.0
-        if gate_passed and behavior_gate_passed:
-            self.teacher_handoff_stable_eval_count += 1
-        else:
-            self.teacher_handoff_stable_eval_count = 0
+        if int(self.teacher_handoff_stage) < 2:
+            self.teacher_handoff_regression_eval_count = 0
+            if gate_passed and behavior_gate_passed:
+                self.teacher_handoff_stable_eval_count += 1
+            else:
+                self.teacher_handoff_stable_eval_count = 0
 
-        if self.teacher_handoff_stable_eval_count >= int(self.config.adaptive_teacher_handoff_required_evals):
-            self.teacher_handoff_stage = 2
-            self.teacher_takeover_full_release_env_step = int(self.global_env_steps)
-            self.teacher_handoff_stable_eval_count = 0
-            metrics["teacher_handoff_stage_just_advanced"] = 1.0
-            print(
-                "Teacher Handoff | stage=full_handoff | unlocked at t_env={0} | actor_logits_frac={1:.6f} | eval_f_c={2:.6f} | eval_return={3:.6f}".format(
-                    int(self.global_env_steps),
-                    float(behavior_frac_actor_logits),
-                    float(online_eval_cooperation_mean),
-                    float(online_eval_return_mean),
+            if self.teacher_handoff_stable_eval_count >= int(self.config.adaptive_teacher_handoff_required_evals):
+                self.teacher_handoff_stage = 2
+                self.teacher_takeover_full_release_env_step = int(self.global_env_steps)
+                self.teacher_handoff_stable_eval_count = 0
+                self.teacher_handoff_regression_eval_count = 0
+                metrics["teacher_handoff_stage_just_advanced"] = 1.0
+                metrics["teacher_handoff_stage_just_changed"] = 1.0
+                print(
+                    "Teacher Handoff | stage=full_handoff | unlocked at t_env={0} | actor_logits_frac={1:.6f} | eval_f_c={2:.6f} | eval_return={3:.6f}".format(
+                        int(self.global_env_steps),
+                        float(behavior_frac_actor_logits),
+                        float(online_eval_cooperation_mean),
+                        float(online_eval_return_mean),
+                    )
                 )
+        else:
+            rollback_gate_passed = gate_passed and (
+                float(behavior_frac_actor_logits) >= float(self.config.adaptive_teacher_handoff_rollback_min_actor_behavior)
             )
+            metrics["teacher_handoff_rollback_gate_passed"] = 1.0 if rollback_gate_passed else 0.0
+            self.teacher_handoff_stable_eval_count = 0
+            if bool(self.config.adaptive_teacher_handoff_rollback_enabled) and not rollback_gate_passed:
+                self.teacher_handoff_regression_eval_count += 1
+            else:
+                self.teacher_handoff_regression_eval_count = 0
+
+            if (
+                bool(self.config.adaptive_teacher_handoff_rollback_enabled)
+                and self.teacher_handoff_regression_eval_count
+                >= int(self.config.adaptive_teacher_handoff_rollback_required_evals)
+            ):
+                self.teacher_handoff_stage = 1
+                self.teacher_takeover_soft_release_env_step = int(self.global_env_steps)
+                self.teacher_takeover_full_release_env_step = None
+                self.teacher_handoff_stable_eval_count = 0
+                self.teacher_handoff_regression_eval_count = 0
+                metrics["teacher_handoff_stage_just_regressed"] = 1.0
+                metrics["teacher_handoff_stage_just_changed"] = 1.0
+                print(
+                    "Teacher Handoff | rollback to soft_release at t_env={0} | actor_logits_frac={1:.6f} | eval_f_c={2:.6f} | eval_return={3:.6f}".format(
+                        int(self.global_env_steps),
+                        float(behavior_frac_actor_logits),
+                        float(online_eval_cooperation_mean),
+                        float(online_eval_return_mean),
+                    )
+                )
 
         metrics["teacher_handoff_stage"] = float(self.teacher_handoff_stage)
+        metrics["teacher_handoff_soft_released"] = 1.0 if int(self.teacher_handoff_stage) >= 1 else 0.0
         metrics["teacher_handoff_full_released"] = 1.0 if int(self.teacher_handoff_stage) >= 2 else 0.0
         metrics["teacher_handoff_stage_stable_eval_count"] = float(self.teacher_handoff_stable_eval_count)
+        metrics["teacher_handoff_regression_eval_count"] = float(self.teacher_handoff_regression_eval_count)
         return metrics
 
     def _shutdown_rollout_runtime(self) -> None:
@@ -689,6 +735,11 @@ class GraphTD3Trainer:
                 None if self.teacher_takeover_release_env_step is None else int(self.teacher_takeover_release_env_step)
             ),
             "teacher_takeover_stable_eval_count": int(self.teacher_takeover_stable_eval_count),
+            "teacher_takeover_soft_release_env_step": (
+                None
+                if self.teacher_takeover_soft_release_env_step is None
+                else int(self.teacher_takeover_soft_release_env_step)
+            ),
             "teacher_takeover_full_release_env_step": (
                 None
                 if self.teacher_takeover_full_release_env_step is None
@@ -696,6 +747,7 @@ class GraphTD3Trainer:
             ),
             "teacher_handoff_stage": int(self.teacher_handoff_stage),
             "teacher_handoff_stable_eval_count": int(self.teacher_handoff_stable_eval_count),
+            "teacher_handoff_regression_eval_count": int(self.teacher_handoff_regression_eval_count),
         }
         if checkpoint_mode == "full_resume":
             payload["replay_buffer_state"] = self.replay_buffer.state_dict()
@@ -714,6 +766,10 @@ class GraphTD3Trainer:
         release_env_step = checkpoint.get("teacher_takeover_release_env_step")
         self.teacher_takeover_release_env_step = None if release_env_step is None else int(release_env_step)
         self.teacher_takeover_stable_eval_count = int(checkpoint.get("teacher_takeover_stable_eval_count", 0))
+        soft_release_env_step = checkpoint.get("teacher_takeover_soft_release_env_step")
+        self.teacher_takeover_soft_release_env_step = (
+            None if soft_release_env_step is None else int(soft_release_env_step)
+        )
         full_release_env_step = checkpoint.get("teacher_takeover_full_release_env_step")
         self.teacher_takeover_full_release_env_step = (
             None if full_release_env_step is None else int(full_release_env_step)
@@ -725,6 +781,7 @@ class GraphTD3Trainer:
             )
         )
         self.teacher_handoff_stable_eval_count = int(checkpoint.get("teacher_handoff_stable_eval_count", 0))
+        self.teacher_handoff_regression_eval_count = int(checkpoint.get("teacher_handoff_regression_eval_count", 0))
         checkpoint_mode = str(
             checkpoint.get(
                 "checkpoint_mode",
@@ -753,6 +810,7 @@ class GraphTD3Trainer:
                     actor_state_dict,
                     version=actor_version,
                     teacher_takeover_release_env_step=self.teacher_takeover_release_env_step,
+                    teacher_takeover_soft_release_env_step=self.teacher_takeover_soft_release_env_step,
                     teacher_takeover_full_release_env_step=self.teacher_takeover_full_release_env_step,
                     teacher_handoff_stage=self.teacher_handoff_stage,
                 )
@@ -1952,6 +2010,8 @@ class GraphTD3Trainer:
                 global_env_steps=int(self.global_env_steps),
                 teacher_release_unlocked=(self.teacher_takeover_release_env_step is not None),
                 teacher_release_env_step=self.teacher_takeover_release_env_step,
+                teacher_handoff_stage=self.teacher_handoff_stage,
+                teacher_full_release_env_step=self.teacher_takeover_full_release_env_step,
             )
             learner_metrics = dict(step_metrics)
             for key in accumulated_profiles:
@@ -1985,6 +2045,7 @@ class GraphTD3Trainer:
                 actor_state_dict,
                 version=actor_version,
                 teacher_takeover_release_env_step=self.teacher_takeover_release_env_step,
+                teacher_takeover_soft_release_env_step=self.teacher_takeover_soft_release_env_step,
                 teacher_takeover_full_release_env_step=self.teacher_takeover_full_release_env_step,
                 teacher_handoff_stage=self.teacher_handoff_stage,
             )
@@ -2210,7 +2271,7 @@ class GraphTD3Trainer:
                     metrics[key] = float(value)
                 if (
                     bool(teacher_release_metrics.get("teacher_release_just_unlocked", 0.0))
-                    or bool(teacher_release_metrics.get("teacher_handoff_stage_just_advanced", 0.0))
+                    or bool(teacher_release_metrics.get("teacher_handoff_stage_just_changed", 0.0))
                 ) and self.workers:
                     self._broadcast_actor_state_to_rollout_runtime()
                 evaluation_seconds = float(perf_counter() - evaluation_start)

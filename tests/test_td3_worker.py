@@ -184,6 +184,7 @@ class RolloutWorkerTeacherTests(unittest.TestCase):
         worker.train_config.teacher_takeover_soft_prob = 0.4
         worker.train_config.teacher_takeover_stage_transition_fraction = 0.10
         worker.teacher_takeover_release_env_step = 10
+        worker.teacher_takeover_soft_release_env_step = 10
         worker.teacher_handoff_stage = 1
 
         self.assertAlmostEqual(worker._current_teacher_takeover_prob(10), 0.8, places=6)
@@ -196,6 +197,14 @@ class RolloutWorkerTeacherTests(unittest.TestCase):
         self.assertAlmostEqual(worker._current_teacher_takeover_prob(20), 0.4, places=6)
         self.assertAlmostEqual(worker._current_teacher_takeover_prob(24), 0.0, places=6)
         self.assertAlmostEqual(worker._current_teacher_takeover_prob(30), 0.0, places=6)
+
+        worker.teacher_takeover_soft_release_env_step = 30
+        worker.teacher_takeover_full_release_env_step = None
+        worker.teacher_handoff_stage = 1
+
+        self.assertAlmostEqual(worker._current_teacher_takeover_prob(30), 0.0, places=6)
+        self.assertAlmostEqual(worker._current_teacher_takeover_prob(34), 0.4, places=6)
+        self.assertAlmostEqual(worker._current_teacher_takeover_prob(40), 0.4, places=6)
 
 
 @unittest.skipUnless(NUMPY_AVAILABLE and TORCH_AVAILABLE, "numpy and torch are required for worker tests")

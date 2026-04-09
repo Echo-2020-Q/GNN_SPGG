@@ -553,6 +553,7 @@ class RolloutWorker:
         self.current_warmup_behavior_sources: list[str | None] = [None for _ in range(self.num_envs_per_worker)]
         self.current_teacher_takeover_decisions: list[bool | None] = [None for _ in range(self.num_envs_per_worker)]
         self.teacher_takeover_release_env_step: int | None = None
+        self.teacher_takeover_soft_release_env_step: int | None = None
         self.teacher_takeover_full_release_env_step: int | None = None
         self.teacher_handoff_stage = 0
 
@@ -561,6 +562,7 @@ class RolloutWorker:
         actor_state_dict: dict[str, torch.Tensor],
         version: int,
         teacher_takeover_release_env_step: int | None = None,
+        teacher_takeover_soft_release_env_step: int | None = None,
         teacher_takeover_full_release_env_step: int | None = None,
         teacher_handoff_stage: int = 0,
     ) -> None:
@@ -569,6 +571,9 @@ class RolloutWorker:
         self.actor_version = version
         self.teacher_takeover_release_env_step = (
             None if teacher_takeover_release_env_step is None else int(teacher_takeover_release_env_step)
+        )
+        self.teacher_takeover_soft_release_env_step = (
+            None if teacher_takeover_soft_release_env_step is None else int(teacher_takeover_soft_release_env_step)
         )
         self.teacher_takeover_full_release_env_step = (
             None if teacher_takeover_full_release_env_step is None else int(teacher_takeover_full_release_env_step)
@@ -602,6 +607,11 @@ class RolloutWorker:
                 if self.teacher_takeover_release_env_step is None
                 else int(self.teacher_takeover_release_env_step)
             ),
+            "teacher_takeover_soft_release_env_step": (
+                None
+                if self.teacher_takeover_soft_release_env_step is None
+                else int(self.teacher_takeover_soft_release_env_step)
+            ),
             "teacher_takeover_full_release_env_step": (
                 None
                 if self.teacher_takeover_full_release_env_step is None
@@ -627,6 +637,10 @@ class RolloutWorker:
         self.actor.eval()
         release_env_step = state_dict.get("teacher_takeover_release_env_step")
         self.teacher_takeover_release_env_step = None if release_env_step is None else int(release_env_step)
+        soft_release_env_step = state_dict.get("teacher_takeover_soft_release_env_step")
+        self.teacher_takeover_soft_release_env_step = (
+            None if soft_release_env_step is None else int(soft_release_env_step)
+        )
         full_release_env_step = state_dict.get("teacher_takeover_full_release_env_step")
         self.teacher_takeover_full_release_env_step = (
             None if full_release_env_step is None else int(full_release_env_step)
@@ -745,31 +759,31 @@ class RolloutWorker:
         )
         release_env_step = max(warmup_end_step, release_env_step)
         stage = int(self.teacher_handoff_stage)
+        soft_release_step = (
+            int(self.teacher_takeover_soft_release_env_step)
+            if self.teacher_takeover_soft_release_env_step is not None
+            else release_env_step
+        )
+        soft_release_step = max(release_env_step, soft_release_step)
         transition_duration = int(
             round(float(total_rollout_env_steps) * float(self.train_config.teacher_takeover_stage_transition_fraction))
         )
         transition_duration = max(1, transition_duration)
         soft_prob = float(self.train_config.teacher_takeover_soft_prob)
+        soft_stage_start_prob = end_prob if soft_release_step > release_env_step else start_prob
         soft_stage_prob = self._interpolate_prob(
-            start_prob,
+            soft_stage_start_prob,
             soft_prob,
             current_step=current_step,
-            start_step=release_env_step,
+            start_step=soft_release_step,
             duration=transition_duration,
         )
         if stage <= 1 or self.teacher_takeover_full_release_env_step is None:
             return soft_stage_prob
 
-        full_release_step = max(release_env_step, int(self.teacher_takeover_full_release_env_step))
-        soft_prob_at_full_release = self._interpolate_prob(
-            start_prob,
-            soft_prob,
-            current_step=full_release_step,
-            start_step=release_env_step,
-            duration=transition_duration,
-        )
+        full_release_step = max(soft_release_step, int(self.teacher_takeover_full_release_env_step))
         return self._interpolate_prob(
-            soft_prob_at_full_release,
+            soft_prob,
             end_prob,
             current_step=current_step,
             start_step=full_release_step,
@@ -1508,6 +1522,7 @@ def _parallel_rollout_worker_main(
                         actor_state_dict=dict(message["actor_state_dict"]),
                         version=int(message["version"]),
                         teacher_takeover_release_env_step=message.get("teacher_takeover_release_env_step"),
+                        teacher_takeover_soft_release_env_step=message.get("teacher_takeover_soft_release_env_step"),
                         teacher_takeover_full_release_env_step=message.get("teacher_takeover_full_release_env_step"),
                         teacher_handoff_stage=int(message.get("teacher_handoff_stage", 0)),
                     )
@@ -1647,6 +1662,7 @@ class ParallelRolloutWorker:
         actor_state_dict: dict[str, torch.Tensor],
         version: int,
         teacher_takeover_release_env_step: int | None = None,
+        teacher_takeover_soft_release_env_step: int | None = None,
         teacher_takeover_full_release_env_step: int | None = None,
         teacher_handoff_stage: int = 0,
     ) -> None:
@@ -1659,6 +1675,11 @@ class ParallelRolloutWorker:
                     None
                     if teacher_takeover_release_env_step is None
                     else int(teacher_takeover_release_env_step)
+                ),
+                "teacher_takeover_soft_release_env_step": (
+                    None
+                    if teacher_takeover_soft_release_env_step is None
+                    else int(teacher_takeover_soft_release_env_step)
                 ),
                 "teacher_takeover_full_release_env_step": (
                     None

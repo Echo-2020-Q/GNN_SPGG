@@ -301,17 +301,61 @@ class GraphTD3LearnerPretrainTests(unittest.TestCase):
             global_env_steps=60,
             teacher_release_unlocked=True,
             teacher_release_env_step=60,
+            teacher_handoff_stage=2,
+            teacher_full_release_env_step=60,
         )
         after_release = learner.train_step(
             global_env_steps=90,
             teacher_release_unlocked=True,
             teacher_release_env_step=60,
+            teacher_handoff_stage=2,
+            teacher_full_release_env_step=60,
         )
 
         self.assertAlmostEqual(float(just_released["actor_q_coef"]), 0.2, places=6)
         self.assertAlmostEqual(float(just_released["actor_bc_coef"]), 0.8, places=6)
         self.assertGreater(float(after_release["actor_q_coef"]), float(just_released["actor_q_coef"]))
         self.assertLess(float(after_release["actor_bc_coef"]), float(just_released["actor_bc_coef"]))
+
+    def test_stage_aware_actor_schedules_hold_during_soft_release(self) -> None:
+        learner = self._make_learner()
+        learner.config.warmup_steps = 10
+        learner.config.policy_delay = 1
+        learner.config.total_updates = 100
+        learner.config.steps_per_update = 1
+        learner.config.num_workers = 1
+        learner.config.batch_size = 4
+        learner.config.adaptive_teacher_release_enabled = True
+        learner.config.freeze_actor_q_until_teacher_release = True
+        learner.config.actor_demo_bc_coef = 0.8
+        learner.config.actor_demo_bc_stage_aware = True
+        learner.config.online_actor_q_coef_initial = 0.2
+        learner.config.online_actor_q_stage_aware = True
+
+        fixed_batch = learner.replay_buffer.export_demo_batch()
+        assert fixed_batch is not None
+        learner.replay_buffer.sample = lambda *args, **kwargs: fixed_batch  # type: ignore[method-assign]
+        learner.replay_buffer.get_last_sample_stats = lambda: {}  # type: ignore[method-assign]
+
+        early_soft = learner.train_step(
+            global_env_steps=60,
+            teacher_release_unlocked=True,
+            teacher_release_env_step=40,
+            teacher_handoff_stage=1,
+            teacher_full_release_env_step=None,
+        )
+        late_soft = learner.train_step(
+            global_env_steps=120,
+            teacher_release_unlocked=True,
+            teacher_release_env_step=40,
+            teacher_handoff_stage=1,
+            teacher_full_release_env_step=None,
+        )
+
+        self.assertAlmostEqual(float(early_soft["actor_q_coef"]), 0.2, places=6)
+        self.assertAlmostEqual(float(late_soft["actor_q_coef"]), 0.2, places=6)
+        self.assertAlmostEqual(float(early_soft["actor_bc_coef"]), 0.8, places=6)
+        self.assertAlmostEqual(float(late_soft["actor_bc_coef"]), 0.8, places=6)
 
     def test_freeze_actor_q_until_teacher_release_is_noop_without_adaptive_release(self) -> None:
         learner = self._make_learner()

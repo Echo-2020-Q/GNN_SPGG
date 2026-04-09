@@ -679,6 +679,81 @@ class TrainerSmokeTests(unittest.TestCase):
         finally:
             trainer.close()
 
+    def test_adaptive_teacher_handoff_can_rollback_to_soft_release(self) -> None:
+        env = SPGGEnv(
+            SPGGConfig(
+                alpha=0.0,
+                r=0.5,
+                p_max=5.0,
+                beta=1.0,
+                episode_length=4,
+                reward=RewardConfig(lambda_payoff=1.0, lambda_cooperation=0.5, lambda_gini=0.1),
+            ),
+            make_grid_graph(2, 2),
+        )
+        policy = GNNAllocationPolicy(GNNPolicyConfig(hidden_dim=16, num_message_passing_layers=2))
+        trainer = CentralizedActorCriticTrainer(
+            env=env,
+            policy=policy,
+            config=TrainerConfig(
+                total_updates=2,
+                steps_per_update=4,
+                eval_interval=1,
+                eval_episodes=1,
+                adaptive_teacher_release_enabled=True,
+                adaptive_teacher_release_mode="eval_cooperation",
+                adaptive_teacher_release_min_cooperation=0.8,
+                adaptive_teacher_release_required_evals=1,
+                adaptive_teacher_handoff_min_actor_behavior=0.6,
+                adaptive_teacher_handoff_required_evals=1,
+                adaptive_teacher_handoff_rollback_enabled=True,
+                adaptive_teacher_handoff_rollback_min_actor_behavior=0.45,
+                adaptive_teacher_handoff_rollback_required_evals=2,
+                warmup_steps=0,
+                seed=0,
+            ),
+        )
+        try:
+            trainer.global_env_steps = 100
+            trainer._update_adaptive_teacher_release(
+                online_eval_cooperation_mean=0.85,
+                online_eval_return_mean=0.0,
+                actor_bc_val_loss=None,
+                critic_val_loss=None,
+                behavior_frac_actor_logits=0.2,
+            )
+            trainer.global_env_steps = 120
+            trainer._update_adaptive_teacher_release(
+                online_eval_cooperation_mean=0.86,
+                online_eval_return_mean=0.0,
+                actor_bc_val_loss=None,
+                critic_val_loss=None,
+                behavior_frac_actor_logits=0.7,
+            )
+            trainer.global_env_steps = 140
+            first_regression = trainer._update_adaptive_teacher_release(
+                online_eval_cooperation_mean=0.82,
+                online_eval_return_mean=0.0,
+                actor_bc_val_loss=None,
+                critic_val_loss=None,
+                behavior_frac_actor_logits=0.3,
+            )
+            trainer.global_env_steps = 160
+            second_regression = trainer._update_adaptive_teacher_release(
+                online_eval_cooperation_mean=0.82,
+                online_eval_return_mean=0.0,
+                actor_bc_val_loss=None,
+                critic_val_loss=None,
+                behavior_frac_actor_logits=0.3,
+            )
+            self.assertEqual(int(first_regression["teacher_handoff_stage"]), 2)
+            self.assertEqual(int(second_regression["teacher_handoff_stage"]), 1)
+            self.assertEqual(float(second_regression["teacher_handoff_stage_just_regressed"]), 1.0)
+            self.assertEqual(trainer.teacher_takeover_full_release_env_step, None)
+            self.assertEqual(int(trainer.teacher_takeover_soft_release_env_step or -1), 160)
+        finally:
+            trainer.close()
+
     def test_parallel_worker_training_smoke(self) -> None:
         env = SPGGEnv(
             SPGGConfig(

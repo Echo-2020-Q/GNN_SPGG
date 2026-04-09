@@ -346,6 +346,8 @@ class GraphTD3Learner:
         global_env_steps: int | None,
         *,
         teacher_release_env_step: int | None = None,
+        teacher_handoff_stage: int = 0,
+        teacher_full_release_env_step: int | None = None,
     ) -> float:
         if int(self.config.warmup_steps) <= 0:
             return 0.0
@@ -357,13 +359,21 @@ class GraphTD3Learner:
         warmup_end_step = int(self.config.warmup_steps)
         decay_end_fraction = float(self.config.actor_demo_bc_decay_end_fraction)
         current_step = max(0, int(global_env_steps))
-        reference_step = warmup_end_step
-        if (
-            bool(self.config.actor_demo_bc_decay_from_teacher_release)
-            and bool(self.config.adaptive_teacher_release_enabled)
-            and teacher_release_env_step is not None
-        ):
-            reference_step = max(warmup_end_step, int(teacher_release_env_step))
+        if bool(self.config.actor_demo_bc_stage_aware) and bool(self.config.adaptive_teacher_release_enabled):
+            if int(teacher_handoff_stage) < 2:
+                return float(self.config.actor_demo_bc_coef)
+            if teacher_full_release_env_step is not None:
+                reference_step = max(warmup_end_step, int(teacher_full_release_env_step))
+            else:
+                reference_step = warmup_end_step
+        else:
+            reference_step = warmup_end_step
+            if (
+                bool(self.config.actor_demo_bc_decay_from_teacher_release)
+                and bool(self.config.adaptive_teacher_release_enabled)
+                and teacher_release_env_step is not None
+            ):
+                reference_step = max(warmup_end_step, int(teacher_release_env_step))
         decay_duration = int(round(float(total_rollout_env_steps) * decay_end_fraction))
         decay_end_step = max(reference_step, reference_step + decay_duration)
 
@@ -383,6 +393,8 @@ class GraphTD3Learner:
         global_env_steps: int | None,
         *,
         teacher_release_env_step: int | None = None,
+        teacher_handoff_stage: int = 0,
+        teacher_full_release_env_step: int | None = None,
     ) -> float:
         if global_env_steps is None:
             return float(self.config.online_actor_q_coef_final)
@@ -390,13 +402,21 @@ class GraphTD3Learner:
         total_rollout_env_steps = int(self.config.total_updates) * int(self.config.steps_per_update) * int(self.config.num_workers)
         current_step = max(0, int(global_env_steps))
         warmup_end_step = int(self.config.warmup_steps)
-        reference_step = warmup_end_step
-        if (
-            bool(self.config.online_actor_q_ramp_from_teacher_release)
-            and bool(self.config.adaptive_teacher_release_enabled)
-            and teacher_release_env_step is not None
-        ):
-            reference_step = max(warmup_end_step, int(teacher_release_env_step))
+        if bool(self.config.online_actor_q_stage_aware) and bool(self.config.adaptive_teacher_release_enabled):
+            if int(teacher_handoff_stage) < 2:
+                return float(self.config.online_actor_q_coef_initial)
+            if teacher_full_release_env_step is not None:
+                reference_step = max(warmup_end_step, int(teacher_full_release_env_step))
+            else:
+                reference_step = warmup_end_step
+        else:
+            reference_step = warmup_end_step
+            if (
+                bool(self.config.online_actor_q_ramp_from_teacher_release)
+                and bool(self.config.adaptive_teacher_release_enabled)
+                and teacher_release_env_step is not None
+            ):
+                reference_step = max(warmup_end_step, int(teacher_release_env_step))
         ramp_duration = int(round(float(total_rollout_env_steps) * float(self.config.online_actor_q_coef_ramp_end_fraction)))
         ramp_end_step = max(reference_step, reference_step + ramp_duration)
 
@@ -993,6 +1013,8 @@ class GraphTD3Learner:
         *,
         teacher_release_unlocked: bool = False,
         teacher_release_env_step: int | None = None,
+        teacher_handoff_stage: int = 0,
+        teacher_full_release_env_step: int | None = None,
     ) -> dict[str, float]:
         if len(self.replay_buffer) < max(1, self.config.batch_size):
             return {
@@ -1097,6 +1119,8 @@ class GraphTD3Learner:
             self._current_demo_bc_coef(
                 global_env_steps,
                 teacher_release_env_step=teacher_release_env_step,
+                teacher_handoff_stage=teacher_handoff_stage,
+                teacher_full_release_env_step=teacher_full_release_env_step,
             )
             if actor_q_enabled
             else (float(self.config.warmup_actor_bc_coef) if actor_update_enabled else 0.0)
@@ -1105,6 +1129,8 @@ class GraphTD3Learner:
             actor_q_coef = self._current_actor_q_coef(
                 global_env_steps,
                 teacher_release_env_step=teacher_release_env_step,
+                teacher_handoff_stage=teacher_handoff_stage,
+                teacher_full_release_env_step=teacher_full_release_env_step,
             )
         q_filter_enabled = bool(self.config.actor_bc_q_filter_enabled) and actor_q_enabled and bc_coef > 0.0
         if q_filter_enabled and bool(self.config.actor_bc_q_filter_require_teacher_release):
