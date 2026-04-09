@@ -4045,6 +4045,9 @@ def run_gnn_training_mode(
                     trainer_config.ppo_advantage_normalization,
                 )
             )
+            print(
+                "PPO Note : ignoring TD3-only replay/demo/teacher settings during PPO training."
+            )
         else:
             print(
                 "Replay CFG: strategy={0}, capacity={1}, topology_names={2}, recent={3:.2f}, long_term={4:.2f}, demo={5:.2f}, demo_source={6}, collapse_cap_per_topology={7:.2f}".format(
@@ -4190,6 +4193,13 @@ def run_gnn_training_mode(
         save_demo_pretrain_checkpoint = bool(training.get("save_demo_pretrain_checkpoint", False)) if algo == "td3" else False
         demo_pretrain_checkpoint_name = str(training.get("demo_pretrain_checkpoint_name", "demo_pretrained.pt"))
         stop_after_demo_pretrain = bool(training.get("stop_after_demo_pretrain", False)) if algo == "td3" else False
+        if algo == "ppo" and (
+            bool(training.get("save_demo_pretrain_checkpoint", False))
+            or bool(training.get("stop_after_demo_pretrain", False))
+        ):
+            raise ValueError(
+                "Demo-pretrain checkpoint options are unsupported when training.algo == 'ppo'."
+            )
         if stop_after_demo_pretrain and not save_demo_pretrain_checkpoint:
             raise ValueError(
                 "training.stop_after_demo_pretrain=True requires "
