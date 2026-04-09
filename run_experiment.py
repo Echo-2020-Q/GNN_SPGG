@@ -103,7 +103,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "0405_spgg_GNN_20Nodes_150length_Qlearn_ThresholdTeacher",#CUDACUDACUDA
+    "experiment_name": "0408_spgg_GNN_20Nodes_150length_Fermi_FixedTopology",#CUDACUDACUDA
     #记得改CUDACUDACUDACUDACUDACUDACUDACUDACUDACUDACUDA
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -238,7 +238,7 @@ BASE_EXPERIMENT = {
         # - "q_learning_2x2"：每个节点使用 2状态×2动作 Q-learning，
         #                     状态=自己上一轮动作，动作=本轮选 C/D
         # - "imitate_best" ：最优邻居模仿 / Best-takes-over
-        "strategy_update_rule": "q_learning",
+        "strategy_update_rule": "fermi",
 
         # beta：同步 Fermi 更新的选择强度。
         # 仅当 strategy_update_rule == "fermi" 时使用。
@@ -282,7 +282,7 @@ BASE_EXPERIMENT = {
         "lambda_payoff":0.0,
 
         # 下一时刻实际合作比例项的权重。
-        "lambda_cooperation": 2.0,
+        "lambda_cooperation": 0.0,
 
         # 下一时刻全局平均资源项的权重。
         # 单步使用 mean(next_resources)；跨时间平均后对应评估里的 mean_resource 口径。
@@ -349,7 +349,7 @@ BASE_EXPERIMENT = {
         # 程序内部会按：
         #   total_updates = ceil((warmup_env_steps + total_env_steps) / (num_workers * effective_steps_per_update))
         # 自动换算成 update 次数。
-        "total_env_steps": 100_000_000,#episode需要用总的steps除以episode_length=150
+        "total_env_steps": 30_000_000,#episode需要用总的steps除以episode_length=150
 
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
@@ -684,7 +684,7 @@ BASE_EXPERIMENT = {
         "demo_pretrain_checkpoint_name": "demo_pretrained.pt",
 
         # 是否在 demo pretrain 完成并保存 checkpoint 后直接退出，不进入 online training。
-        "stop_after_demo_pretrain": True,
+        "stop_after_demo_pretrain": False,
 
         # demo critic 预训练使用的目标类型：
         # - "n_step" ：teacher 轨迹自身的纯 n-step return
@@ -758,10 +758,10 @@ BASE_EXPERIMENT = {
         "train_every": 1,
 
         # 每个外层训练迭代做多少次梯度更新。
-        "gradient_steps_per_update": 6,
+        "gradient_steps_per_update": 4,
 
         # TD3 delayed policy update 频率。
-        "policy_delay": 8,
+        "policy_delay": 2,
 
         # 将实际合作率过低的 transition 视为塌缩样本。
         "replay_collapse_fc_threshold": 0.10,
@@ -814,7 +814,7 @@ BASE_EXPERIMENT = {
         # 默认建议先用 "cpu"，让 worker 侧保持最简单、最稳定的本地 CPU rollout。
         # 如果后面要专门做 rollout 推理加速，再改成某张 GPU 或多张 GPU 列表。
         # learner 训练设备仍由下面的 device 单独控制。
-        "rollout_device": "cuda:2",
+        "rollout_device": "cuda:0",
 
         # rollout 推理模式：
         # - "local"       ：每个 worker 自己持有 actor，并在本地前向
@@ -829,7 +829,7 @@ BASE_EXPERIMENT = {
 
         # learner 训练设备：cpu / cuda / cuda:0 等。
         # 这只控制主进程里的 actor/critic 训练，不控制 rollout worker 的推理设备。
-        "device": "cuda:3",
+        "device": "cuda:1",
 
         # 并行 rollout worker 进程内的 PyTorch CPU 线程数。
         # 仅对多进程 worker 生效，用于减少小图前向时的线程争抢。
