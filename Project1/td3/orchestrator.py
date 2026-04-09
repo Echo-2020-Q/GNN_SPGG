@@ -133,6 +133,9 @@ class GraphTD3Trainer:
         self.demo_validation_batch: TensorReplayBatch | None = None
         self.teacher_takeover_release_env_step: int | None = None
         self.teacher_takeover_stable_eval_count = 0
+        self.teacher_takeover_full_release_env_step: int | None = None
+        self.teacher_handoff_stage = 0
+        self.teacher_handoff_stable_eval_count = 0
 
     def preload_demo_replay(
         self,
@@ -358,60 +361,29 @@ class GraphTD3Trainer:
             }
         return self.learner.evaluate_critic_on_td_batch(validation_batch)
 
-    def _update_adaptive_teacher_release(
+    @staticmethod
+    def _teacher_handoff_stage_label(stage: int) -> str:
+        return {
+            0: "locked",
+            1: "soft_release",
+            2: "full_handoff",
+        }.get(int(stage), str(stage))
+
+    def _evaluate_teacher_release_gate(
         self,
         *,
         online_eval_cooperation_mean: float,
         online_eval_return_mean: float,
         actor_bc_val_loss: float | None,
         critic_val_loss: float | None,
-    ) -> dict[str, float]:
-        metrics = {
-            "teacher_release_enabled": 1.0 if bool(self.config.adaptive_teacher_release_enabled) else 0.0,
-            "teacher_release_unlocked": 1.0 if self.teacher_takeover_release_env_step is not None else 0.0,
-            "teacher_release_stable_eval_count": float(self.teacher_takeover_stable_eval_count),
-            "teacher_release_gate_pass_count": 0.0,
-            "teacher_release_gate_available_count": 0.0,
-            "teacher_release_passed": 0.0,
-            "teacher_release_just_unlocked": 0.0,
-        }
-        if not bool(self.config.adaptive_teacher_release_enabled):
-            return metrics
-        if self.teacher_takeover_release_env_step is not None:
-            metrics["teacher_release_unlocked"] = 1.0
-            return metrics
+    ) -> tuple[int, int, bool]:
         if str(self.config.adaptive_teacher_release_mode) == "eval_cooperation":
             available = 1
             passed = 1 if float(online_eval_cooperation_mean) >= float(
                 self.config.adaptive_teacher_release_min_cooperation
             ) else 0
-            gate_passed = passed >= 1
-            if gate_passed:
-                self.teacher_takeover_stable_eval_count += 1
-            else:
-                self.teacher_takeover_stable_eval_count = 0
+            return available, passed, passed >= 1
 
-            if self.teacher_takeover_stable_eval_count >= int(self.config.adaptive_teacher_release_required_evals):
-                self.teacher_takeover_release_env_step = int(self.global_env_steps)
-                print(
-                    "Teacher Release | unlocked at t_env={0} | eval_f_c={1:.6f} | threshold={2:.6f}".format(
-                        int(self.global_env_steps),
-                        float(online_eval_cooperation_mean),
-                        float(self.config.adaptive_teacher_release_min_cooperation),
-                    )
-                )
-                metrics["teacher_release_just_unlocked"] = 1.0
-
-            metrics.update(
-                {
-                    "teacher_release_unlocked": 1.0 if self.teacher_takeover_release_env_step is not None else 0.0,
-                    "teacher_release_stable_eval_count": float(self.teacher_takeover_stable_eval_count),
-                    "teacher_release_gate_pass_count": float(passed),
-                    "teacher_release_gate_available_count": float(available),
-                    "teacher_release_passed": 1.0 if gate_passed else 0.0,
-                }
-            )
-            return metrics
         demo_summary = self.demo_pretrain_summary or {}
         baseline_return = float(demo_summary.get("quick_eval_return_best", 0.0))
         baseline_actor_val = float(demo_summary.get("actor_bc_val_loss_best", 0.0))
@@ -438,32 +410,130 @@ class GraphTD3Trainer:
 
         required_criteria = min(int(self.config.adaptive_teacher_release_min_criteria), max(1, available))
         gate_passed = available > 0 and passed >= required_criteria
-        if gate_passed:
-            self.teacher_takeover_stable_eval_count += 1
-        else:
+        return available, passed, gate_passed
+
+    def _update_adaptive_teacher_release(
+        self,
+        *,
+        online_eval_cooperation_mean: float,
+        online_eval_return_mean: float,
+        actor_bc_val_loss: float | None,
+        critic_val_loss: float | None,
+        behavior_frac_actor_logits: float,
+    ) -> dict[str, float]:
+        metrics = {
+            "teacher_release_enabled": 1.0 if bool(self.config.adaptive_teacher_release_enabled) else 0.0,
+            "teacher_release_unlocked": 1.0 if self.teacher_takeover_release_env_step is not None else 0.0,
+            "teacher_release_stable_eval_count": float(self.teacher_takeover_stable_eval_count),
+            "teacher_release_gate_pass_count": 0.0,
+            "teacher_release_gate_available_count": 0.0,
+            "teacher_release_passed": 0.0,
+            "teacher_release_just_unlocked": 0.0,
+            "teacher_handoff_stage": float(self.teacher_handoff_stage),
+            "teacher_handoff_soft_released": 1.0 if int(self.teacher_handoff_stage) >= 1 else 0.0,
+            "teacher_handoff_full_released": 1.0 if int(self.teacher_handoff_stage) >= 2 else 0.0,
+            "teacher_handoff_stage_stable_eval_count": float(self.teacher_handoff_stable_eval_count),
+            "teacher_handoff_behavior_frac_actor_logits": float(behavior_frac_actor_logits),
+            "teacher_handoff_behavior_gate_passed": 0.0,
+            "teacher_handoff_stage_just_advanced": 0.0,
+        }
+        if not bool(self.config.adaptive_teacher_release_enabled):
+            return metrics
+        if (
+            bool(self.config.adaptive_teacher_release_require_warmup_complete)
+            and int(self.global_env_steps) < int(self.config.warmup_steps)
+        ):
             self.teacher_takeover_stable_eval_count = 0
+            self.teacher_handoff_stable_eval_count = 0
+            metrics["teacher_release_stable_eval_count"] = 0.0
+            metrics["teacher_handoff_stage_stable_eval_count"] = 0.0
+            return metrics
 
-        if self.teacher_takeover_stable_eval_count >= int(self.config.adaptive_teacher_release_required_evals):
-            self.teacher_takeover_release_env_step = int(self.global_env_steps)
-            print(
-                "Teacher Release | unlocked at t_env={0} | eval_return={1:.6f} | actor_bc_val={2} | critic_val={3}".format(
-                    int(self.global_env_steps),
-                    float(online_eval_return_mean),
-                    "None" if actor_bc_val_loss is None else "{0:.6f}".format(float(actor_bc_val_loss)),
-                    "None" if critic_val_loss is None else "{0:.6f}".format(float(critic_val_loss)),
-                )
-            )
-            metrics["teacher_release_just_unlocked"] = 1.0
-
+        available, passed, gate_passed = self._evaluate_teacher_release_gate(
+            online_eval_cooperation_mean=online_eval_cooperation_mean,
+            online_eval_return_mean=online_eval_return_mean,
+            actor_bc_val_loss=actor_bc_val_loss,
+            critic_val_loss=critic_val_loss,
+        )
         metrics.update(
             {
-                "teacher_release_unlocked": 1.0 if self.teacher_takeover_release_env_step is not None else 0.0,
-                "teacher_release_stable_eval_count": float(self.teacher_takeover_stable_eval_count),
                 "teacher_release_gate_pass_count": float(passed),
                 "teacher_release_gate_available_count": float(available),
                 "teacher_release_passed": 1.0 if gate_passed else 0.0,
             }
         )
+
+        if self.teacher_takeover_release_env_step is None:
+            if gate_passed:
+                self.teacher_takeover_stable_eval_count += 1
+            else:
+                self.teacher_takeover_stable_eval_count = 0
+
+            if self.teacher_takeover_stable_eval_count >= int(self.config.adaptive_teacher_release_required_evals):
+                self.teacher_takeover_release_env_step = int(self.global_env_steps)
+                self.teacher_handoff_stage = 1
+                self.teacher_handoff_stable_eval_count = 0
+                if str(self.config.adaptive_teacher_release_mode) == "eval_cooperation":
+                    print(
+                        "Teacher Release | stage=soft_release | unlocked at t_env={0} | eval_f_c={1:.6f} | threshold={2:.6f}".format(
+                            int(self.global_env_steps),
+                            float(online_eval_cooperation_mean),
+                            float(self.config.adaptive_teacher_release_min_cooperation),
+                        )
+                    )
+                else:
+                    print(
+                        "Teacher Release | stage=soft_release | unlocked at t_env={0} | eval_return={1:.6f} | actor_bc_val={2} | critic_val={3}".format(
+                            int(self.global_env_steps),
+                            float(online_eval_return_mean),
+                            "None" if actor_bc_val_loss is None else "{0:.6f}".format(float(actor_bc_val_loss)),
+                            "None" if critic_val_loss is None else "{0:.6f}".format(float(critic_val_loss)),
+                        )
+                    )
+                metrics["teacher_release_just_unlocked"] = 1.0
+                metrics["teacher_handoff_stage_just_advanced"] = 1.0
+
+            metrics["teacher_release_unlocked"] = 1.0 if self.teacher_takeover_release_env_step is not None else 0.0
+            metrics["teacher_release_stable_eval_count"] = float(self.teacher_takeover_stable_eval_count)
+            metrics["teacher_handoff_stage"] = float(self.teacher_handoff_stage)
+            metrics["teacher_handoff_soft_released"] = 1.0 if int(self.teacher_handoff_stage) >= 1 else 0.0
+            return metrics
+
+        metrics["teacher_release_unlocked"] = 1.0
+        metrics["teacher_release_stable_eval_count"] = float(self.teacher_takeover_stable_eval_count)
+        metrics["teacher_handoff_stage"] = float(self.teacher_handoff_stage)
+        metrics["teacher_handoff_soft_released"] = 1.0
+
+        if int(self.teacher_handoff_stage) >= 2:
+            metrics["teacher_handoff_full_released"] = 1.0
+            return metrics
+
+        behavior_gate_passed = float(behavior_frac_actor_logits) >= float(
+            self.config.adaptive_teacher_handoff_min_actor_behavior
+        )
+        metrics["teacher_handoff_behavior_gate_passed"] = 1.0 if behavior_gate_passed else 0.0
+        if gate_passed and behavior_gate_passed:
+            self.teacher_handoff_stable_eval_count += 1
+        else:
+            self.teacher_handoff_stable_eval_count = 0
+
+        if self.teacher_handoff_stable_eval_count >= int(self.config.adaptive_teacher_handoff_required_evals):
+            self.teacher_handoff_stage = 2
+            self.teacher_takeover_full_release_env_step = int(self.global_env_steps)
+            self.teacher_handoff_stable_eval_count = 0
+            metrics["teacher_handoff_stage_just_advanced"] = 1.0
+            print(
+                "Teacher Handoff | stage=full_handoff | unlocked at t_env={0} | actor_logits_frac={1:.6f} | eval_f_c={2:.6f} | eval_return={3:.6f}".format(
+                    int(self.global_env_steps),
+                    float(behavior_frac_actor_logits),
+                    float(online_eval_cooperation_mean),
+                    float(online_eval_return_mean),
+                )
+            )
+
+        metrics["teacher_handoff_stage"] = float(self.teacher_handoff_stage)
+        metrics["teacher_handoff_full_released"] = 1.0 if int(self.teacher_handoff_stage) >= 2 else 0.0
+        metrics["teacher_handoff_stage_stable_eval_count"] = float(self.teacher_handoff_stable_eval_count)
         return metrics
 
     def _shutdown_rollout_runtime(self) -> None:
@@ -619,6 +689,13 @@ class GraphTD3Trainer:
                 None if self.teacher_takeover_release_env_step is None else int(self.teacher_takeover_release_env_step)
             ),
             "teacher_takeover_stable_eval_count": int(self.teacher_takeover_stable_eval_count),
+            "teacher_takeover_full_release_env_step": (
+                None
+                if self.teacher_takeover_full_release_env_step is None
+                else int(self.teacher_takeover_full_release_env_step)
+            ),
+            "teacher_handoff_stage": int(self.teacher_handoff_stage),
+            "teacher_handoff_stable_eval_count": int(self.teacher_handoff_stable_eval_count),
         }
         if checkpoint_mode == "full_resume":
             payload["replay_buffer_state"] = self.replay_buffer.state_dict()
@@ -637,6 +714,17 @@ class GraphTD3Trainer:
         release_env_step = checkpoint.get("teacher_takeover_release_env_step")
         self.teacher_takeover_release_env_step = None if release_env_step is None else int(release_env_step)
         self.teacher_takeover_stable_eval_count = int(checkpoint.get("teacher_takeover_stable_eval_count", 0))
+        full_release_env_step = checkpoint.get("teacher_takeover_full_release_env_step")
+        self.teacher_takeover_full_release_env_step = (
+            None if full_release_env_step is None else int(full_release_env_step)
+        )
+        self.teacher_handoff_stage = int(
+            checkpoint.get(
+                "teacher_handoff_stage",
+                1 if self.teacher_takeover_release_env_step is not None else 0,
+            )
+        )
+        self.teacher_handoff_stable_eval_count = int(checkpoint.get("teacher_handoff_stable_eval_count", 0))
         checkpoint_mode = str(
             checkpoint.get(
                 "checkpoint_mode",
@@ -665,6 +753,8 @@ class GraphTD3Trainer:
                     actor_state_dict,
                     version=actor_version,
                     teacher_takeover_release_env_step=self.teacher_takeover_release_env_step,
+                    teacher_takeover_full_release_env_step=self.teacher_takeover_full_release_env_step,
+                    teacher_handoff_stage=self.teacher_handoff_stage,
                 )
 
         actor_state_dict, _ = self.learner.publish_actor_state()
@@ -1861,6 +1951,7 @@ class GraphTD3Trainer:
             step_metrics = self.learner.train_step(
                 global_env_steps=int(self.global_env_steps),
                 teacher_release_unlocked=(self.teacher_takeover_release_env_step is not None),
+                teacher_release_env_step=self.teacher_takeover_release_env_step,
             )
             learner_metrics = dict(step_metrics)
             for key in accumulated_profiles:
@@ -1894,6 +1985,8 @@ class GraphTD3Trainer:
                 actor_state_dict,
                 version=actor_version,
                 teacher_takeover_release_env_step=self.teacher_takeover_release_env_step,
+                teacher_takeover_full_release_env_step=self.teacher_takeover_full_release_env_step,
+                teacher_handoff_stage=self.teacher_handoff_stage,
             )
         sync_metrics["profile_actor_sync_worker_rpc_seconds"] = float(perf_counter() - worker_sync_start)
         sync_metrics["profile_actor_sync_seconds"] = (
@@ -2031,6 +2124,10 @@ class GraphTD3Trainer:
                 "replay_teacher_frac": float(learner_metrics.get("replay_teacher_frac", 0.0)),
                 "replay_collapse_frac": float(learner_metrics.get("replay_collapse_frac", 0.0)),
                 "teacher_takeover_prob": mean_teacher_takeover_prob,
+                "teacher_handoff_stage": float(self.teacher_handoff_stage),
+                "teacher_handoff_soft_released": 1.0 if int(self.teacher_handoff_stage) >= 1 else 0.0,
+                "teacher_handoff_full_released": 1.0 if int(self.teacher_handoff_stage) >= 2 else 0.0,
+                "teacher_handoff_stage_stable_eval_count": float(self.teacher_handoff_stable_eval_count),
                 "mean_rollout_reward": mean_rollout_reward,
                 "actor_lr": float(learner_metrics["actor_lr"]),
                 "critic_lr": float(learner_metrics["critic_lr"]),
@@ -2107,10 +2204,14 @@ class GraphTD3Trainer:
                     online_eval_return_mean=float(evaluation.get("return_mean", 0.0)),
                     actor_bc_val_loss=float(demo_validation_metrics.get("actor_bc_val_loss", 0.0)),
                     critic_val_loss=float(demo_validation_metrics.get("critic_val_loss", 0.0)),
+                    behavior_frac_actor_logits=float(metrics.get("behavior_frac_actor_logits", 0.0)),
                 )
                 for key, value in teacher_release_metrics.items():
                     metrics[key] = float(value)
-                if bool(teacher_release_metrics.get("teacher_release_just_unlocked", 0.0)) and self.workers:
+                if (
+                    bool(teacher_release_metrics.get("teacher_release_just_unlocked", 0.0))
+                    or bool(teacher_release_metrics.get("teacher_handoff_stage_just_advanced", 0.0))
+                ) and self.workers:
                     self._broadcast_actor_state_to_rollout_runtime()
                 evaluation_seconds = float(perf_counter() - evaluation_start)
                 metrics["profile_eval_seconds"] = evaluation_seconds

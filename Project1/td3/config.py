@@ -99,6 +99,8 @@ class GraphTD3Config:
     teacher_takeover_start_prob: float = 0.8
     teacher_takeover_end_prob: float = 0.0
     teacher_takeover_decay_end_fraction: float = 0.30
+    teacher_takeover_soft_prob: float = 0.40
+    teacher_takeover_stage_transition_fraction: float = 0.05
     adaptive_teacher_release_enabled: bool = False
     adaptive_teacher_release_mode: str = "legacy"
     adaptive_teacher_release_min_cooperation: float = 0.80
@@ -108,9 +110,14 @@ class GraphTD3Config:
     adaptive_teacher_release_required_evals: int = 3
     adaptive_teacher_release_min_criteria: int = 2
     freeze_actor_q_until_teacher_release: bool = False
+    adaptive_teacher_release_require_warmup_complete: bool = True
+    adaptive_teacher_handoff_min_actor_behavior: float = 0.60
+    adaptive_teacher_handoff_required_evals: int = 2
+    actor_demo_bc_decay_from_teacher_release: bool = True
     online_actor_q_coef_initial: float = 0.2
     online_actor_q_coef_final: float = 1.0
     online_actor_q_coef_ramp_end_fraction: float = 0.30
+    online_actor_q_ramp_from_teacher_release: bool = True
     critic_loss_type: str = "huber"
     critic_huber_delta: float = 1.0
     actor_grad_clip_norm: float | None = 5.0
@@ -347,6 +354,14 @@ class GraphTD3Config:
             raise ValueError("teacher_takeover_end_prob must be in [0, 1].")
         if self.teacher_takeover_decay_end_fraction < 0.0 or self.teacher_takeover_decay_end_fraction > 1.0:
             raise ValueError("teacher_takeover_decay_end_fraction must be in [0, 1].")
+        if self.teacher_takeover_soft_prob < 0.0 or self.teacher_takeover_soft_prob > 1.0:
+            raise ValueError("teacher_takeover_soft_prob must be in [0, 1].")
+        if self.teacher_takeover_soft_prob > self.teacher_takeover_start_prob + 1e-12:
+            raise ValueError("teacher_takeover_soft_prob must be <= teacher_takeover_start_prob.")
+        if self.teacher_takeover_soft_prob < self.teacher_takeover_end_prob - 1e-12:
+            raise ValueError("teacher_takeover_soft_prob must be >= teacher_takeover_end_prob.")
+        if self.teacher_takeover_stage_transition_fraction < 0.0 or self.teacher_takeover_stage_transition_fraction > 1.0:
+            raise ValueError("teacher_takeover_stage_transition_fraction must be in [0, 1].")
         if not isinstance(self.adaptive_teacher_release_enabled, bool):
             raise ValueError("adaptive_teacher_release_enabled must be a bool.")
         if self.adaptive_teacher_release_mode not in {"legacy", "eval_cooperation"}:
@@ -363,6 +378,16 @@ class GraphTD3Config:
             raise ValueError("adaptive_teacher_release_required_evals must be positive.")
         if self.adaptive_teacher_release_min_criteria <= 0:
             raise ValueError("adaptive_teacher_release_min_criteria must be positive.")
+        if not isinstance(self.adaptive_teacher_release_require_warmup_complete, bool):
+            raise ValueError("adaptive_teacher_release_require_warmup_complete must be a bool.")
+        if self.adaptive_teacher_handoff_min_actor_behavior < 0.0 or self.adaptive_teacher_handoff_min_actor_behavior > 1.0:
+            raise ValueError("adaptive_teacher_handoff_min_actor_behavior must be in [0, 1].")
+        if self.adaptive_teacher_handoff_required_evals <= 0:
+            raise ValueError("adaptive_teacher_handoff_required_evals must be positive.")
+        if not isinstance(self.actor_demo_bc_decay_from_teacher_release, bool):
+            raise ValueError("actor_demo_bc_decay_from_teacher_release must be a bool.")
+        if not isinstance(self.online_actor_q_ramp_from_teacher_release, bool):
+            raise ValueError("online_actor_q_ramp_from_teacher_release must be a bool.")
         if not isinstance(self.freeze_actor_q_until_teacher_release, bool):
             raise ValueError("freeze_actor_q_until_teacher_release must be a bool.")
         if self.online_actor_q_coef_initial < 0.0:

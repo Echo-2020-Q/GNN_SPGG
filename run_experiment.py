@@ -600,6 +600,10 @@ BASE_EXPERIMENT = {
         # 例如 0.50 表示到总 rollout 步数的 20% 时衰减到 0。
         "actor_demo_bc_decay_end_fraction": 0.50,
 
+        # 是否把 demo BC 的衰减起点对齐到 teacher release 时刻。
+        # True 时，BC 不再因为“release 很晚”而在解锁前几乎衰减光。
+        "actor_demo_bc_decay_from_teacher_release": True,
+
         # 是否启用 actor BC 的 Q-filter。
         # 启用后，online 阶段只在 critic 认为 demo 动作优于当前 actor 动作时，才对该 demo transition 施加 BC。
         "actor_bc_q_filter_enabled": True,
@@ -786,6 +790,13 @@ BASE_EXPERIMENT = {
         # teacher takeover 线性衰减到 end_prob 的总 rollout 步数比例。
         "teacher_takeover_decay_end_fraction": 0.30,
 
+        # soft release 阶段 teacher 的中间占比。
+        # 初次 unlock 后先从 start_prob 退到 soft_prob，再根据 actor 接手表现决定是否继续退到 end_prob。
+        "teacher_takeover_soft_prob": 0.40,
+
+        # 每次 handoff stage 切换时，teacher 占比线性过渡所使用的 rollout 步数比例。
+        "teacher_takeover_stage_transition_fraction": 0.05,
+
         # 是否启用“达标后再退场”的 adaptive teacher release。
         # 启用后，teacher 会先保持在高权重，直到 online 评估显示 actor/critic 达到稳定阈值，再开始按 teacher_takeover_* 的 schedule 衰减。
         "adaptive_teacher_release_enabled": True,
@@ -815,6 +826,15 @@ BASE_EXPERIMENT = {
         # 当前条件包括：eval return、actor_bc_val、critic_val。
         "adaptive_teacher_release_min_criteria": 2,
 
+        # 是否要求 warm-up 真正结束后，adaptive teacher release 才允许开始累计达标次数。
+        "adaptive_teacher_release_require_warmup_complete": True,
+
+        # 进入 full handoff 前，最近 rollout 中 actor_logits 的最小行为占比。
+        "adaptive_teacher_handoff_min_actor_behavior": 0.60,
+
+        # 连续多少次 eval 同时满足“release gate 继续成立 + actor 行为占比足够”，才进入 full handoff。
+        "adaptive_teacher_handoff_required_evals": 2,
+
         # 是否在 adaptive teacher release 真正解锁前，一直禁止 actor 的 Q 更新。
         # 这样可以先保持 imitation 锚点，等 teacher 退场门槛满足后再做 RL 提升。
         "freeze_actor_q_until_teacher_release": True,
@@ -828,6 +848,10 @@ BASE_EXPERIMENT = {
 
         # actor Q 系数从 initial 线性升到 final 的总 rollout 步数比例。
         "online_actor_q_coef_ramp_end_fraction": 0.50,
+
+        # 是否把 actor Q ramp 的起点对齐到 teacher release 时刻。
+        # True 时，release 晚不会导致 actor_q 一解锁就接近满强度。
+        "online_actor_q_ramp_from_teacher_release": True,
 
         # critic 损失类型：
         # - "mse"
@@ -2032,6 +2056,10 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         warmup_actor_bc_coef=training.get("warmup_actor_bc_coef", 1.0),
         actor_demo_bc_coef=training.get("actor_demo_bc_coef", 0.25),
         actor_demo_bc_decay_end_fraction=training.get("actor_demo_bc_decay_end_fraction", 0.50),
+        actor_demo_bc_decay_from_teacher_release=training.get(
+            "actor_demo_bc_decay_from_teacher_release",
+            True,
+        ),
         actor_bc_q_filter_enabled=training.get("actor_bc_q_filter_enabled", False),
         actor_bc_q_filter_margin=training.get("actor_bc_q_filter_margin", 0.0),
         actor_bc_q_filter_online_only=training.get("actor_bc_q_filter_online_only", True),
@@ -2096,6 +2124,8 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         teacher_takeover_start_prob=training.get("teacher_takeover_start_prob", 0.8),
         teacher_takeover_end_prob=training.get("teacher_takeover_end_prob", 0.0),
         teacher_takeover_decay_end_fraction=training.get("teacher_takeover_decay_end_fraction", 0.30),
+        teacher_takeover_soft_prob=training.get("teacher_takeover_soft_prob", 0.40),
+        teacher_takeover_stage_transition_fraction=training.get("teacher_takeover_stage_transition_fraction", 0.05),
         adaptive_teacher_release_enabled=training.get("adaptive_teacher_release_enabled", False),
         adaptive_teacher_release_mode=str(training.get("adaptive_teacher_release_mode", "legacy")),
         adaptive_teacher_release_min_cooperation=training.get("adaptive_teacher_release_min_cooperation", 0.80),
@@ -2110,10 +2140,26 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         ),
         adaptive_teacher_release_required_evals=training.get("adaptive_teacher_release_required_evals", 3),
         adaptive_teacher_release_min_criteria=training.get("adaptive_teacher_release_min_criteria", 2),
+        adaptive_teacher_release_require_warmup_complete=training.get(
+            "adaptive_teacher_release_require_warmup_complete",
+            True,
+        ),
+        adaptive_teacher_handoff_min_actor_behavior=training.get(
+            "adaptive_teacher_handoff_min_actor_behavior",
+            0.60,
+        ),
+        adaptive_teacher_handoff_required_evals=training.get(
+            "adaptive_teacher_handoff_required_evals",
+            2,
+        ),
         freeze_actor_q_until_teacher_release=training.get("freeze_actor_q_until_teacher_release", False),
         online_actor_q_coef_initial=training.get("online_actor_q_coef_initial", 0.2),
         online_actor_q_coef_final=training.get("online_actor_q_coef_final", 1.0),
         online_actor_q_coef_ramp_end_fraction=training.get("online_actor_q_coef_ramp_end_fraction", 0.30),
+        online_actor_q_ramp_from_teacher_release=training.get(
+            "online_actor_q_ramp_from_teacher_release",
+            True,
+        ),
         critic_loss_type=training.get("critic_loss_type", "huber"),
         critic_huber_delta=training.get("critic_huber_delta", 1.0),
         actor_grad_clip_norm=training.get("actor_grad_clip_norm", 5.0),
@@ -3445,6 +3491,8 @@ def _format_console_recent_stats_lines(
         ("online_critic_val_loss", "online_critic_val"),
         ("teacher_release_unlocked", "teacher_release"),
         ("teacher_release_stable_eval_count", "teacher_release_stable"),
+        ("teacher_handoff_stage", "handoff_stage"),
+        ("teacher_handoff_stage_stable_eval_count", "handoff_stable"),
         ("profile_rollout_steps_per_second", "rollout_sps"),
         ("profile_rollout_collect_seconds", "rollout_collect_s"),
         ("profile_rollout_collect_worker_seconds", "worker_collect_s"),
@@ -3587,6 +3635,8 @@ def _tensorboard_tag_for_metric(metric_name: str) -> Optional[str]:
         return "replay/size"
     if metric_name == "curriculum_stage":
         return "curriculum/stage_index"
+    if metric_name == "teacher_handoff_stage":
+        return "teacher_handoff/stage_index"
     if metric_name in {
         "loss",
         "policy_loss",
@@ -3677,6 +3727,16 @@ def _log_tensorboard_static_metadata(
         "static/training/teacher_takeover_end_prob": float(spec["training"].get("teacher_takeover_end_prob", 0.0)),
         "static/training/teacher_takeover_decay_end_fraction": float(
             spec["training"].get("teacher_takeover_decay_end_fraction", 0.30)
+        ),
+        "static/training/teacher_takeover_soft_prob": float(spec["training"].get("teacher_takeover_soft_prob", 0.40)),
+        "static/training/teacher_takeover_stage_transition_fraction": float(
+            spec["training"].get("teacher_takeover_stage_transition_fraction", 0.05)
+        ),
+        "static/training/adaptive_teacher_handoff_min_actor_behavior": float(
+            spec["training"].get("adaptive_teacher_handoff_min_actor_behavior", 0.60)
+        ),
+        "static/training/adaptive_teacher_handoff_required_evals": float(
+            spec["training"].get("adaptive_teacher_handoff_required_evals", 2)
         ),
         "static/training/online_actor_q_coef_initial": float(
             spec["training"].get("online_actor_q_coef_initial", 0.2)
@@ -3958,6 +4018,16 @@ def _log_tensorboard_update_metrics(
                 stage_label = str(curriculum_stages[stage_index].get("label", stage_label))
             writer.add_text("curriculum/active_stage_label", stage_label, tensorboard_step)
             stage_log_state["last_stage_index"] = stage_index
+    if stage_log_state is not None and "teacher_handoff_stage" in metrics:
+        handoff_stage = int(metrics["teacher_handoff_stage"])
+        if stage_log_state.get("last_teacher_handoff_stage") != handoff_stage:
+            handoff_label = {
+                0: "locked",
+                1: "soft_release",
+                2: "full_handoff",
+            }.get(handoff_stage, str(handoff_stage))
+            writer.add_text("teacher_handoff/active_stage_label", handoff_label, tensorboard_step)
+            stage_log_state["last_teacher_handoff_stage"] = handoff_stage
 
 
 def _log_tensorboard_post_training_evaluation(
@@ -4350,11 +4420,13 @@ def run_gnn_training_mode(
                 )
             )
             print(
-                "Stab CFG : teacher_takeover={0}({1}->{2}, end@{3}), adaptive_release={4}({5}, need={6}/{7}), q_filter={8}(margin={9}, online_only={10}, require_release={11}), actor_q_coef={12}->{13} end@{14}, critic_loss={15}, huber_delta={16}, grad_clip(actor={17}, critic={18})".format(
+                "Stab CFG : teacher_takeover={0}({1}->{2}, soft={3}, end@{4}, stage_transition@{5}), adaptive_release={6}({7}, need={8}/{9}, warmup_guard={10}), handoff(actor_logits>={11:.2f}, need={12}), q_filter={13}(margin={14}, online_only={15}, require_release={16}), actor_bc_decay={17}(from_release={18}), actor_q_coef={19}->{20} end@{21} (from_release={22}), critic_loss={23}, huber_delta={24}, grad_clip(actor={25}, critic={26})".format(
                     trainer_config.teacher_takeover_enabled,
                     trainer_config.teacher_takeover_start_prob,
                     trainer_config.teacher_takeover_end_prob,
+                    trainer_config.teacher_takeover_soft_prob,
                     trainer_config.teacher_takeover_decay_end_fraction,
+                    trainer_config.teacher_takeover_stage_transition_fraction,
                     trainer_config.adaptive_teacher_release_enabled,
                     (
                         "eval_f_c>={0:.2f}".format(trainer_config.adaptive_teacher_release_min_cooperation)
@@ -4367,13 +4439,19 @@ def run_gnn_training_mode(
                     ),
                     trainer_config.adaptive_teacher_release_required_evals,
                     trainer_config.adaptive_teacher_release_min_criteria,
+                    trainer_config.adaptive_teacher_release_require_warmup_complete,
+                    trainer_config.adaptive_teacher_handoff_min_actor_behavior,
+                    trainer_config.adaptive_teacher_handoff_required_evals,
                     trainer_config.actor_bc_q_filter_enabled,
                     trainer_config.actor_bc_q_filter_margin,
                     trainer_config.actor_bc_q_filter_online_only,
                     trainer_config.actor_bc_q_filter_require_teacher_release,
+                    trainer_config.actor_demo_bc_decay_end_fraction,
+                    trainer_config.actor_demo_bc_decay_from_teacher_release,
                     trainer_config.online_actor_q_coef_initial,
                     trainer_config.online_actor_q_coef_final,
                     trainer_config.online_actor_q_coef_ramp_end_fraction,
+                    trainer_config.online_actor_q_ramp_from_teacher_release,
                     trainer_config.critic_loss_type,
                     trainer_config.critic_huber_delta,
                     trainer_config.actor_grad_clip_norm,
@@ -4471,7 +4549,10 @@ def run_gnn_training_mode(
         console_training_logs = bool(tensorboard.get("console_training_logs", False))
         console_log_interval = int(tensorboard.get("console_log_interval", 50))
         console_recent_window_updates = int(tensorboard.get("console_recent_window_updates", 50))
-        tensorboard_stage_log_state: Dict[str, Any] = {"last_stage_index": None}
+        tensorboard_stage_log_state: Dict[str, Any] = {
+            "last_stage_index": None,
+            "last_teacher_handoff_stage": None,
+        }
         training_start_time = time.time()
         effective_steps_per_update = int(training_schedule["global_env_steps_per_update"])
         total_env_steps = int(training_schedule["total_env_steps_effective"])

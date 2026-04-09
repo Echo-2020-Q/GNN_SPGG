@@ -341,7 +341,12 @@ class GraphTD3Learner:
         self.last_q_filter_actor_q_mean = float(state_dict.get("last_q_filter_actor_q_mean", 0.0))
         self.last_q_filter_margin_mean = float(state_dict.get("last_q_filter_margin_mean", 0.0))
 
-    def _current_demo_bc_coef(self, global_env_steps: int | None) -> float:
+    def _current_demo_bc_coef(
+        self,
+        global_env_steps: int | None,
+        *,
+        teacher_release_env_step: int | None = None,
+    ) -> float:
         if int(self.config.warmup_steps) <= 0:
             return 0.0
 
@@ -351,35 +356,56 @@ class GraphTD3Learner:
         total_rollout_env_steps = int(self.config.total_updates) * int(self.config.steps_per_update) * int(self.config.num_workers)
         warmup_end_step = int(self.config.warmup_steps)
         decay_end_fraction = float(self.config.actor_demo_bc_decay_end_fraction)
-        decay_end_step = int(round(float(total_rollout_env_steps) * decay_end_fraction))
-        decay_end_step = max(warmup_end_step, decay_end_step)
         current_step = max(0, int(global_env_steps))
+        reference_step = warmup_end_step
+        if (
+            bool(self.config.actor_demo_bc_decay_from_teacher_release)
+            and bool(self.config.adaptive_teacher_release_enabled)
+            and teacher_release_env_step is not None
+        ):
+            reference_step = max(warmup_end_step, int(teacher_release_env_step))
+        decay_duration = int(round(float(total_rollout_env_steps) * decay_end_fraction))
+        decay_end_step = max(reference_step, reference_step + decay_duration)
 
         if current_step >= decay_end_step:
             return 0.0
-        if decay_end_step <= warmup_end_step:
+        if decay_end_step <= reference_step:
             return 0.0
+        if current_step <= reference_step:
+            return float(self.config.actor_demo_bc_coef)
 
-        decay_progress = float(current_step - warmup_end_step) / float(decay_end_step - warmup_end_step)
+        decay_progress = float(current_step - reference_step) / float(decay_end_step - reference_step)
         decay_progress = min(max(decay_progress, 0.0), 1.0)
         return float(self.config.actor_demo_bc_coef) * (1.0 - decay_progress)
 
-    def _current_actor_q_coef(self, global_env_steps: int | None) -> float:
+    def _current_actor_q_coef(
+        self,
+        global_env_steps: int | None,
+        *,
+        teacher_release_env_step: int | None = None,
+    ) -> float:
         if global_env_steps is None:
             return float(self.config.online_actor_q_coef_final)
 
-        warmup_end_step = int(self.config.warmup_steps)
         total_rollout_env_steps = int(self.config.total_updates) * int(self.config.steps_per_update) * int(self.config.num_workers)
-        ramp_end_step = int(round(float(total_rollout_env_steps) * float(self.config.online_actor_q_coef_ramp_end_fraction)))
-        ramp_end_step = max(warmup_end_step, ramp_end_step)
         current_step = max(0, int(global_env_steps))
+        warmup_end_step = int(self.config.warmup_steps)
+        reference_step = warmup_end_step
+        if (
+            bool(self.config.online_actor_q_ramp_from_teacher_release)
+            and bool(self.config.adaptive_teacher_release_enabled)
+            and teacher_release_env_step is not None
+        ):
+            reference_step = max(warmup_end_step, int(teacher_release_env_step))
+        ramp_duration = int(round(float(total_rollout_env_steps) * float(self.config.online_actor_q_coef_ramp_end_fraction)))
+        ramp_end_step = max(reference_step, reference_step + ramp_duration)
 
-        if current_step <= warmup_end_step:
+        if current_step <= reference_step:
             return float(self.config.online_actor_q_coef_initial)
-        if current_step >= ramp_end_step or ramp_end_step <= warmup_end_step:
+        if current_step >= ramp_end_step or ramp_end_step <= reference_step:
             return float(self.config.online_actor_q_coef_final)
 
-        progress = float(current_step - warmup_end_step) / float(ramp_end_step - warmup_end_step)
+        progress = float(current_step - reference_step) / float(ramp_end_step - reference_step)
         progress = min(max(progress, 0.0), 1.0)
         initial_coef = float(self.config.online_actor_q_coef_initial)
         final_coef = float(self.config.online_actor_q_coef_final)
@@ -966,6 +992,7 @@ class GraphTD3Learner:
         global_env_steps: int | None = None,
         *,
         teacher_release_unlocked: bool = False,
+        teacher_release_env_step: int | None = None,
     ) -> dict[str, float]:
         if len(self.replay_buffer) < max(1, self.config.batch_size):
             return {
@@ -1067,12 +1094,18 @@ class GraphTD3Learner:
         ):
             actor_q_enabled = False
         bc_coef = (
-            self._current_demo_bc_coef(global_env_steps)
+            self._current_demo_bc_coef(
+                global_env_steps,
+                teacher_release_env_step=teacher_release_env_step,
+            )
             if actor_q_enabled
             else (float(self.config.warmup_actor_bc_coef) if actor_update_enabled else 0.0)
         )
         if actor_q_enabled:
-            actor_q_coef = self._current_actor_q_coef(global_env_steps)
+            actor_q_coef = self._current_actor_q_coef(
+                global_env_steps,
+                teacher_release_env_step=teacher_release_env_step,
+            )
         q_filter_enabled = bool(self.config.actor_bc_q_filter_enabled) and actor_q_enabled and bc_coef > 0.0
         if q_filter_enabled and bool(self.config.actor_bc_q_filter_require_teacher_release):
             if bool(self.config.adaptive_teacher_release_enabled):

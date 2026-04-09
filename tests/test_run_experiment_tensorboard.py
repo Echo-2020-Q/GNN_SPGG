@@ -112,6 +112,10 @@ class RunExperimentTensorboardTests(unittest.TestCase):
             _tensorboard_tag_for_metric("profile_rollout_overlap_seconds"),
             "profile/rollout_overlap_seconds",
         )
+        self.assertEqual(
+            _tensorboard_tag_for_metric("teacher_handoff_stage"),
+            "teacher_handoff/stage_index",
+        )
 
     def test_grad_clip_metrics_map_to_grad_tensorboard_namespace(self) -> None:
         self.assertEqual(
@@ -122,6 +126,23 @@ class RunExperimentTensorboardTests(unittest.TestCase):
             _tensorboard_tag_for_metric("critic_grad_norm_post_clip"),
             "grad/critic_grad_norm_post_clip",
         )
+
+    def test_update_metrics_log_teacher_handoff_stage_label(self) -> None:
+        writer = _FakeSummaryWriter()
+        stage_log_state = {"last_stage_index": None, "last_teacher_handoff_stage": None}
+        metrics = {
+            "update": 3.0,
+            "global_env_steps": 120.0,
+            "teacher_handoff_stage": 1.0,
+        }
+
+        _log_tensorboard_update_metrics(
+            writer,
+            metrics,
+            stage_log_state=stage_log_state,
+        )
+
+        self.assertIn(("teacher_handoff/active_stage_label", "soft_release", 120), writer.texts)
 
     def test_custom_layout_adds_eval_only_fc_panel(self) -> None:
         writer = _FakeSummaryWriter()
