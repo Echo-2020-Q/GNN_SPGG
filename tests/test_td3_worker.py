@@ -19,14 +19,22 @@ if NUMPY_AVAILABLE and TORCH_AVAILABLE:
 
 @unittest.skipUnless(NUMPY_AVAILABLE and TORCH_AVAILABLE, "numpy and torch are required for worker tests")
 class RolloutWorkerTeacherTests(unittest.TestCase):
-    def _make_worker(self, *, teacher_takeover_enabled: bool = False) -> RolloutWorker:
+    def _make_worker(
+        self,
+        *,
+        teacher_takeover_enabled: bool = False,
+        teacher_takeover_granularity: str = "per_step",
+        teacher_takeover_start_prob: float = 1.0,
+        teacher_takeover_end_prob: float | None = None,
+        episode_length: int = 4,
+    ) -> RolloutWorker:
         env = SPGGEnv(
             SPGGConfig(
                 alpha=0.0,
                 r=0.5,
                 p_max=5.0,
                 beta=1.0,
-                episode_length=4,
+                episode_length=episode_length,
                 reward=RewardConfig(lambda_payoff=1.0, lambda_cooperation=0.5, lambda_gini=0.1),
             ),
             make_grid_graph(2, 2),
@@ -39,8 +47,11 @@ class RolloutWorkerTeacherTests(unittest.TestCase):
             warmup_steps=0,
             warmup_pool_power_k=19.0,
             teacher_takeover_enabled=teacher_takeover_enabled,
-            teacher_takeover_start_prob=1.0,
-            teacher_takeover_end_prob=1.0,
+            teacher_takeover_granularity=teacher_takeover_granularity,
+            teacher_takeover_start_prob=teacher_takeover_start_prob,
+            teacher_takeover_end_prob=(
+                teacher_takeover_start_prob if teacher_takeover_end_prob is None else teacher_takeover_end_prob
+            ),
             teacher_takeover_decay_end_fraction=1.0,
             device="cpu",
         )
@@ -136,6 +147,32 @@ class RolloutWorkerTeacherTests(unittest.TestCase):
         self.assertTrue(np.all(result.replay_batch.pool_power_demo_flag.detach().cpu().numpy()))
         self.assertGreater(result.metrics["teacher_takeover_prob_mean"], 0.0)
         self.assertGreater(result.metrics["behavior_source_counts"].get("pool_power_mix", 0), 0)
+
+    def test_teacher_takeover_per_episode_keeps_episode_behavior_consistent(self) -> None:
+        worker = self._make_worker(
+            teacher_takeover_enabled=True,
+            teacher_takeover_granularity="per_episode",
+            teacher_takeover_start_prob=0.5,
+            teacher_takeover_end_prob=0.5,
+            episode_length=4,
+        )
+        result = worker.collect(
+            num_steps=8,
+            global_env_start_step=0,
+        )
+
+        demo_flags = result.replay_batch.is_demo.detach().cpu().numpy().astype(np.bool_, copy=False)
+        done_flags = result.replay_batch.done.detach().cpu().numpy().astype(np.bool_, copy=False)
+        episode_start = 0
+        for index, done_flag in enumerate(done_flags):
+            if not bool(done_flag):
+                continue
+            episode_demo_flags = demo_flags[episode_start : index + 1]
+            self.assertGreater(len(episode_demo_flags), 0)
+            self.assertTrue(np.all(episode_demo_flags == episode_demo_flags[0]))
+            episode_start = index + 1
+
+        self.assertGreater(result.metrics["teacher_takeover_prob_mean"], 0.0)
 
 
 @unittest.skipUnless(NUMPY_AVAILABLE and TORCH_AVAILABLE, "numpy and torch are required for worker tests")

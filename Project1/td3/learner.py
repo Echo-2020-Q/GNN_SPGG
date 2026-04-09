@@ -385,6 +385,9 @@ class GraphTD3Learner:
         final_coef = float(self.config.online_actor_q_coef_final)
         return initial_coef + (final_coef - initial_coef) * progress
 
+    def _warmup_active(self, global_env_steps: int | None) -> bool:
+        return global_env_steps is not None and int(global_env_steps) < int(self.config.warmup_steps)
+
     def _critic_loss_sum(self, prediction: Tensor, target: Tensor, *, valid_mask: Tensor | None = None) -> Tensor:
         if self.config.critic_loss_type == "huber":
             loss = F.huber_loss(
@@ -767,16 +770,23 @@ class GraphTD3Learner:
         }
         actor_update_seconds = 0.0
         target_soft_update_seconds = 0.0
+        warmup_active = self._warmup_active(global_env_steps)
+        actor_update_enabled = not (bool(self.config.freeze_actor_during_warmup) and warmup_active)
         actor_q_coef = 0.0
-        actor_q_enabled = not (
-            bool(self.config.freeze_actor_q_during_warmup)
-            and global_env_steps is not None
-            and int(global_env_steps) < int(self.config.warmup_steps)
+        actor_q_enabled = actor_update_enabled and not (
+            bool(self.config.freeze_actor_q_during_warmup) and warmup_active
         )
+        if (
+            actor_update_enabled
+            and bool(self.config.freeze_actor_q_until_teacher_release)
+            and bool(self.config.adaptive_teacher_release_enabled)
+            and not bool(teacher_release_unlocked)
+        ):
+            actor_q_enabled = False
         bc_coef = (
             self._current_demo_bc_coef(global_env_steps)
             if actor_q_enabled
-            else float(self.config.warmup_actor_bc_coef)
+            else (float(self.config.warmup_actor_bc_coef) if actor_update_enabled else 0.0)
         )
         if actor_q_enabled:
             actor_q_coef = self._current_actor_q_coef(global_env_steps)
@@ -786,7 +796,7 @@ class GraphTD3Learner:
                 q_filter_enabled = bool(teacher_release_unlocked)
         self.last_actor_bc_coef = float(bc_coef)
         self.last_actor_q_coef = float(actor_q_coef)
-        if self.update_step_count % self.config.policy_delay == 0:
+        if actor_update_enabled and self.update_step_count % self.config.policy_delay == 0:
             actor_update_start = perf_counter()
             actor_metrics = self.update_actor(
                 batch,

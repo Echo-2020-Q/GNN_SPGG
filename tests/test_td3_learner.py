@@ -186,6 +186,66 @@ class GraphTD3LearnerPretrainTests(unittest.TestCase):
             float(late_metrics["critic_grad_norm_post_clip"]),
         )
 
+    def test_freeze_actor_during_warmup_skips_actor_updates(self) -> None:
+        learner = self._make_learner()
+        learner.config.warmup_steps = 10
+        learner.config.policy_delay = 1
+        learner.config.freeze_actor_during_warmup = True
+
+        actor_before = [parameter.detach().clone() for parameter in learner.actor.parameters()]
+        critic_before = [parameter.detach().clone() for parameter in learner.critics.parameters()]
+
+        metrics = learner.train_step(global_env_steps=0)
+
+        actor_after = [parameter.detach().clone() for parameter in learner.actor.parameters()]
+        critic_after = [parameter.detach().clone() for parameter in learner.critics.parameters()]
+        self.assertEqual(float(metrics["actor_bc_coef"]), 0.0)
+        self.assertEqual(float(metrics["actor_q_coef"]), 0.0)
+        self.assertTrue(all(torch.allclose(before, after) for before, after in zip(actor_before, actor_after)))
+        self.assertTrue(any(not torch.allclose(before, after) for before, after in zip(critic_before, critic_after)))
+
+    def test_freeze_actor_q_until_teacher_release_uses_bc_only_before_release(self) -> None:
+        learner = self._make_learner()
+        learner.config.warmup_steps = 1
+        learner.config.policy_delay = 1
+        learner.config.total_updates = 100
+        learner.config.steps_per_update = 1
+        learner.config.batch_size = 4
+        learner.config.adaptive_teacher_release_enabled = True
+        learner.config.freeze_actor_q_until_teacher_release = True
+
+        fixed_batch = learner.replay_buffer.export_demo_batch()
+        assert fixed_batch is not None
+        learner.replay_buffer.sample = lambda *args, **kwargs: fixed_batch  # type: ignore[method-assign]
+        learner.replay_buffer.get_last_sample_stats = lambda: {}  # type: ignore[method-assign]
+
+        locked_metrics = learner.train_step(global_env_steps=10, teacher_release_unlocked=False)
+        unlocked_metrics = learner.train_step(global_env_steps=10, teacher_release_unlocked=True)
+
+        self.assertGreater(float(locked_metrics["actor_bc_coef"]), 0.0)
+        self.assertEqual(float(locked_metrics["actor_q_coef"]), 0.0)
+        self.assertAlmostEqual(float(locked_metrics["actor_q_loss"]), 0.0, places=8)
+        self.assertGreater(float(unlocked_metrics["actor_q_coef"]), 0.0)
+
+    def test_freeze_actor_q_until_teacher_release_is_noop_without_adaptive_release(self) -> None:
+        learner = self._make_learner()
+        learner.config.warmup_steps = 1
+        learner.config.policy_delay = 1
+        learner.config.total_updates = 100
+        learner.config.steps_per_update = 1
+        learner.config.batch_size = 4
+        learner.config.adaptive_teacher_release_enabled = False
+        learner.config.freeze_actor_q_until_teacher_release = True
+
+        fixed_batch = learner.replay_buffer.export_demo_batch()
+        assert fixed_batch is not None
+        learner.replay_buffer.sample = lambda *args, **kwargs: fixed_batch  # type: ignore[method-assign]
+        learner.replay_buffer.get_last_sample_stats = lambda: {}  # type: ignore[method-assign]
+
+        metrics = learner.train_step(global_env_steps=10, teacher_release_unlocked=False)
+
+        self.assertGreater(float(metrics["actor_q_coef"]), 0.0)
+
     def test_q_filter_can_disable_demo_bc_loss(self) -> None:
         learner = self._make_learner()
         learner.config.warmup_steps = 1

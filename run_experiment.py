@@ -583,6 +583,10 @@ BASE_EXPERIMENT = {
         # 启发式 warm-up logits 噪声的截断范围。
         "warmup_logit_noise_clip": 0.25,
 
+        # warm-up 期间是否完全冻结 actor，不做任何参数更新。
+        # 建议配合 demo pretrain 使用，避免 warm-up 把 pretrain actor 改坏。
+        "freeze_actor_during_warmup": True,
+
         # warm-up 期间 actor 不做 max-Q 更新，只做 demo 行为克隆。
         "freeze_actor_q_during_warmup": True,
 
@@ -701,6 +705,11 @@ BASE_EXPERIMENT = {
         # 当前只支持 "pool_power_mix"。
         "teacher_takeover_behavior_source": "pool_power_mix",
 
+        # teacher takeover 的采样粒度：
+        # - "per_step"    ：每一步独立决定是否由 teacher 接管
+        # - "per_episode" ：整局固定决定是否由 teacher 接管
+        "teacher_takeover_granularity": "per_episode",
+
         # teacher takeover 起始概率。
         # 例如 0.8 表示刚脱离 warm-up 时，80% 概率仍由 teacher 接管。
         "teacher_takeover_start_prob": 0.8,
@@ -730,6 +739,10 @@ BASE_EXPERIMENT = {
         # 稳定条件至少满足多少条才算一次达标。
         # 当前条件包括：eval return、actor_bc_val、critic_val。
         "adaptive_teacher_release_min_criteria": 2,
+
+        # 是否在 adaptive teacher release 真正解锁前，一直禁止 actor 的 Q 更新。
+        # 这样可以先保持 imitation 锚点，等 teacher 退场门槛满足后再做 RL 提升。
+        "freeze_actor_q_until_teacher_release": True,
 
         # online 阶段 actor 的 Q 项初始系数。
         # 早期让 actor loss 以 BC 为主，Q 为辅。
@@ -774,10 +787,10 @@ BASE_EXPERIMENT = {
         "tau": 0.001,
 
         # rollout 时在 logits 空间加噪声的标准差。
-        "rollout_logit_noise_std": 0.30,
+        "rollout_logit_noise_std": 0.10,
 
         # rollout 时 logits 噪声的截断范围。
-        "rollout_logit_noise_clip": 0.50,
+        "rollout_logit_noise_clip": 0.20,
 
         # rollout 噪声衰减系数。
         "rollout_noise_decay": 0.9995,
@@ -1939,6 +1952,7 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         warmup_pool_power_k=training["warmup_pool_power_k"],
         warmup_logit_noise_std=training["warmup_logit_noise_std"],
         warmup_logit_noise_clip=training["warmup_logit_noise_clip"],
+        freeze_actor_during_warmup=training.get("freeze_actor_during_warmup", False),
         freeze_actor_q_during_warmup=training.get("freeze_actor_q_during_warmup", True),
         warmup_actor_bc_coef=training.get("warmup_actor_bc_coef", 1.0),
         actor_demo_bc_coef=training.get("actor_demo_bc_coef", 0.25),
@@ -1966,6 +1980,7 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         demo_critic_pretrain_n_step=training.get("demo_critic_pretrain_n_step", 20),
         teacher_takeover_enabled=training.get("teacher_takeover_enabled", True),
         teacher_takeover_behavior_source=training.get("teacher_takeover_behavior_source", "pool_power_mix"),
+        teacher_takeover_granularity=training.get("teacher_takeover_granularity", "per_step"),
         teacher_takeover_start_prob=training.get("teacher_takeover_start_prob", 0.8),
         teacher_takeover_end_prob=training.get("teacher_takeover_end_prob", 0.0),
         teacher_takeover_decay_end_fraction=training.get("teacher_takeover_decay_end_fraction", 0.30),
@@ -1981,6 +1996,7 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         ),
         adaptive_teacher_release_required_evals=training.get("adaptive_teacher_release_required_evals", 3),
         adaptive_teacher_release_min_criteria=training.get("adaptive_teacher_release_min_criteria", 2),
+        freeze_actor_q_until_teacher_release=training.get("freeze_actor_q_until_teacher_release", False),
         online_actor_q_coef_initial=training.get("online_actor_q_coef_initial", 0.2),
         online_actor_q_coef_final=training.get("online_actor_q_coef_final", 1.0),
         online_actor_q_coef_ramp_end_fraction=training.get("online_actor_q_coef_ramp_end_fraction", 0.30),

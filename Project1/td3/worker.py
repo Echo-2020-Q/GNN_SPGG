@@ -551,6 +551,7 @@ class RolloutWorker:
         self.constant_mix_policy = ConstantMixAllocationPolicy(train_config.warmup_constant_mix_omega)
         self.pool_power_mix_policy = PoolPowerMixAllocationPolicy(train_config.warmup_pool_power_k)
         self.current_warmup_behavior_sources: list[str | None] = [None for _ in range(self.num_envs_per_worker)]
+        self.current_teacher_takeover_decisions: list[bool | None] = [None for _ in range(self.num_envs_per_worker)]
         self.teacher_takeover_release_env_step: int | None = None
 
     def sync_actor(
@@ -573,6 +574,7 @@ class RolloutWorker:
             self.env_metadatas = [{} for _ in range(self.num_envs_per_worker)]
             self.observations = [None for _ in range(self.num_envs_per_worker)]
             self.current_warmup_behavior_sources = [None for _ in range(self.num_envs_per_worker)]
+            self.current_teacher_takeover_decisions = [None for _ in range(self.num_envs_per_worker)]
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -599,6 +601,7 @@ class RolloutWorker:
             ],
             "env_state_list": [env.state_dict() if env is not None else None for env in self.envs],
             "current_warmup_behavior_source_list": list(self.current_warmup_behavior_sources),
+            "current_teacher_takeover_decision_list": list(self.current_teacher_takeover_decisions),
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -622,11 +625,21 @@ class RolloutWorker:
         current_warmup_behavior_source_list = state_dict.get("current_warmup_behavior_source_list")
         if current_warmup_behavior_source_list is None:
             current_warmup_behavior_source_list = [state_dict.get("current_warmup_behavior_source")]
+        current_teacher_takeover_decision_list = state_dict.get("current_teacher_takeover_decision_list")
+        if current_teacher_takeover_decision_list is None:
+            current_teacher_takeover_decision_list = [None for _ in range(self.num_envs_per_worker)]
 
         if len(env_state_list) != self.num_envs_per_worker:
             raise ValueError(
                 "Checkpoint env count {0} does not match worker num_envs_per_worker {1}.".format(
                     len(env_state_list),
+                    self.num_envs_per_worker,
+                )
+            )
+        if len(current_teacher_takeover_decision_list) != self.num_envs_per_worker:
+            raise ValueError(
+                "Checkpoint teacher decision count {0} does not match worker num_envs_per_worker {1}.".format(
+                    len(current_teacher_takeover_decision_list),
                     self.num_envs_per_worker,
                 )
             )
@@ -645,6 +658,10 @@ class RolloutWorker:
                 env.load_state_dict(env_state)
                 self.envs.append(env)
         self.current_warmup_behavior_sources = list(current_warmup_behavior_source_list)
+        self.current_teacher_takeover_decisions = [
+            None if decision is None else bool(decision)
+            for decision in current_teacher_takeover_decision_list
+        ]
 
     def _total_rollout_env_steps(self) -> int:
         return int(self.train_config.total_updates) * int(self.train_config.steps_per_update) * int(self.train_config.num_workers)
@@ -684,6 +701,18 @@ class RolloutWorker:
         start_prob = float(self.train_config.teacher_takeover_start_prob)
         end_prob = float(self.train_config.teacher_takeover_end_prob)
         return start_prob + (end_prob - start_prob) * progress
+
+    def _resolve_teacher_takeover_decision(self, slot_index: int, global_env_step: int) -> tuple[float, bool]:
+        teacher_takeover_prob = self._current_teacher_takeover_prob(global_env_step)
+        if teacher_takeover_prob <= 0.0:
+            return teacher_takeover_prob, False
+        if self.train_config.teacher_takeover_granularity == "per_step":
+            return teacher_takeover_prob, bool(self.rng.random() < teacher_takeover_prob)
+        current_decision = self.current_teacher_takeover_decisions[slot_index]
+        if current_decision is None:
+            current_decision = bool(self.rng.random() < teacher_takeover_prob)
+            self.current_teacher_takeover_decisions[slot_index] = current_decision
+        return teacher_takeover_prob, bool(current_decision)
 
     def _annotate_demo_return_targets(
         self,
@@ -847,11 +876,12 @@ class RolloutWorker:
                     behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
                     continue
                 current_global_step = int(global_env_start_step) + int(collected_steps + batch_offset)
-                teacher_takeover_prob = self._current_teacher_takeover_prob(current_global_step)
+                teacher_takeover_prob, teacher_takeover_active = self._resolve_teacher_takeover_decision(
+                    slot_index,
+                    current_global_step,
+                )
                 teacher_takeover_probs.append(float(teacher_takeover_prob))
-                if teacher_takeover_prob > 0.0 and (
-                    self.rng.random() < teacher_takeover_prob
-                ):
+                if teacher_takeover_active:
                     behavior_source = str(self.train_config.teacher_takeover_behavior_source)
                     actions_by_slot[slot_index] = self._sample_warmup_action(observation, behavior_source)
                     is_demo_by_slot[slot_index] = True
@@ -1037,6 +1067,7 @@ class RolloutWorker:
         self.env_metadatas[slot_index] = env_metadata
         self.observations[slot_index] = env.reset(seed=reset_seed)
         self.current_warmup_behavior_sources[slot_index] = None
+        self.current_teacher_takeover_decisions[slot_index] = None
         if self.train_config.warmup_selection_granularity == "per_episode":
             self.current_warmup_behavior_sources[slot_index] = self._select_warmup_behavior_source()
 

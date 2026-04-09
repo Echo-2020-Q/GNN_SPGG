@@ -50,6 +50,7 @@ class GraphTD3Config:
     warmup_pool_power_k: float = 19.0
     warmup_logit_noise_std: float = 0.0
     warmup_logit_noise_clip: float = 0.0
+    freeze_actor_during_warmup: bool = False
     freeze_actor_q_during_warmup: bool = True
     warmup_actor_bc_coef: float = 1.0
     actor_demo_bc_coef: float = 0.25
@@ -75,8 +76,20 @@ class GraphTD3Config:
     demo_dataset_save_path: str | None = None
     demo_critic_pretrain_target_mode: str = "n_step"
     demo_critic_pretrain_n_step: int = 20
+    critic_bridge_enabled: bool = False
+    critic_bridge_env_steps: int = 0
+    critic_bridge_updates: int = 0
+    critic_bridge_batch_size: int | None = None
+    critic_bridge_validation_fraction: float = 0.10
+    critic_bridge_eval_interval: int = 200
+    critic_bridge_patience: int = 5
+    critic_bridge_min_relative_improvement: float = 0.01
+    critic_bridge_behavior_mode: str = "actor_only"
+    critic_bridge_teacher_takeover_prob: float = 0.0
+    critic_bridge_use_curriculum_stage0_distribution: bool = True
     teacher_takeover_enabled: bool = True
     teacher_takeover_behavior_source: str = "pool_power_mix"
+    teacher_takeover_granularity: str = "per_step"
     teacher_takeover_start_prob: float = 0.8
     teacher_takeover_end_prob: float = 0.0
     teacher_takeover_decay_end_fraction: float = 0.30
@@ -86,6 +99,7 @@ class GraphTD3Config:
     adaptive_teacher_release_max_critic_val_ratio: float = 1.20
     adaptive_teacher_release_required_evals: int = 3
     adaptive_teacher_release_min_criteria: int = 2
+    freeze_actor_q_until_teacher_release: bool = False
     online_actor_q_coef_initial: float = 0.2
     online_actor_q_coef_final: float = 1.0
     online_actor_q_coef_ramp_end_fraction: float = 0.30
@@ -218,6 +232,8 @@ class GraphTD3Config:
             raise ValueError("warmup_logit_noise_std must be non-negative.")
         if self.warmup_logit_noise_clip < 0.0:
             raise ValueError("warmup_logit_noise_clip must be non-negative.")
+        if not isinstance(self.freeze_actor_during_warmup, bool):
+            raise ValueError("freeze_actor_during_warmup must be a bool.")
         if not isinstance(self.freeze_actor_q_during_warmup, bool):
             raise ValueError("freeze_actor_q_during_warmup must be a bool.")
         if self.warmup_actor_bc_coef < 0.0:
@@ -267,10 +283,34 @@ class GraphTD3Config:
             raise ValueError("demo_critic_pretrain_target_mode must be one of {'n_step', 'mc'}.")
         if self.demo_critic_pretrain_n_step <= 0:
             raise ValueError("demo_critic_pretrain_n_step must be positive.")
+        if not isinstance(self.critic_bridge_enabled, bool):
+            raise ValueError("critic_bridge_enabled must be a bool.")
+        if self.critic_bridge_env_steps < 0:
+            raise ValueError("critic_bridge_env_steps must be non-negative.")
+        if self.critic_bridge_updates < 0:
+            raise ValueError("critic_bridge_updates must be non-negative.")
+        if self.critic_bridge_batch_size is not None and self.critic_bridge_batch_size <= 0:
+            raise ValueError("critic_bridge_batch_size must be positive when provided.")
+        if self.critic_bridge_validation_fraction < 0.0 or self.critic_bridge_validation_fraction >= 1.0:
+            raise ValueError("critic_bridge_validation_fraction must be in [0, 1).")
+        if self.critic_bridge_eval_interval <= 0:
+            raise ValueError("critic_bridge_eval_interval must be positive.")
+        if self.critic_bridge_patience <= 0:
+            raise ValueError("critic_bridge_patience must be positive.")
+        if self.critic_bridge_min_relative_improvement < 0.0:
+            raise ValueError("critic_bridge_min_relative_improvement must be non-negative.")
+        if self.critic_bridge_behavior_mode not in {"actor_only", "teacher_actor_mix"}:
+            raise ValueError("critic_bridge_behavior_mode must be one of {'actor_only', 'teacher_actor_mix'}.")
+        if self.critic_bridge_teacher_takeover_prob < 0.0 or self.critic_bridge_teacher_takeover_prob > 1.0:
+            raise ValueError("critic_bridge_teacher_takeover_prob must be in [0, 1].")
+        if not isinstance(self.critic_bridge_use_curriculum_stage0_distribution, bool):
+            raise ValueError("critic_bridge_use_curriculum_stage0_distribution must be a bool.")
         if not isinstance(self.teacher_takeover_enabled, bool):
             raise ValueError("teacher_takeover_enabled must be a bool.")
         if self.teacher_takeover_behavior_source not in {"pool_power_mix"}:
             raise ValueError("teacher_takeover_behavior_source currently only supports 'pool_power_mix'.")
+        if self.teacher_takeover_granularity not in {"per_step", "per_episode"}:
+            raise ValueError("teacher_takeover_granularity must be one of {'per_step', 'per_episode'}.")
         if self.teacher_takeover_start_prob < 0.0 or self.teacher_takeover_start_prob > 1.0:
             raise ValueError("teacher_takeover_start_prob must be in [0, 1].")
         if self.teacher_takeover_end_prob < 0.0 or self.teacher_takeover_end_prob > 1.0:
@@ -289,6 +329,8 @@ class GraphTD3Config:
             raise ValueError("adaptive_teacher_release_required_evals must be positive.")
         if self.adaptive_teacher_release_min_criteria <= 0:
             raise ValueError("adaptive_teacher_release_min_criteria must be positive.")
+        if not isinstance(self.freeze_actor_q_until_teacher_release, bool):
+            raise ValueError("freeze_actor_q_until_teacher_release must be a bool.")
         if self.online_actor_q_coef_initial < 0.0:
             raise ValueError("online_actor_q_coef_initial must be non-negative.")
         if self.online_actor_q_coef_final < 0.0:

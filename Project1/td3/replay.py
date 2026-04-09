@@ -91,36 +91,40 @@ def _shuffle_replay_batch(batch: TensorReplayBatch, rng: np.random.Generator) ->
     return _slice_replay_batch(batch, indices)
 
 
-def split_demo_batch_train_val(
+def _split_replay_batch_train_val_impl(
     batch: TensorReplayBatch,
     *,
     validation_fraction: float,
     rng: np.random.Generator,
+    only_demo: bool,
 ) -> tuple[TensorReplayBatch | None, TensorReplayBatch | None]:
     if len(batch) <= 0:
         return None, None
     if validation_fraction <= 0.0:
         return batch.clone(), None
 
-    demo_mask = batch.is_demo.detach().cpu().numpy().astype(np.bool_, copy=False)
-    if not np.any(demo_mask):
+    if only_demo:
+        eligible_mask = batch.is_demo.detach().cpu().numpy().astype(np.bool_, copy=False)
+    else:
+        eligible_mask = np.ones(len(batch), dtype=np.bool_)
+    if not np.any(eligible_mask):
         return batch.clone(), None
 
     topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64, copy=False)
     val_mask = np.zeros(len(batch), dtype=np.bool_)
-    for topology_id in np.unique(topology_ids[demo_mask]):
-        topology_demo_indices = np.flatnonzero(np.logical_and(demo_mask, topology_ids == int(topology_id)))
-        if topology_demo_indices.size <= 1:
+    for topology_id in np.unique(topology_ids[eligible_mask]):
+        topology_indices = np.flatnonzero(np.logical_and(eligible_mask, topology_ids == int(topology_id)))
+        if topology_indices.size <= 1:
             continue
-        requested = int(round(float(topology_demo_indices.size) * float(validation_fraction)))
-        requested = max(0, min(requested, int(topology_demo_indices.size) - 1))
+        requested = int(round(float(topology_indices.size) * float(validation_fraction)))
+        requested = max(0, min(requested, int(topology_indices.size) - 1))
         if requested <= 0:
             continue
-        selected = rng.choice(topology_demo_indices, size=requested, replace=False)
+        selected = rng.choice(topology_indices, size=requested, replace=False)
         val_mask[selected] = True
 
-    if not np.any(val_mask) and int(np.sum(demo_mask)) > 1:
-        selected = rng.choice(np.flatnonzero(demo_mask), size=1, replace=False)
+    if not np.any(val_mask) and int(np.sum(eligible_mask)) > 1:
+        selected = rng.choice(np.flatnonzero(eligible_mask), size=1, replace=False)
         val_mask[selected] = True
 
     train_mask = np.logical_not(val_mask)
@@ -133,6 +137,34 @@ def split_demo_batch_train_val(
         val_indices = torch.as_tensor(np.flatnonzero(val_mask), dtype=torch.int64, device="cpu")
         val_batch = _slice_replay_batch(batch, val_indices)
     return train_batch, val_batch
+
+
+def split_demo_batch_train_val(
+    batch: TensorReplayBatch,
+    *,
+    validation_fraction: float,
+    rng: np.random.Generator,
+) -> tuple[TensorReplayBatch | None, TensorReplayBatch | None]:
+    return _split_replay_batch_train_val_impl(
+        batch,
+        validation_fraction=validation_fraction,
+        rng=rng,
+        only_demo=True,
+    )
+
+
+def split_replay_batch_train_val(
+    batch: TensorReplayBatch,
+    *,
+    validation_fraction: float,
+    rng: np.random.Generator,
+) -> tuple[TensorReplayBatch | None, TensorReplayBatch | None]:
+    return _split_replay_batch_train_val_impl(
+        batch,
+        validation_fraction=validation_fraction,
+        rng=rng,
+        only_demo=False,
+    )
 
 
 def _allocate_integer_counts(total: int, weights: Sequence[float]) -> list[int]:
