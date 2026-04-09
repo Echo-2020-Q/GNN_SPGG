@@ -698,6 +698,72 @@ BASE_EXPERIMENT = {
         # 当 demo_critic_pretrain_target_mode="n_step" 时使用的步长 n。
         "demo_critic_pretrain_n_step": 10,
 
+        # 是否启用 critic bridge phase：
+        # actor BC pretrain 后，先用 actor-only / teacher-actor mix rollout 一批 bridge 数据，
+        # 再只训练 critic 用标准 TD target 适应 actor 分布，最后再进入 online training。
+        "critic_bridge_enabled": True,
+
+        # critic bridge collection 的总环境步数。
+        # 这些步数不计入 warm-up，也不计入 total_env_steps。
+        "critic_bridge_env_steps": 500_000,
+
+        # critic bridge 阶段只训练 critic 的最大更新次数。
+        "critic_bridge_updates": 2_000,
+
+        # critic bridge 的 batch 大小。
+        # 设为 None 时，回退到 demo_pretrain_batch_size，再回退到 batch_size。
+        "critic_bridge_batch_size": 256,
+
+        # critic bridge hold-out 验证集比例。
+        "critic_bridge_validation_fraction": 0.10,
+
+        # critic bridge 每隔多少个 update 做一次验证。
+        "critic_bridge_eval_interval": 200,
+
+        # critic bridge early stopping 的 patience。
+        "critic_bridge_patience": 5,
+
+        # critic bridge 最小相对改善阈值。
+        "critic_bridge_min_relative_improvement": 0.01,
+
+        # critic bridge 行为模式：
+        # - "actor_only"        : 纯 actor rollout
+        # - "teacher_actor_mix" : 用固定 teacher takeover 概率混合 rollout
+        "critic_bridge_behavior_mode": "actor_only",
+
+        # 当 critic_bridge_behavior_mode="teacher_actor_mix" 时使用的固定 teacher 接管概率。
+        "critic_bridge_teacher_takeover_prob": 0.0,
+
+        # critic bridge 是否默认使用 curriculum 第 0 阶段的训练分布。
+        # False 时退回到 train_factory 当前分布。
+        "critic_bridge_use_curriculum_stage0_distribution": True,
+
+        # critic bridge 的 teacher-return aux 调度方式：
+        # - "fixed"    : 使用固定系数
+        # - "adaptive" : 只有 bridge 验证收敛到一定程度后，才把 aux 系数降一档
+        "critic_bridge_teacher_return_aux_schedule": "adaptive",
+
+        # 当 critic_bridge_teacher_return_aux_schedule="adaptive" 时使用的分档系数。
+        # 这些值必须单调不增；bridge 会从左到右逐档衰减。
+        "critic_bridge_teacher_return_aux_levels": (1.0, 0.5, 0.25, 0.0),
+
+        # adaptive bridge aux 需要连续多少次验证满足收敛门槛，才允许降一档。
+        "critic_bridge_teacher_return_aux_required_evals": 2,
+
+        # adaptive bridge aux 的验证损失门槛。
+        # 当前 bridge val loss 需要 <= best_val_loss * 该比例，才算“还在稳定区间”。
+        "critic_bridge_teacher_return_aux_max_val_ratio": 1.10,
+
+        # adaptive bridge aux 的 Q 均值误差门槛。
+        # |q_pred_mean - target_mean| / max(|target_mean|, 1.0) 需要 <= 该阈值。
+        "critic_bridge_teacher_return_aux_max_error_ratio": 0.20,
+
+        # critic bridge 阶段的 teacher-return 辅助损失系数。
+        # bridge 主损失仍是 actor 分布上的 TD target；这里额外用 demo replay 上的 teacher-return
+        # 保持 critic 不要在过渡阶段完全丢掉 pretrain 学到的价值尺度。
+        # 当 schedule="adaptive" 时，这个值只作为兼容回退，不参与主逻辑。
+        "critic_bridge_teacher_return_aux_coef": 0.5,
+
         # warm-up 结束后，是否让 teacher 先和 actor 混合接管，而不是立刻纯 actor。
         "teacher_takeover_enabled": True,
 
@@ -1978,6 +2044,43 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         demo_dataset_save_path=training.get("demo_dataset_save_path"),
         demo_critic_pretrain_target_mode=training.get("demo_critic_pretrain_target_mode", "n_step"),
         demo_critic_pretrain_n_step=training.get("demo_critic_pretrain_n_step", 20),
+        critic_bridge_enabled=training.get("critic_bridge_enabled", False),
+        critic_bridge_env_steps=training.get("critic_bridge_env_steps", 0),
+        critic_bridge_updates=training.get("critic_bridge_updates", 0),
+        critic_bridge_batch_size=training.get("critic_bridge_batch_size"),
+        critic_bridge_validation_fraction=training.get("critic_bridge_validation_fraction", 0.10),
+        critic_bridge_eval_interval=training.get("critic_bridge_eval_interval", 200),
+        critic_bridge_patience=training.get("critic_bridge_patience", 5),
+        critic_bridge_min_relative_improvement=training.get("critic_bridge_min_relative_improvement", 0.01),
+        critic_bridge_behavior_mode=training.get("critic_bridge_behavior_mode", "actor_only"),
+        critic_bridge_teacher_takeover_prob=training.get("critic_bridge_teacher_takeover_prob", 0.0),
+        critic_bridge_use_curriculum_stage0_distribution=training.get(
+            "critic_bridge_use_curriculum_stage0_distribution",
+            True,
+        ),
+        critic_bridge_teacher_return_aux_schedule=str(
+            training.get("critic_bridge_teacher_return_aux_schedule", "fixed")
+        ),
+        critic_bridge_teacher_return_aux_levels=tuple(
+            float(item)
+            for item in (
+                training.get("critic_bridge_teacher_return_aux_levels")
+                or (1.0, 0.5, 0.25, 0.0)
+            )
+        ),
+        critic_bridge_teacher_return_aux_required_evals=training.get(
+            "critic_bridge_teacher_return_aux_required_evals",
+            2,
+        ),
+        critic_bridge_teacher_return_aux_max_val_ratio=training.get(
+            "critic_bridge_teacher_return_aux_max_val_ratio",
+            1.10,
+        ),
+        critic_bridge_teacher_return_aux_max_error_ratio=training.get(
+            "critic_bridge_teacher_return_aux_max_error_ratio",
+            0.20,
+        ),
+        critic_bridge_teacher_return_aux_coef=training.get("critic_bridge_teacher_return_aux_coef", 0.0),
         teacher_takeover_enabled=training.get("teacher_takeover_enabled", True),
         teacher_takeover_behavior_source=training.get("teacher_takeover_behavior_source", "pool_power_mix"),
         teacher_takeover_granularity=training.get("teacher_takeover_granularity", "per_step"),
@@ -3679,27 +3782,50 @@ def _log_tensorboard_demo_pretrain_summary(
         "demo_validation_fraction": "demo_pretrain/demo_validation_fraction",
         "actor_bc_updates": "demo_pretrain/actor_bc_updates",
         "critic_pretrain_updates": "demo_pretrain/critic_pretrain_updates",
+        "critic_bridge_env_steps": "demo_pretrain/critic_bridge_env_steps",
+        "critic_bridge_replay_size_after_collection": "demo_pretrain/critic_bridge_replay_size_after_collection",
+        "critic_bridge_train_replay_size_after_split": "demo_pretrain/critic_bridge_train_replay_size_after_split",
+        "critic_bridge_val_replay_size_after_split": "demo_pretrain/critic_bridge_val_replay_size_after_split",
+        "critic_bridge_updates": "demo_pretrain/critic_bridge_updates",
         "actor_bc_loss_last": "demo_pretrain/actor_bc_loss_last",
         "actor_bc_val_loss_last": "demo_pretrain/actor_bc_val_loss_last",
         "actor_bc_val_loss_best": "demo_pretrain/actor_bc_val_loss_best",
         "critic_loss_last": "demo_pretrain/critic_loss_last",
         "critic_val_loss_last": "demo_pretrain/critic_val_loss_last",
         "critic_val_loss_best": "demo_pretrain/critic_val_loss_best",
+        "critic_bridge_loss_last": "demo_pretrain/critic_bridge_loss_last",
+        "critic_bridge_teacher_aux_loss_last": "demo_pretrain/critic_bridge_teacher_aux_loss_last",
+        "critic_bridge_teacher_aux_coef": "demo_pretrain/critic_bridge_teacher_aux_coef",
+        "critic_bridge_teacher_aux_level_index": "demo_pretrain/critic_bridge_teacher_aux_level_index",
+        "critic_bridge_teacher_aux_stable_eval_count": "demo_pretrain/critic_bridge_teacher_aux_stable_eval_count",
+        "critic_bridge_teacher_aux_error_ratio": "demo_pretrain/critic_bridge_teacher_aux_error_ratio",
+        "critic_bridge_teacher_aux_reduction_count": "demo_pretrain/critic_bridge_teacher_aux_reduction_count",
+        "critic_bridge_val_loss_last": "demo_pretrain/critic_bridge_val_loss_last",
+        "critic_bridge_val_loss_best": "demo_pretrain/critic_bridge_val_loss_best",
         "quick_eval_return_last": "demo_pretrain/quick_eval_return_last",
         "quick_eval_return_best": "demo_pretrain/quick_eval_return_best",
         "actor_bc_eval_count": "demo_pretrain/actor_bc_eval_count",
         "critic_eval_count": "demo_pretrain/critic_eval_count",
+        "critic_bridge_eval_count": "demo_pretrain/critic_bridge_eval_count",
         "critic_q_pred_mean": "demo_pretrain/critic_q_pred_mean",
         "critic_q_pred_std": "demo_pretrain/critic_q_pred_std",
         "critic_target_mean": "demo_pretrain/critic_target_mean",
         "critic_target_std": "demo_pretrain/critic_target_std",
         "critic_error_mean": "demo_pretrain/critic_error_mean",
         "critic_error_std": "demo_pretrain/critic_error_std",
+        "critic_bridge_q_pred_mean": "demo_pretrain/critic_bridge_q_pred_mean",
+        "critic_bridge_q_pred_std": "demo_pretrain/critic_bridge_q_pred_std",
+        "critic_bridge_target_mean": "demo_pretrain/critic_bridge_target_mean",
+        "critic_bridge_target_std": "demo_pretrain/critic_bridge_target_std",
+        "critic_bridge_error_mean": "demo_pretrain/critic_bridge_error_mean",
+        "critic_bridge_error_std": "demo_pretrain/critic_bridge_error_std",
         "demo_return_target_mean": "demo_pretrain/demo_return_target_mean",
         "demo_return_target_std": "demo_pretrain/demo_return_target_std",
         "seconds_collection": "demo_pretrain/seconds_collection",
         "seconds_actor_bc": "demo_pretrain/seconds_actor_bc",
         "seconds_critic": "demo_pretrain/seconds_critic",
+        "seconds_critic_bridge_collection": "demo_pretrain/seconds_critic_bridge_collection",
+        "seconds_critic_bridge": "demo_pretrain/seconds_critic_bridge",
     }
     for key, tag in scalar_keys.items():
         if key in summary and summary[key] is not None:
@@ -3707,6 +3833,7 @@ def _log_tensorboard_demo_pretrain_summary(
     for key, tag in {
         "actor_bc_early_stopped": "demo_pretrain/actor_bc_early_stopped",
         "critic_pretrain_early_stopped": "demo_pretrain/critic_pretrain_early_stopped",
+        "critic_bridge_early_stopped": "demo_pretrain/critic_bridge_early_stopped",
     }.items():
         if key in summary and summary[key] is not None:
             writer.add_scalar(tag, 1.0 if bool(summary[key]) else 0.0, 0)
@@ -3714,6 +3841,12 @@ def _log_tensorboard_demo_pretrain_summary(
         writer.add_text("demo_pretrain/behavior_source", str(summary["behavior_source"]), 0)
     if "critic_target_mode" in summary and summary["critic_target_mode"] is not None:
         writer.add_text("demo_pretrain/critic_target_mode", str(summary["critic_target_mode"]), 0)
+    if "critic_bridge_teacher_aux_schedule" in summary and summary["critic_bridge_teacher_aux_schedule"] is not None:
+        writer.add_text(
+            "demo_pretrain/critic_bridge_teacher_aux_schedule",
+            str(summary["critic_bridge_teacher_aux_schedule"]),
+            0,
+        )
     if "dataset_path" in summary and summary["dataset_path"] is not None:
         writer.add_text("demo_pretrain/dataset_path", str(summary["dataset_path"]), 0)
 
@@ -4087,11 +4220,11 @@ def run_gnn_training_mode(
                         else "fixed"
                     )
                 )
-                print(
-                    "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, runtime={4}, actor_bc_updates={5}, critic_pretrain_updates={6}, critic_target={7}, n_step={8}, batch_size={9}, val_batch_size={10}, val_frac={11}, eval_interval={12}, patience={13}, min_improve={14}, dataset_path={15}, save_ckpt={16}, ckpt_name={17}, stop_after={18}".format(
-                        trainer_config.demo_collection_env_steps,
-                        trainer_config.demo_collection_behavior_source,
-                        trainer_config.demo_collection_use_domain_randomization,
+            print(
+                "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, runtime={4}, actor_bc_updates={5}, critic_pretrain_updates={6}, critic_target={7}, n_step={8}, batch_size={9}, val_batch_size={10}, val_frac={11}, eval_interval={12}, patience={13}, min_improve={14}, dataset_path={15}, save_ckpt={16}, ckpt_name={17}, stop_after={18}".format(
+                    trainer_config.demo_collection_env_steps,
+                    trainer_config.demo_collection_behavior_source,
+                    trainer_config.demo_collection_use_domain_randomization,
                         demo_collection_network_types,
                         trainer_config.demo_collection_runtime,
                         trainer_config.actor_bc_pretrain_updates,
@@ -4119,6 +4252,40 @@ def run_gnn_training_mode(
                         bool(training.get("stop_after_demo_pretrain", False)),
                     )
                 )
+            print(
+                "Bridge CFG: enabled={0}, env_steps={1}, updates={2}, batch_size={3}, val_frac={4}, eval_interval={5}, patience={6}, min_improve={7}, mode={8}, teacher_prob={9}, stage0_dist={10}, teacher_aux={11}".format(
+                    trainer_config.critic_bridge_enabled,
+                    trainer_config.critic_bridge_env_steps,
+                    trainer_config.critic_bridge_updates,
+                    trainer_config.critic_bridge_batch_size
+                    if trainer_config.critic_bridge_batch_size is not None
+                    else (
+                        trainer_config.demo_pretrain_batch_size
+                        if trainer_config.demo_pretrain_batch_size is not None
+                        else trainer_config.batch_size
+                    ),
+                    trainer_config.critic_bridge_validation_fraction,
+                    trainer_config.critic_bridge_eval_interval,
+                    trainer_config.critic_bridge_patience,
+                    trainer_config.critic_bridge_min_relative_improvement,
+                    trainer_config.critic_bridge_behavior_mode,
+                    trainer_config.critic_bridge_teacher_takeover_prob,
+                    trainer_config.critic_bridge_use_curriculum_stage0_distribution,
+                    (
+                        "adaptive(levels={0}, need={1}, val<={2:.2f}x, err<={3:.2f})".format(
+                            ",".join(
+                                "{0:.3f}".format(float(level))
+                                for level in trainer_config.critic_bridge_teacher_return_aux_levels
+                            ),
+                            trainer_config.critic_bridge_teacher_return_aux_required_evals,
+                            trainer_config.critic_bridge_teacher_return_aux_max_val_ratio,
+                            trainer_config.critic_bridge_teacher_return_aux_max_error_ratio,
+                        )
+                        if str(trainer_config.critic_bridge_teacher_return_aux_schedule) == "adaptive"
+                        else "fixed({0:.3f})".format(trainer_config.critic_bridge_teacher_return_aux_coef)
+                    ),
+                )
+            )
             print(
                 "Stab CFG : teacher_takeover={0}({1}->{2}, end@{3}), adaptive_release={4}(return>={5:.2f}x, actor_bc<={6:.2f}x, critic<={7:.2f}x, need={8}/{9}), q_filter={10}(margin={11}, online_only={12}, require_release={13}), actor_q_coef={14}->{15} end@{16}, critic_loss={17}, huber_delta={18}, grad_clip(actor={19}, critic={20})".format(
                     trainer_config.teacher_takeover_enabled,
@@ -4443,12 +4610,13 @@ def run_gnn_training_mode(
             )
             if demo_pretrain_summary is not None:
                 print(
-                    "Demo Summary: total={0:.0f}, train={1:.0f}, val={2:.0f}, actor_bc_updates={3:.0f}, critic_pretrain_updates={4:.0f}, critic_target={5}, target_mean={6:.6f}, target_std={7:.6f}, actor_bc_loss_last={8:.6f}, actor_bc_val_best={9:.6f}, critic_loss_last={10:.6f}, critic_val_best={11:.6f}, quick_eval_best={12:.6f}, early_stop={{actor:{13}, critic:{14}}}, seconds={{collection:{15:.3f}, actor_bc:{16:.3f}, critic:{17:.3f}}}".format(
+                    "Demo Summary: total={0:.0f}, train={1:.0f}, val={2:.0f}, actor_bc_updates={3:.0f}, critic_pretrain_updates={4:.0f}, critic_bridge_updates={5:.0f}, critic_target={6}, target_mean={7:.6f}, target_std={8:.6f}, actor_bc_loss_last={9:.6f}, actor_bc_val_best={10:.6f}, critic_loss_last={11:.6f}, critic_val_best={12:.6f}, bridge_loss_last={13:.6f}, bridge_aux_last={14:.6f}, bridge_val_best={15:.6f}, quick_eval_best={16:.6f}, early_stop={{actor:{17}, critic:{18}, bridge:{19}}}, seconds={{collection:{20:.3f}, actor_bc:{21:.3f}, critic:{22:.3f}, bridge_collect:{23:.3f}, bridge:{24:.3f}}}".format(
                         float(demo_pretrain_summary.get("demo_replay_size_after_collection", 0.0)),
                         float(demo_pretrain_summary.get("demo_train_replay_size_after_split", 0.0)),
                         float(demo_pretrain_summary.get("demo_val_replay_size_after_split", 0.0)),
                         float(demo_pretrain_summary.get("actor_bc_updates", 0.0)),
                         float(demo_pretrain_summary.get("critic_pretrain_updates", 0.0)),
+                        float(demo_pretrain_summary.get("critic_bridge_updates", 0.0)),
                         str(demo_pretrain_summary.get("critic_target_mode", "n_step")),
                         float(demo_pretrain_summary.get("demo_return_target_mean", 0.0)),
                         float(demo_pretrain_summary.get("demo_return_target_std", 0.0)),
@@ -4456,12 +4624,18 @@ def run_gnn_training_mode(
                         float(demo_pretrain_summary.get("actor_bc_val_loss_best", 0.0)),
                         float(demo_pretrain_summary.get("critic_loss_last", 0.0)),
                         float(demo_pretrain_summary.get("critic_val_loss_best", 0.0)),
+                        float(demo_pretrain_summary.get("critic_bridge_loss_last", 0.0)),
+                        float(demo_pretrain_summary.get("critic_bridge_teacher_aux_loss_last", 0.0)),
+                        float(demo_pretrain_summary.get("critic_bridge_val_loss_best", 0.0)),
                         float(demo_pretrain_summary.get("quick_eval_return_best", 0.0)),
                         bool(demo_pretrain_summary.get("actor_bc_early_stopped", False)),
                         bool(demo_pretrain_summary.get("critic_pretrain_early_stopped", False)),
+                        bool(demo_pretrain_summary.get("critic_bridge_early_stopped", False)),
                         float(demo_pretrain_summary.get("seconds_collection", 0.0)),
                         float(demo_pretrain_summary.get("seconds_actor_bc", 0.0)),
                         float(demo_pretrain_summary.get("seconds_critic", 0.0)),
+                        float(demo_pretrain_summary.get("seconds_critic_bridge_collection", 0.0)),
+                        float(demo_pretrain_summary.get("seconds_critic_bridge", 0.0)),
                     )
                 )
                 if writer is not None:
@@ -4556,12 +4730,13 @@ def run_gnn_training_mode(
         if demo_pretrain_summary is not None:
             if not demo_pretrain_summary_logged:
                 print(
-                    "Demo Summary: total={0:.0f}, train={1:.0f}, val={2:.0f}, actor_bc_updates={3:.0f}, critic_pretrain_updates={4:.0f}, critic_target={5}, target_mean={6:.6f}, target_std={7:.6f}, actor_bc_loss_last={8:.6f}, actor_bc_val_best={9:.6f}, critic_loss_last={10:.6f}, critic_val_best={11:.6f}, quick_eval_best={12:.6f}, early_stop={{actor:{13}, critic:{14}}}, seconds={{collection:{15:.3f}, actor_bc:{16:.3f}, critic:{17:.3f}}}".format(
+                    "Demo Summary: total={0:.0f}, train={1:.0f}, val={2:.0f}, actor_bc_updates={3:.0f}, critic_pretrain_updates={4:.0f}, critic_bridge_updates={5:.0f}, critic_target={6}, target_mean={7:.6f}, target_std={8:.6f}, actor_bc_loss_last={9:.6f}, actor_bc_val_best={10:.6f}, critic_loss_last={11:.6f}, critic_val_best={12:.6f}, bridge_loss_last={13:.6f}, bridge_aux_last={14:.6f}, bridge_val_best={15:.6f}, quick_eval_best={16:.6f}, early_stop={{actor:{17}, critic:{18}, bridge:{19}}}, seconds={{collection:{20:.3f}, actor_bc:{21:.3f}, critic:{22:.3f}, bridge_collect:{23:.3f}, bridge:{24:.3f}}}".format(
                         float(demo_pretrain_summary.get("demo_replay_size_after_collection", 0.0)),
                         float(demo_pretrain_summary.get("demo_train_replay_size_after_split", 0.0)),
                         float(demo_pretrain_summary.get("demo_val_replay_size_after_split", 0.0)),
                         float(demo_pretrain_summary.get("actor_bc_updates", 0.0)),
                         float(demo_pretrain_summary.get("critic_pretrain_updates", 0.0)),
+                        float(demo_pretrain_summary.get("critic_bridge_updates", 0.0)),
                         str(demo_pretrain_summary.get("critic_target_mode", "n_step")),
                         float(demo_pretrain_summary.get("demo_return_target_mean", 0.0)),
                         float(demo_pretrain_summary.get("demo_return_target_std", 0.0)),
@@ -4569,12 +4744,18 @@ def run_gnn_training_mode(
                         float(demo_pretrain_summary.get("actor_bc_val_loss_best", 0.0)),
                         float(demo_pretrain_summary.get("critic_loss_last", 0.0)),
                         float(demo_pretrain_summary.get("critic_val_loss_best", 0.0)),
+                        float(demo_pretrain_summary.get("critic_bridge_loss_last", 0.0)),
+                        float(demo_pretrain_summary.get("critic_bridge_teacher_aux_loss_last", 0.0)),
+                        float(demo_pretrain_summary.get("critic_bridge_val_loss_best", 0.0)),
                         float(demo_pretrain_summary.get("quick_eval_return_best", 0.0)),
                         bool(demo_pretrain_summary.get("actor_bc_early_stopped", False)),
                         bool(demo_pretrain_summary.get("critic_pretrain_early_stopped", False)),
+                        bool(demo_pretrain_summary.get("critic_bridge_early_stopped", False)),
                         float(demo_pretrain_summary.get("seconds_collection", 0.0)),
                         float(demo_pretrain_summary.get("seconds_actor_bc", 0.0)),
                         float(demo_pretrain_summary.get("seconds_critic", 0.0)),
+                        float(demo_pretrain_summary.get("seconds_critic_bridge_collection", 0.0)),
+                        float(demo_pretrain_summary.get("seconds_critic_bridge", 0.0)),
                     )
                 )
             if writer is not None and not demo_pretrain_summary_logged:

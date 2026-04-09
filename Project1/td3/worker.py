@@ -704,6 +704,13 @@ class RolloutWorker:
 
     def _resolve_teacher_takeover_decision(self, slot_index: int, global_env_step: int) -> tuple[float, bool]:
         teacher_takeover_prob = self._current_teacher_takeover_prob(global_env_step)
+        return self._resolve_teacher_takeover_decision_from_prob(slot_index, teacher_takeover_prob)
+
+    def _resolve_teacher_takeover_decision_from_prob(
+        self,
+        slot_index: int,
+        teacher_takeover_prob: float,
+    ) -> tuple[float, bool]:
         if teacher_takeover_prob <= 0.0:
             return teacher_takeover_prob, False
         if self.train_config.teacher_takeover_granularity == "per_step":
@@ -797,6 +804,7 @@ class RolloutWorker:
         global_env_start_step: int = 0,
         demo_return_target_mode: str | None = None,
         demo_return_n_step: int | None = None,
+        teacher_takeover_override_prob: float | None = None,
     ) -> RolloutResult:
         collect_start = perf_counter()
         rewards: list[float] = []
@@ -876,10 +884,18 @@ class RolloutWorker:
                     behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
                     continue
                 current_global_step = int(global_env_start_step) + int(collected_steps + batch_offset)
-                teacher_takeover_prob, teacher_takeover_active = self._resolve_teacher_takeover_decision(
-                    slot_index,
-                    current_global_step,
-                )
+                if teacher_takeover_override_prob is None:
+                    teacher_takeover_prob, teacher_takeover_active = self._resolve_teacher_takeover_decision(
+                        slot_index,
+                        current_global_step,
+                    )
+                else:
+                    teacher_takeover_prob, teacher_takeover_active = (
+                        self._resolve_teacher_takeover_decision_from_prob(
+                            slot_index,
+                            float(teacher_takeover_override_prob),
+                        )
+                    )
                 teacher_takeover_probs.append(float(teacher_takeover_prob))
                 if teacher_takeover_active:
                     behavior_source = str(self.train_config.teacher_takeover_behavior_source)
@@ -1438,6 +1454,7 @@ def _parallel_rollout_worker_main(
                         global_env_start_step=int(message.get("global_env_start_step", 0)),
                         demo_return_target_mode=message.get("demo_return_target_mode"),
                         demo_return_n_step=message.get("demo_return_n_step"),
+                        teacher_takeover_override_prob=message.get("teacher_takeover_override_prob"),
                     )
                     shared_memory_serialize_start = perf_counter()
                     serialized_result, shared_memory_handles = _serialize_rollout_result(collect_result)
@@ -1587,6 +1604,7 @@ class ParallelRolloutWorker:
         global_env_start_step: int = 0,
         demo_return_target_mode: str | None = None,
         demo_return_n_step: int | None = None,
+        teacher_takeover_override_prob: float | None = None,
     ) -> None:
         if self._collect_inflight:
             raise RuntimeError("Collect request already in flight for worker {0}.".format(self.config.worker_id))
@@ -1601,6 +1619,11 @@ class ParallelRolloutWorker:
                 "global_env_start_step": int(global_env_start_step),
                 "demo_return_target_mode": demo_return_target_mode,
                 "demo_return_n_step": demo_return_n_step,
+                "teacher_takeover_override_prob": (
+                    None
+                    if teacher_takeover_override_prob is None
+                    else float(teacher_takeover_override_prob)
+                ),
             }
         )
         self._collect_inflight = True
@@ -1639,6 +1662,7 @@ class ParallelRolloutWorker:
         global_env_start_step: int = 0,
         demo_return_target_mode: str | None = None,
         demo_return_n_step: int | None = None,
+        teacher_takeover_override_prob: float | None = None,
     ) -> RolloutResult:
         self.start_collect(
             num_steps=num_steps,
@@ -1649,6 +1673,7 @@ class ParallelRolloutWorker:
             global_env_start_step=global_env_start_step,
             demo_return_target_mode=demo_return_target_mode,
             demo_return_n_step=demo_return_n_step,
+            teacher_takeover_override_prob=teacher_takeover_override_prob,
         )
         return self.finish_collect()
 

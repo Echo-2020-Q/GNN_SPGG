@@ -87,6 +87,12 @@ class GraphTD3Config:
     critic_bridge_behavior_mode: str = "actor_only"
     critic_bridge_teacher_takeover_prob: float = 0.0
     critic_bridge_use_curriculum_stage0_distribution: bool = True
+    critic_bridge_teacher_return_aux_schedule: str = "fixed"
+    critic_bridge_teacher_return_aux_levels: tuple[float, ...] = (1.0, 0.5, 0.25, 0.0)
+    critic_bridge_teacher_return_aux_required_evals: int = 2
+    critic_bridge_teacher_return_aux_max_val_ratio: float = 1.10
+    critic_bridge_teacher_return_aux_max_error_ratio: float = 0.20
+    critic_bridge_teacher_return_aux_coef: float = 0.0
     teacher_takeover_enabled: bool = True
     teacher_takeover_behavior_source: str = "pool_power_mix"
     teacher_takeover_granularity: str = "per_step"
@@ -305,6 +311,28 @@ class GraphTD3Config:
             raise ValueError("critic_bridge_teacher_takeover_prob must be in [0, 1].")
         if not isinstance(self.critic_bridge_use_curriculum_stage0_distribution, bool):
             raise ValueError("critic_bridge_use_curriculum_stage0_distribution must be a bool.")
+        if self.critic_bridge_teacher_return_aux_schedule not in {"fixed", "adaptive"}:
+            raise ValueError("critic_bridge_teacher_return_aux_schedule must be one of {'fixed', 'adaptive'}.")
+        if not self.critic_bridge_teacher_return_aux_levels:
+            raise ValueError("critic_bridge_teacher_return_aux_levels must contain at least one entry.")
+        if any(float(level) < 0.0 for level in self.critic_bridge_teacher_return_aux_levels):
+            raise ValueError("critic_bridge_teacher_return_aux_levels must be non-negative.")
+        for previous, current in zip(
+            self.critic_bridge_teacher_return_aux_levels,
+            self.critic_bridge_teacher_return_aux_levels[1:],
+        ):
+            if float(current) > float(previous):
+                raise ValueError(
+                    "critic_bridge_teacher_return_aux_levels must be non-increasing so the aux weight only decays."
+                )
+        if self.critic_bridge_teacher_return_aux_required_evals <= 0:
+            raise ValueError("critic_bridge_teacher_return_aux_required_evals must be positive.")
+        if self.critic_bridge_teacher_return_aux_max_val_ratio < 1.0:
+            raise ValueError("critic_bridge_teacher_return_aux_max_val_ratio must be >= 1.0.")
+        if self.critic_bridge_teacher_return_aux_max_error_ratio < 0.0:
+            raise ValueError("critic_bridge_teacher_return_aux_max_error_ratio must be non-negative.")
+        if self.critic_bridge_teacher_return_aux_coef < 0.0:
+            raise ValueError("critic_bridge_teacher_return_aux_coef must be non-negative.")
         if not isinstance(self.teacher_takeover_enabled, bool):
             raise ValueError("teacher_takeover_enabled must be a bool.")
         if self.teacher_takeover_behavior_source not in {"pool_power_mix"}:

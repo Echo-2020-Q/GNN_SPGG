@@ -20,7 +20,7 @@ from .data import TensorReplayActionRecord, TensorReplayBatch
 from .evaluator import GraphTD3Evaluator
 from .exploration import LogitSpaceExplorer
 from .learner import GraphTD3Learner
-from .replay import ReplayBuffer, split_demo_batch_train_val
+from .replay import ReplayBuffer, split_demo_batch_train_val, split_replay_batch_train_val
 from .worker import (
     ParallelRolloutInferenceServer,
     ParallelRolloutWorker,
@@ -252,6 +252,29 @@ class GraphTD3Trainer:
             collected_now += len(val_batch)
         return collected_now
 
+    @staticmethod
+    def _route_replay_batch_to_train_and_val(
+        replay_buffer: ReplayBuffer,
+        batch: TensorReplayBatch,
+        *,
+        validation_fraction: float,
+        split_rng: np.random.Generator,
+        validation_batches: list[TensorReplayBatch],
+    ) -> int:
+        train_batch, val_batch = split_replay_batch_train_val(
+            batch,
+            validation_fraction=float(validation_fraction),
+            rng=split_rng,
+        )
+        collected_now = 0
+        if train_batch is not None and len(train_batch) > 0:
+            replay_buffer.extend(train_batch)
+            collected_now += len(train_batch)
+        if val_batch is not None and len(val_batch) > 0:
+            validation_batches.append(val_batch.clone())
+            collected_now += len(val_batch)
+        return collected_now
+
     def _resolved_demo_validation_batch(self) -> TensorReplayBatch | None:
         if self.demo_validation_batch is not None and len(self.demo_validation_batch) > 0:
             return self.demo_validation_batch.clone()
@@ -315,6 +338,25 @@ class GraphTD3Trainer:
             metrics["quick_eval_collapse_rate"] = float(quick_eval.get("collapse_rate", 0.0))
             metrics["quick_eval_num_episodes"] = float(quick_eval_episodes)
         return metrics
+
+    def _run_critic_bridge_validation(
+        self,
+        validation_batch: TensorReplayBatch | None,
+    ) -> dict[str, float]:
+        if validation_batch is None or len(validation_batch) <= 0:
+            return {
+                "critic_val_loss": 0.0,
+                "critic1_val_loss": 0.0,
+                "critic2_val_loss": 0.0,
+                "critic_val_num_targets": 0.0,
+                "critic_q_pred_mean": 0.0,
+                "critic_q_pred_std": 0.0,
+                "critic_target_mean": 0.0,
+                "critic_target_std": 0.0,
+                "critic_error_mean": 0.0,
+                "critic_error_std": 0.0,
+            }
+        return self.learner.evaluate_critic_on_td_batch(validation_batch)
 
     def _update_adaptive_teacher_release(
         self,
@@ -654,6 +696,8 @@ class GraphTD3Trainer:
         count_env_steps: bool = True,
         demo_return_target_mode: str | None = None,
         demo_return_n_step: int | None = None,
+        teacher_takeover_override_prob: float | None = None,
+        extend_to_replay: bool = True,
     ) -> list[RolloutResult]:
         return self._collect_rollouts_with_allocations_on_workers(
             self.workers,
@@ -664,6 +708,8 @@ class GraphTD3Trainer:
             count_env_steps=count_env_steps,
             demo_return_target_mode=demo_return_target_mode,
             demo_return_n_step=demo_return_n_step,
+            teacher_takeover_override_prob=teacher_takeover_override_prob,
+            extend_to_replay=extend_to_replay,
         )
 
     def _collect_rollouts_with_allocations_on_workers(
@@ -677,6 +723,8 @@ class GraphTD3Trainer:
         count_env_steps: bool = True,
         demo_return_target_mode: str | None = None,
         demo_return_n_step: int | None = None,
+        teacher_takeover_override_prob: float | None = None,
+        extend_to_replay: bool = True,
     ) -> list[RolloutResult]:
         if len(step_allocations) != len(workers):
             raise ValueError("step_allocations must align with workers.")
@@ -705,6 +753,7 @@ class GraphTD3Trainer:
                     global_env_start_step=int(self.global_env_steps),
                     demo_return_target_mode=demo_return_target_mode,
                     demo_return_n_step=demo_return_n_step,
+                    teacher_takeover_override_prob=teacher_takeover_override_prob,
                 )
             ]
         else:
@@ -722,6 +771,7 @@ class GraphTD3Trainer:
                         global_env_start_step=int(self.global_env_steps),
                         demo_return_target_mode=demo_return_target_mode,
                         demo_return_n_step=demo_return_n_step,
+                        teacher_takeover_override_prob=teacher_takeover_override_prob,
                     )
                     started_workers.append(worker)
                     pending_workers[worker.connection] = worker
@@ -750,16 +800,18 @@ class GraphTD3Trainer:
                 raise
 
         try:
-            replay_extend_start = perf_counter()
-            for result in rollout_results:
-                self.replay_buffer.extend(result.replay_batch)
-                if count_env_steps:
-                    self.global_env_steps += len(result.replay_batch)
-            self._last_replay_extend_seconds = float(perf_counter() - replay_extend_start)
+            if extend_to_replay:
+                replay_extend_start = perf_counter()
+                for result in rollout_results:
+                    self.replay_buffer.extend(result.replay_batch)
+                    if count_env_steps:
+                        self.global_env_steps += len(result.replay_batch)
+                self._last_replay_extend_seconds = float(perf_counter() - replay_extend_start)
             return rollout_results
         finally:
-            for result in rollout_results:
-                result.release_shared_memory()
+            if extend_to_replay:
+                for result in rollout_results:
+                    result.release_shared_memory()
 
     def _build_demo_collection_factory(self) -> RandomizedEnvFactory:
         base_randomization = self.train_factory.randomization
@@ -953,6 +1005,108 @@ class GraphTD3Trainer:
         if last_logged_completed < int(total_steps):
             self._print_pretrain_progress("collection", int(total_steps), int(total_steps), started_at)
 
+    def _build_critic_bridge_collection_factory(self) -> RandomizedEnvFactory:
+        if (
+            bool(self.config.critic_bridge_use_curriculum_stage0_distribution)
+            and self.curriculum_stages
+            and self.curriculum_stages[0].get("train_randomization") is not None
+        ):
+            stage_zero_randomization = self.curriculum_stages[0]["train_randomization"]
+            return RandomizedEnvFactory.from_env(self.env, randomization=stage_zero_randomization)
+        return self.train_factory
+
+    def _build_critic_bridge_replay_buffer(self) -> ReplayBuffer:
+        return ReplayBuffer(
+            self.config.replay_capacity,
+            seed=(int(self.config.seed or 0) + 4_000_000),
+            replay_strategy=self.config.replay_strategy,
+            topology_names=self.config.replay_topology_names,
+            recent_fraction=self.config.replay_recent_fraction,
+            long_term_fraction=self.config.replay_long_term_fraction,
+            demo_fraction=self.config.replay_demo_fraction,
+            demo_behavior_source=self.config.replay_demo_behavior_source,
+        )
+
+    def _collect_critic_bridge_rollouts(
+        self,
+        bridge_replay_buffer: ReplayBuffer,
+    ) -> tuple[TensorReplayBatch | None, dict[str, float]]:
+        bridge_factory = self._build_critic_bridge_collection_factory()
+        if not self._rollout_runtime_initialized:
+            self._initialize_rollout_runtime()
+
+        self._broadcast_actor_state_to_rollout_runtime()
+        for worker in self.workers:
+            worker.set_env_factory(bridge_factory, reset_environment=True)
+
+        total_steps = max(0, int(self.config.critic_bridge_env_steps))
+        split_rng = np.random.default_rng(int(self.config.seed or 0) + 5_000_000)
+        validation_batches: list[TensorReplayBatch] = []
+        started_at = perf_counter()
+        log_interval = self._progress_interval(total_steps)
+        next_log_at = min(total_steps, log_interval)
+        last_logged_completed = 0
+        remaining_steps = total_steps
+        behavior_mode = str(self.config.critic_bridge_behavior_mode)
+        teacher_takeover_override_prob = (
+            0.0
+            if behavior_mode == "actor_only"
+            else float(self.config.critic_bridge_teacher_takeover_prob)
+        )
+
+        try:
+            while remaining_steps > 0:
+                step_allocations = self._global_step_allocations(remaining_steps)
+                if sum(step_allocations) <= 0:
+                    break
+                rollout_results = self._collect_rollouts_with_allocations_on_workers(
+                    self.workers,
+                    step_allocations,
+                    warmup_allocations=[0 for _ in self.workers],
+                    count_env_steps=False,
+                    teacher_takeover_override_prob=teacher_takeover_override_prob,
+                    extend_to_replay=False,
+                )
+                collected_now = 0
+                try:
+                    for result in rollout_results:
+                        collected_now += self._route_replay_batch_to_train_and_val(
+                            bridge_replay_buffer,
+                            result.replay_batch,
+                            validation_fraction=float(self.config.critic_bridge_validation_fraction),
+                            split_rng=split_rng,
+                            validation_batches=validation_batches,
+                        )
+                finally:
+                    for result in rollout_results:
+                        result.release_shared_memory()
+                if collected_now <= 0:
+                    raise RuntimeError("Critic bridge collection produced zero transitions.")
+                remaining_steps -= collected_now
+                completed_steps = total_steps - remaining_steps
+                if completed_steps >= next_log_at:
+                    self._print_pretrain_progress("critic_bridge_collection", completed_steps, total_steps, started_at)
+                    last_logged_completed = completed_steps
+                    next_log_at += log_interval
+        finally:
+            for worker in self.workers:
+                worker.set_env_factory(self.train_factory, reset_environment=True)
+
+        if total_steps > 0 and last_logged_completed < total_steps:
+            self._print_pretrain_progress("critic_bridge_collection", total_steps, total_steps, started_at)
+
+        validation_batch = self._concat_replay_batches(validation_batches) if validation_batches else None
+        summary = {
+            "critic_bridge_env_steps": float(total_steps),
+            "critic_bridge_replay_size_after_collection": float(
+                len(bridge_replay_buffer) + (len(validation_batch) if validation_batch is not None else 0)
+            ),
+            "critic_bridge_train_replay_size_after_split": float(len(bridge_replay_buffer)),
+            "critic_bridge_val_replay_size_after_split": float(len(validation_batch) if validation_batch is not None else 0),
+            "seconds_critic_bridge_collection": float(perf_counter() - started_at),
+        }
+        return validation_batch, summary
+
     def _save_demo_dataset(self, replay_batches: Sequence[Any]) -> str | None:
         save_path = self.config.demo_dataset_save_path
         if not save_path:
@@ -989,32 +1143,61 @@ class GraphTD3Trainer:
             "demo_pretrain_min_relative_improvement": float(self.config.demo_pretrain_min_relative_improvement),
             "actor_bc_updates": 0.0,
             "critic_pretrain_updates": 0.0,
+            "critic_bridge_env_steps": 0.0,
+            "critic_bridge_replay_size_after_collection": 0.0,
+            "critic_bridge_train_replay_size_after_split": 0.0,
+            "critic_bridge_val_replay_size_after_split": 0.0,
+            "critic_bridge_updates": 0.0,
             "actor_bc_loss_last": 0.0,
             "critic_loss_last": 0.0,
+            "critic_bridge_loss_last": 0.0,
+            "critic_bridge_teacher_aux_loss_last": 0.0,
+            "critic_bridge_teacher_aux_coef": (
+                float(self.config.critic_bridge_teacher_return_aux_levels[0])
+                if str(self.config.critic_bridge_teacher_return_aux_schedule) == "adaptive"
+                else float(self.config.critic_bridge_teacher_return_aux_coef)
+            ),
+            "critic_bridge_teacher_aux_level_index": 0.0,
+            "critic_bridge_teacher_aux_stable_eval_count": 0.0,
+            "critic_bridge_teacher_aux_error_ratio": 0.0,
+            "critic_bridge_teacher_aux_reduction_count": 0.0,
             "actor_bc_val_loss_last": 0.0,
             "actor_bc_val_loss_best": 0.0,
             "critic_val_loss_last": 0.0,
             "critic_val_loss_best": 0.0,
+            "critic_bridge_val_loss_last": 0.0,
+            "critic_bridge_val_loss_best": 0.0,
             "quick_eval_return_last": 0.0,
             "quick_eval_return_best": 0.0,
             "quick_eval_return_per_step_last": 0.0,
             "quick_eval_return_per_step_best": 0.0,
             "actor_bc_eval_count": 0.0,
             "critic_eval_count": 0.0,
+            "critic_bridge_eval_count": 0.0,
             "actor_bc_early_stopped": False,
             "critic_pretrain_early_stopped": False,
+            "critic_bridge_early_stopped": False,
             "critic_q_pred_mean": 0.0,
             "critic_q_pred_std": 0.0,
             "critic_target_mean": 0.0,
             "critic_target_std": 0.0,
             "critic_error_mean": 0.0,
             "critic_error_std": 0.0,
+            "critic_bridge_q_pred_mean": 0.0,
+            "critic_bridge_q_pred_std": 0.0,
+            "critic_bridge_target_mean": 0.0,
+            "critic_bridge_target_std": 0.0,
+            "critic_bridge_error_mean": 0.0,
+            "critic_bridge_error_std": 0.0,
             "seconds_collection": 0.0,
             "seconds_actor_bc": 0.0,
             "seconds_critic": 0.0,
+            "seconds_critic_bridge_collection": 0.0,
+            "seconds_critic_bridge": 0.0,
             "dataset_path": None,
             "behavior_source": str(self.config.demo_collection_behavior_source),
             "critic_target_mode": str(self.config.demo_critic_pretrain_target_mode),
+            "critic_bridge_teacher_aux_schedule": str(self.config.critic_bridge_teacher_return_aux_schedule),
             "demo_return_target_mean": 0.0,
             "demo_return_target_std": 0.0,
         }
@@ -1356,6 +1539,186 @@ class GraphTD3Trainer:
                     float(summary["critic_val_loss_best"]),
                     bool(summary["critic_pretrain_early_stopped"]),
                     float(summary["seconds_critic"]),
+                )
+            )
+
+        bridge_env_steps = max(0, int(self.config.critic_bridge_env_steps))
+        bridge_updates = max(0, int(self.config.critic_bridge_updates))
+        if bool(self.config.critic_bridge_enabled) and bridge_env_steps > 0 and bridge_updates > 0:
+            print(
+                "Demo Pretrain | critic bridge start | env_steps={0} | updates={1} | mode={2}".format(
+                    bridge_env_steps,
+                    bridge_updates,
+                    str(self.config.critic_bridge_behavior_mode),
+                )
+            )
+            bridge_replay_buffer = self._build_critic_bridge_replay_buffer()
+            bridge_validation_batch, bridge_collection_summary = self._collect_critic_bridge_rollouts(bridge_replay_buffer)
+            summary.update(bridge_collection_summary)
+
+            bridge_train_size = int(summary.get("critic_bridge_train_replay_size_after_split", 0.0) or 0)
+            if bridge_train_size <= 0:
+                raise ValueError("Critic bridge requires at least one training transition.")
+
+            bridge_start = perf_counter()
+            bridge_metrics: dict[str, float] = {}
+            bridge_log_interval = self._progress_interval(bridge_updates)
+            next_bridge_log_at = bridge_log_interval
+            last_bridge_logged = 0
+            bridge_eval_interval = max(1, int(self.config.critic_bridge_eval_interval))
+            bridge_eval_count = 0
+            bridge_no_improve = 0
+            bridge_best_state: dict[str, Any] | None = None
+            bridge_best_val_loss: float | None = None
+            bridge_early_stopped = False
+            executed_bridge_updates = 0
+            bridge_aux_schedule = str(self.config.critic_bridge_teacher_return_aux_schedule)
+            bridge_aux_levels = (
+                tuple(float(level) for level in self.config.critic_bridge_teacher_return_aux_levels)
+                if bridge_aux_schedule == "adaptive"
+                else (float(self.config.critic_bridge_teacher_return_aux_coef),)
+            )
+            bridge_aux_level_index = 0
+            bridge_aux_reduction_count = 0
+            bridge_aux_stable_eval_count = 0
+            current_bridge_teacher_aux_coef = float(bridge_aux_levels[bridge_aux_level_index])
+            summary["critic_bridge_teacher_aux_coef"] = current_bridge_teacher_aux_coef
+            summary["critic_bridge_teacher_aux_level_index"] = float(bridge_aux_level_index)
+            for update_index in range(1, bridge_updates + 1):
+                bridge_metrics = self.learner.critic_bridge_step(
+                    bridge_replay_buffer,
+                    teacher_aux_coef_override=current_bridge_teacher_aux_coef,
+                )
+                executed_bridge_updates = update_index
+                if update_index >= next_bridge_log_at:
+                    self._print_pretrain_progress("critic_bridge", update_index, bridge_updates, bridge_start)
+                    last_bridge_logged = update_index
+                    next_bridge_log_at += bridge_log_interval
+                should_eval = update_index == bridge_updates or update_index % bridge_eval_interval == 0
+                if should_eval:
+                    bridge_eval_count += 1
+                    validation_metrics = self._run_critic_bridge_validation(bridge_validation_batch)
+                    current_bridge_val = float(validation_metrics.get("critic_val_loss", 0.0))
+                    summary["critic_bridge_val_loss_last"] = current_bridge_val
+                    summary["critic_bridge_q_pred_mean"] = float(validation_metrics.get("critic_q_pred_mean", 0.0))
+                    summary["critic_bridge_q_pred_std"] = float(validation_metrics.get("critic_q_pred_std", 0.0))
+                    summary["critic_bridge_target_mean"] = float(validation_metrics.get("critic_target_mean", 0.0))
+                    summary["critic_bridge_target_std"] = float(validation_metrics.get("critic_target_std", 0.0))
+                    summary["critic_bridge_error_mean"] = float(validation_metrics.get("critic_error_mean", 0.0))
+                    summary["critic_bridge_error_std"] = float(validation_metrics.get("critic_error_std", 0.0))
+                    target_mean_abs = max(abs(float(summary["critic_bridge_target_mean"])), 1.0)
+                    bridge_aux_error_ratio = (
+                        abs(
+                            float(summary["critic_bridge_q_pred_mean"])
+                            - float(summary["critic_bridge_target_mean"])
+                        )
+                        / target_mean_abs
+                    )
+                    summary["critic_bridge_teacher_aux_error_ratio"] = float(bridge_aux_error_ratio)
+                    bridge_improved = self._metric_improved(
+                        current_bridge_val,
+                        bridge_best_val_loss,
+                        greater_is_better=False,
+                        min_relative_improvement=float(self.config.critic_bridge_min_relative_improvement),
+                    )
+                    if bridge_best_state is None or bridge_improved:
+                        bridge_best_state = self._current_learner_state()
+                        bridge_best_val_loss = current_bridge_val
+                    if bridge_improved or bridge_best_state is None:
+                        bridge_no_improve = 0
+                    else:
+                        bridge_no_improve += 1
+                    bridge_aux_gate_passed = False
+                    if bridge_aux_schedule == "adaptive" and bridge_aux_level_index < len(bridge_aux_levels) - 1:
+                        reference_bridge_val = (
+                            float(bridge_best_val_loss)
+                            if bridge_best_val_loss is not None
+                            else float(current_bridge_val)
+                        )
+                        if reference_bridge_val <= 0.0:
+                            bridge_val_ok = float(current_bridge_val) <= 0.0
+                        else:
+                            bridge_val_ok = float(current_bridge_val) <= (
+                                reference_bridge_val
+                                * float(self.config.critic_bridge_teacher_return_aux_max_val_ratio)
+                            )
+                        bridge_error_ok = float(bridge_aux_error_ratio) <= float(
+                            self.config.critic_bridge_teacher_return_aux_max_error_ratio
+                        )
+                        bridge_aux_gate_passed = bool(bridge_val_ok and bridge_error_ok)
+                        if bridge_aux_gate_passed:
+                            bridge_aux_stable_eval_count += 1
+                        else:
+                            bridge_aux_stable_eval_count = 0
+                        if bridge_aux_stable_eval_count >= int(
+                            self.config.critic_bridge_teacher_return_aux_required_evals
+                        ):
+                            previous_bridge_teacher_aux_coef = float(current_bridge_teacher_aux_coef)
+                            bridge_aux_level_index += 1
+                            current_bridge_teacher_aux_coef = float(bridge_aux_levels[bridge_aux_level_index])
+                            bridge_aux_reduction_count += 1
+                            bridge_aux_stable_eval_count = 0
+                            bridge_no_improve = 0
+                            print(
+                                "Demo Pretrain | critic_bridge aux decay | update={0}/{1} | coef={2:.3f}->{3:.3f} | level={4}/{5}".format(
+                                    update_index,
+                                    bridge_updates,
+                                    previous_bridge_teacher_aux_coef,
+                                    current_bridge_teacher_aux_coef,
+                                    bridge_aux_level_index,
+                                    len(bridge_aux_levels) - 1,
+                                )
+                            )
+                    summary["critic_bridge_teacher_aux_coef"] = float(current_bridge_teacher_aux_coef)
+                    summary["critic_bridge_teacher_aux_level_index"] = float(bridge_aux_level_index)
+                    summary["critic_bridge_teacher_aux_stable_eval_count"] = float(bridge_aux_stable_eval_count)
+                    summary["critic_bridge_teacher_aux_reduction_count"] = float(bridge_aux_reduction_count)
+                    print(
+                        "Demo Pretrain | critic_bridge eval | update={0}/{1} | val_critic={2:.6f} | q_pred_mean={3:.6f} | target_mean={4:.6f} | aux_coef={5:.3f} | aux_stable={6} | aux_gate={7} | patience={8}/{9}".format(
+                            update_index,
+                            bridge_updates,
+                            current_bridge_val,
+                            float(summary["critic_bridge_q_pred_mean"]),
+                            float(summary["critic_bridge_target_mean"]),
+                            float(current_bridge_teacher_aux_coef),
+                            bridge_aux_stable_eval_count,
+                            1 if bridge_aux_gate_passed else 0,
+                            bridge_no_improve,
+                            int(self.config.critic_bridge_patience),
+                        )
+                    )
+                    if bridge_no_improve >= int(self.config.critic_bridge_patience) and update_index < bridge_updates:
+                        bridge_early_stopped = True
+                        break
+
+            summary["seconds_critic_bridge"] = float(perf_counter() - bridge_start)
+            summary["critic_bridge_updates"] = float(executed_bridge_updates)
+            summary["critic_bridge_loss_last"] = float(bridge_metrics.get("critic_loss", 0.0))
+            summary["critic_bridge_teacher_aux_loss_last"] = float(
+                bridge_metrics.get("critic_bridge_teacher_aux_loss", 0.0)
+            )
+            summary["critic_bridge_teacher_aux_coef"] = float(current_bridge_teacher_aux_coef)
+            summary["critic_bridge_teacher_aux_level_index"] = float(bridge_aux_level_index)
+            summary["critic_bridge_teacher_aux_stable_eval_count"] = float(bridge_aux_stable_eval_count)
+            summary["critic_bridge_teacher_aux_reduction_count"] = float(bridge_aux_reduction_count)
+            summary["critic_bridge_eval_count"] = float(bridge_eval_count)
+            summary["critic_bridge_early_stopped"] = bool(bridge_early_stopped)
+            summary["critic_bridge_val_loss_best"] = float(bridge_best_val_loss or 0.0)
+            if bridge_best_state is not None:
+                self.learner.load_checkpoint_state(bridge_best_state)
+            if last_bridge_logged < executed_bridge_updates:
+                self._print_pretrain_progress("critic_bridge", executed_bridge_updates, bridge_updates, bridge_start)
+            print(
+                "Demo Pretrain | critic bridge done | executed={0:.0f} | last_critic_loss={1:.6f} | last_teacher_aux={2:.6f} | aux_coef={3:.3f} | aux_level={4:.0f} | aux_reductions={5:.0f} | best_val_critic={6:.6f} | early_stopped={7} | seconds={8:.3f}".format(
+                    float(summary["critic_bridge_updates"]),
+                    float(summary["critic_bridge_loss_last"]),
+                    float(summary["critic_bridge_teacher_aux_loss_last"]),
+                    float(summary["critic_bridge_teacher_aux_coef"]),
+                    float(summary["critic_bridge_teacher_aux_level_index"]),
+                    float(summary["critic_bridge_teacher_aux_reduction_count"]),
+                    float(summary["critic_bridge_val_loss_best"]),
+                    bool(summary["critic_bridge_early_stopped"]),
+                    float(summary["seconds_critic_bridge"]),
                 )
             )
 

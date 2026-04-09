@@ -164,6 +164,53 @@ class GraphTD3LearnerPretrainTests(unittest.TestCase):
             for value in metrics.values():
                 self.assertTrue(torch.isfinite(torch.tensor(float(value))))
 
+    def test_critic_td_validation_metrics_are_finite(self) -> None:
+        learner = self._make_learner()
+        validation_batch = learner.replay_buffer.export_demo_batch()
+        assert validation_batch is not None
+
+        critic_metrics = learner.evaluate_critic_on_td_batch(validation_batch, batch_size=2)
+
+        self.assertGreater(float(critic_metrics["critic_val_num_targets"]), 0.0)
+        for value in critic_metrics.values():
+            self.assertTrue(torch.isfinite(torch.tensor(float(value))))
+
+    def test_critic_bridge_step_updates_only_critics(self) -> None:
+        learner = self._make_learner()
+        actor_before = [parameter.detach().clone() for parameter in learner.actor.parameters()]
+        critic_before = [parameter.detach().clone() for parameter in learner.critics.parameters()]
+
+        metrics = learner.critic_bridge_step(learner.replay_buffer, batch_size=2)
+
+        actor_after = [parameter.detach().clone() for parameter in learner.actor.parameters()]
+        critic_after = [parameter.detach().clone() for parameter in learner.critics.parameters()]
+        self.assertGreaterEqual(float(metrics["critic_loss"]), 0.0)
+        self.assertTrue(all(torch.allclose(before, after) for before, after in zip(actor_before, actor_after)))
+        self.assertTrue(any(not torch.allclose(before, after) for before, after in zip(critic_before, critic_after)))
+
+    def test_critic_bridge_step_can_use_teacher_return_aux(self) -> None:
+        learner = self._make_learner()
+        learner.config.critic_bridge_teacher_return_aux_coef = 0.5
+
+        metrics = learner.critic_bridge_step(learner.replay_buffer, batch_size=2)
+
+        self.assertGreater(float(metrics["critic_bridge_teacher_aux_coef"]), 0.0)
+        self.assertGreaterEqual(float(metrics["critic_bridge_teacher_aux_loss"]), 0.0)
+        self.assertTrue(torch.isfinite(torch.tensor(float(metrics["critic_loss"]))))
+
+    def test_critic_bridge_step_honors_teacher_aux_override(self) -> None:
+        learner = self._make_learner()
+        learner.config.critic_bridge_teacher_return_aux_coef = 0.5
+
+        metrics = learner.critic_bridge_step(
+            learner.replay_buffer,
+            batch_size=2,
+            teacher_aux_coef_override=0.0,
+        )
+
+        self.assertEqual(float(metrics["critic_bridge_teacher_aux_coef"]), 0.0)
+        self.assertEqual(float(metrics["critic_bridge_teacher_aux_loss"]), 0.0)
+
     def test_train_step_reports_actor_q_coef_schedule(self) -> None:
         learner = self._make_learner()
         learner.config.warmup_steps = 0
