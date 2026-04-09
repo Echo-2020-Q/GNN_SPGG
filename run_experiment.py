@@ -3765,7 +3765,29 @@ def _log_tensorboard_custom_layout(writer: Any) -> None:
                 "payoff_mean": ["Multiline", ["train_global/payoff_mean", "eval/payoff_mean"]],
                 "pool_grown_mean": ["Multiline", ["train_global/pool_grown_mean", "eval/pool_grown_mean"]],
                 "pool_mean": ["Multiline", ["train_global/pool_mean", "eval/pool_mean"]],
-            }
+            },
+            "Eval Only": {
+                "f_c": [
+                    "Multiline",
+                    [
+                        "eval/f_c",
+                        "eval/f_c/regular",
+                        "eval/f_c/erdos_renyi",
+                        "eval/f_c/small_world",
+                        "eval/f_c/scale_free",
+                    ],
+                ],
+                "collapse_rate": [
+                    "Multiline",
+                    [
+                        "eval/collapse_rate",
+                        "eval/collapse_rate/regular",
+                        "eval/collapse_rate/erdos_renyi",
+                        "eval/collapse_rate/small_world",
+                        "eval/collapse_rate/scale_free",
+                    ],
+                ],
+            },
         }
     )
 

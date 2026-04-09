@@ -11,6 +11,7 @@ if NUMPY_AVAILABLE:
     from run_experiment import (
         BASE_EXPERIMENT,
         PPO_BASELINE_EXPERIMENT,
+        _log_tensorboard_custom_layout,
         _log_tensorboard_update_metrics,
         _tensorboard_tag_for_metric,
         build_trainer_config,
@@ -21,12 +22,16 @@ class _FakeSummaryWriter:
     def __init__(self) -> None:
         self.scalars: list[tuple[str, float, int]] = []
         self.texts: list[tuple[str, str, int]] = []
+        self.custom_scalar_layout: dict[str, object] | None = None
 
     def add_scalar(self, tag: str, value: float, step: int) -> None:
         self.scalars.append((tag, float(value), int(step)))
 
     def add_text(self, tag: str, text: str, step: int) -> None:
         self.texts.append((tag, str(text), int(step)))
+
+    def add_custom_scalars(self, layout: dict[str, object]) -> None:
+        self.custom_scalar_layout = layout
 
 
 @unittest.skipUnless(NUMPY_AVAILABLE, "numpy is required for run_experiment tensorboard tests")
@@ -116,4 +121,28 @@ class RunExperimentTensorboardTests(unittest.TestCase):
         self.assertEqual(
             _tensorboard_tag_for_metric("critic_grad_norm_post_clip"),
             "grad/critic_grad_norm_post_clip",
+        )
+
+    def test_custom_layout_adds_eval_only_fc_panel(self) -> None:
+        writer = _FakeSummaryWriter()
+
+        _log_tensorboard_custom_layout(writer)
+
+        self.assertIsNotNone(writer.custom_scalar_layout)
+        layout = writer.custom_scalar_layout or {}
+        self.assertIn("Eval Only", layout)
+        eval_only = layout["Eval Only"]
+        self.assertIn("f_c", eval_only)
+        self.assertEqual(
+            eval_only["f_c"],
+            [
+                "Multiline",
+                [
+                    "eval/f_c",
+                    "eval/f_c/regular",
+                    "eval/f_c/erdos_renyi",
+                    "eval/f_c/small_world",
+                    "eval/f_c/scale_free",
+                ],
+            ],
         )
