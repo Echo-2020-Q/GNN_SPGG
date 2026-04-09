@@ -426,6 +426,19 @@ class GraphTD3Learner:
             raise ValueError("Pretrain validation batch size must be positive.")
         return resolved
 
+    def _resolve_critic_bridge_batch_size(self, batch_size: int | None) -> int:
+        if batch_size is not None:
+            resolved = int(batch_size)
+        elif self.config.critic_bridge_batch_size is not None:
+            resolved = int(self.config.critic_bridge_batch_size)
+        elif self.config.demo_pretrain_batch_size is not None:
+            resolved = int(self.config.demo_pretrain_batch_size)
+        else:
+            resolved = int(self.config.batch_size)
+        if resolved <= 0:
+            raise ValueError("Critic bridge batch size must be positive.")
+        return resolved
+
     def evaluate_actor_bc_on_demo_batch(
         self,
         cpu_batch: TensorReplayBatch,
@@ -512,6 +525,98 @@ class GraphTD3Learner:
                 target_sumsq += float(valid_target.pow(2).sum().item())
                 error_sum += float(valid_error.sum().item())
                 error_sumsq += float(valid_error.pow(2).sum().item())
+
+        mean_q_pred = q_pred_sum / max(total_targets, 1)
+        mean_target = target_sum / max(total_targets, 1)
+        mean_error = error_sum / max(total_targets, 1)
+
+        def _std(sum_squares: float, mean: float) -> float:
+            variance = max(sum_squares / max(total_targets, 1) - mean * mean, 0.0)
+            return float(variance ** 0.5)
+
+        critic1_val_loss = total_loss_q1 / max(total_targets, 1)
+        critic2_val_loss = total_loss_q2 / max(total_targets, 1)
+        return {
+            "critic_val_loss": float(0.5 * (critic1_val_loss + critic2_val_loss)),
+            "critic1_val_loss": float(critic1_val_loss),
+            "critic2_val_loss": float(critic2_val_loss),
+            "critic_val_num_targets": float(total_targets),
+            "critic_q_pred_mean": float(mean_q_pred),
+            "critic_q_pred_std": _std(q_pred_sumsq, mean_q_pred),
+            "critic_target_mean": float(mean_target),
+            "critic_target_std": _std(target_sumsq, mean_target),
+            "critic_error_mean": float(mean_error),
+            "critic_error_std": _std(error_sumsq, mean_error),
+        }
+
+    def evaluate_critic_on_td_batch(
+        self,
+        cpu_batch: TensorReplayBatch,
+        batch_size: int | None = None,
+    ) -> dict[str, float]:
+        if len(cpu_batch) <= 0:
+            return {
+                "critic_val_loss": 0.0,
+                "critic1_val_loss": 0.0,
+                "critic2_val_loss": 0.0,
+                "critic_val_num_targets": 0.0,
+                "critic_q_pred_mean": 0.0,
+                "critic_q_pred_std": 0.0,
+                "critic_target_mean": 0.0,
+                "critic_target_std": 0.0,
+                "critic_error_mean": 0.0,
+                "critic_error_std": 0.0,
+            }
+
+        resolved_batch_size = self._resolve_pretrain_validation_batch_size(batch_size)
+        total_loss_q1 = 0.0
+        total_loss_q2 = 0.0
+        total_targets = 0
+        q_pred_sum = 0.0
+        q_pred_sumsq = 0.0
+        target_sum = 0.0
+        target_sumsq = 0.0
+        error_sum = 0.0
+        error_sumsq = 0.0
+        with torch.no_grad():
+            for start, end in _chunk_ranges(len(cpu_batch), resolved_batch_size):
+                chunk_cpu_batch = _slice_replay_batch_range(cpu_batch, start, end)
+                batch = chunk_cpu_batch if self.device.type == "cpu" else chunk_cpu_batch.to(self.device)
+
+                target_outputs = self.target_actor.deterministic_action_tensor_batch(batch.next_obs)
+                if target_outputs.logits is None:
+                    raise ValueError("Target actor must provide logits for TD3 target smoothing.")
+                target_actions = self.target_explorer.apply_to_logits(
+                    logits=target_outputs.logits,
+                    ego_mask=batch.next_obs["local_mask"],
+                    pool_values=batch.next_obs["pool_grown"],
+                    noise_std=self.config.target_logit_noise_std,
+                    noise_clip=self.config.target_logit_noise_clip,
+                ).allocation
+                target_q1, target_q2 = self.target_critics.forward_tensor_batch(
+                    batch.next_obs,
+                    target_actions,
+                )
+                target_q = batch.reward + (
+                    self.config.gamma * (1.0 - batch.done) * torch.minimum(target_q1, target_q2)
+                )
+
+                current_q1, current_q2 = self._twin_critic_forward_batch(
+                    self.critics,
+                    batch.obs,
+                    batch.action.allocation,
+                )
+                total_loss_q1 += float(self._critic_loss_sum(current_q1, target_q).item())
+                total_loss_q2 += float(self._critic_loss_sum(current_q2, target_q).item())
+                q_prediction = 0.5 * (current_q1 + current_q2)
+                error = q_prediction - target_q
+                total_targets += int(q_prediction.numel())
+                q_pred_sum += float(q_prediction.sum().item())
+                q_pred_sumsq += float(q_prediction.pow(2).sum().item())
+                target_sum += float(target_q.sum().item())
+                target_sumsq += float(target_q.pow(2).sum().item())
+                error_sum += float(error.sum().item())
+                error_sumsq += float(error.pow(2).sum().item())
 
         mean_q_pred = q_pred_sum / max(total_targets, 1)
         mean_target = target_sum / max(total_targets, 1)
@@ -662,6 +767,184 @@ class GraphTD3Learner:
         return {
             **critic_metrics,
             "replay_size": float(len(self.replay_buffer)),
+            "replay_demo_frac": self.last_replay_demo_frac,
+            "replay_pool_power_demo_frac": self.last_replay_pool_power_demo_frac,
+            "replay_teacher_frac": self.last_replay_pool_power_demo_frac,
+            "replay_collapse_frac": self.last_replay_collapse_frac,
+            "actor_q_coef": self.last_actor_q_coef,
+            "actor_grad_norm": self.last_actor_grad_norm,
+            "critic_grad_norm": self.last_critic_grad_norm,
+            "actor_grad_norm_pre_clip": self.last_actor_grad_norm_pre_clip,
+            "actor_grad_norm_post_clip": self.last_actor_grad_norm_post_clip,
+            "critic_grad_norm_pre_clip": self.last_critic_grad_norm_pre_clip,
+            "critic_grad_norm_post_clip": self.last_critic_grad_norm_post_clip,
+            "actor_lr": self._current_actor_lr(),
+            "critic_lr": self._current_critic_lr(),
+            **replay_sample_stats,
+        }
+
+    def critic_bridge_step(
+        self,
+        replay_buffer: ReplayBuffer,
+        batch_size: int | None = None,
+        *,
+        teacher_aux_coef_override: float | None = None,
+    ) -> dict[str, float]:
+        resolved_batch_size = self._resolve_critic_bridge_batch_size(batch_size)
+        cpu_batch = replay_buffer.sample(
+            resolved_batch_size,
+            device=None,
+            max_collapse_ratio=None,
+        )
+        replay_sample_stats = replay_buffer.get_last_sample_stats()
+        self.last_replay_demo_frac = float(cpu_batch.is_demo.float().mean().item()) if len(cpu_batch) > 0 else 0.0
+        self.last_replay_pool_power_demo_frac = (
+            float(cpu_batch.pool_power_demo_flag.float().mean().item()) if len(cpu_batch) > 0 else 0.0
+        )
+        self.last_replay_collapse_frac = (
+            float(cpu_batch.collapse_flag.float().mean().item()) if len(cpu_batch) > 0 else 0.0
+        )
+        batch = cpu_batch if self.device.type == "cpu" else cpu_batch.to(self.device)
+        teacher_aux_coef = (
+            float(teacher_aux_coef_override)
+            if teacher_aux_coef_override is not None
+            else float(self.config.critic_bridge_teacher_return_aux_coef)
+        )
+        if teacher_aux_coef <= 0.0:
+            critic_metrics = self.update_critics(batch, use_demo_return_target=False)
+            critic_metrics["critic_bridge_teacher_aux_loss"] = 0.0
+            critic_metrics["critic_bridge_teacher_aux_coef"] = 0.0
+        else:
+            demo_cpu_batch = self.replay_buffer.sample_demo(
+                resolved_batch_size,
+                device=None,
+                max_collapse_ratio=self.config.replay_max_collapse_sample_ratio,
+            )
+            demo_batch = demo_cpu_batch if self.device.type == "cpu" else demo_cpu_batch.to(self.device)
+
+            self.critic_optimizer.zero_grad(set_to_none=True)
+
+            def _accumulate_critic_gradients(
+                critic_batch: TensorReplayBatch,
+                *,
+                use_demo_return_target: bool,
+                loss_scale: float,
+            ) -> tuple[float, float, int]:
+                observations = critic_batch.obs
+                next_observations = critic_batch.next_obs
+                actions = critic_batch.action.allocation
+                rewards = critic_batch.reward
+                dones = critic_batch.done
+
+                batch_size_local = _batch_size_from_observations(observations)
+                chunk_size = max(1, int(self.config.graph_batch_chunk_size))
+                total_critic1_loss = 0.0
+                total_critic2_loss = 0.0
+                valid_target_count = (
+                    int(critic_batch.demo_return_valid.sum().item())
+                    if use_demo_return_target
+                    else int(batch_size_local)
+                )
+                if use_demo_return_target and valid_target_count <= 0:
+                    raise ValueError("critic_bridge_step aux path requires at least one valid demo_return_target.")
+                normalization_count = max(valid_target_count, 1)
+
+                for start, end in _chunk_ranges(batch_size_local, chunk_size):
+                    chunk_observations = _slice_observation_batch(observations, start, end)
+                    chunk_next_observations = _slice_observation_batch(next_observations, start, end)
+                    chunk_actions = actions[start:end]
+                    chunk_rewards = rewards[start:end]
+                    chunk_dones = dones[start:end]
+                    chunk_valid_mask = critic_batch.demo_return_valid[start:end].bool()
+
+                    if use_demo_return_target:
+                        target_q = critic_batch.demo_return_target[start:end]
+                    else:
+                        with torch.no_grad():
+                            target_outputs = self.target_actor.deterministic_action_tensor_batch(chunk_next_observations)
+                            if target_outputs.logits is None:
+                                raise ValueError("Target actor must provide logits for TD3 target smoothing.")
+                            target_actions = self.target_explorer.apply_to_logits(
+                                logits=target_outputs.logits,
+                                ego_mask=chunk_next_observations["local_mask"],
+                                pool_values=chunk_next_observations["pool_grown"],
+                                noise_std=self.config.target_logit_noise_std,
+                                noise_clip=self.config.target_logit_noise_clip,
+                            ).allocation
+                            target_q1, target_q2 = self.target_critics.forward_tensor_batch(
+                                chunk_next_observations,
+                                target_actions,
+                            )
+                            target_q = chunk_rewards + (
+                                self.config.gamma * (1.0 - chunk_dones) * torch.minimum(target_q1, target_q2)
+                            )
+
+                    current_q1, current_q2 = self.critics.forward_tensor_batch(
+                        chunk_observations,
+                        chunk_actions,
+                    )
+                    critic1_loss_sum = self._critic_loss_sum(
+                        current_q1,
+                        target_q,
+                        valid_mask=chunk_valid_mask if use_demo_return_target else None,
+                    )
+                    critic2_loss_sum = self._critic_loss_sum(
+                        current_q2,
+                        target_q,
+                        valid_mask=chunk_valid_mask if use_demo_return_target else None,
+                    )
+                    chunk_loss = ((critic1_loss_sum + critic2_loss_sum) / float(normalization_count)) * float(loss_scale)
+                    chunk_loss.backward()
+
+                    total_critic1_loss += float(critic1_loss_sum.item())
+                    total_critic2_loss += float(critic2_loss_sum.item())
+
+                return total_critic1_loss, total_critic2_loss, normalization_count
+
+            td_critic1_sum, td_critic2_sum, td_norm = _accumulate_critic_gradients(
+                batch,
+                use_demo_return_target=False,
+                loss_scale=1.0,
+            )
+            aux_critic1_sum, aux_critic2_sum, aux_norm = _accumulate_critic_gradients(
+                demo_batch,
+                use_demo_return_target=True,
+                loss_scale=teacher_aux_coef,
+            )
+
+            critic_parameters = list(self.critics.critic1.parameters()) + list(self.critics.critic2.parameters())
+            if self.config.critic_grad_clip_norm is not None:
+                self.last_critic_grad_norm_pre_clip = float(
+                    torch.nn.utils.clip_grad_norm_(critic_parameters, float(self.config.critic_grad_clip_norm)).item()
+                )
+                self.last_critic_grad_norm_post_clip = _gradient_norm(critic_parameters)
+            else:
+                self.last_critic_grad_norm_pre_clip = _gradient_norm(critic_parameters)
+                self.last_critic_grad_norm_post_clip = self.last_critic_grad_norm_pre_clip
+            self.last_critic_grad_norm = self.last_critic_grad_norm_pre_clip
+            self.critic_optimizer.step()
+
+            td_critic1_loss = td_critic1_sum / float(max(td_norm, 1))
+            td_critic2_loss = td_critic2_sum / float(max(td_norm, 1))
+            aux_critic1_loss = aux_critic1_sum / float(max(aux_norm, 1))
+            aux_critic2_loss = aux_critic2_sum / float(max(aux_norm, 1))
+            td_loss = td_critic1_loss + td_critic2_loss
+            teacher_aux_loss = aux_critic1_loss + aux_critic2_loss
+            critic_metrics = {
+                "critic1_loss": float(td_critic1_loss + teacher_aux_coef * aux_critic1_loss),
+                "critic2_loss": float(td_critic2_loss + teacher_aux_coef * aux_critic2_loss),
+                "critic_loss": float(td_loss + teacher_aux_coef * teacher_aux_loss),
+                "critic_grad_norm": float(self.last_critic_grad_norm),
+                "critic_grad_norm_pre_clip": float(self.last_critic_grad_norm_pre_clip),
+                "critic_grad_norm_post_clip": float(self.last_critic_grad_norm_post_clip),
+                "critic_bridge_td_loss": float(td_loss),
+                "critic_bridge_teacher_aux_loss": float(teacher_aux_loss),
+                "critic_bridge_teacher_aux_coef": float(teacher_aux_coef),
+            }
+        self.soft_update_targets()
+        return {
+            **critic_metrics,
+            "replay_size": float(len(replay_buffer)),
             "replay_demo_frac": self.last_replay_demo_frac,
             "replay_pool_power_demo_frac": self.last_replay_pool_power_demo_frac,
             "replay_teacher_frac": self.last_replay_pool_power_demo_frac,
