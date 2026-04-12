@@ -4386,16 +4386,15 @@ def run_gnn_training_mode(
                     trainer_config.replay_max_collapse_sample_ratio,
                 )
             )
-            if bool(trainer_config.demo_pretrain_enabled):
-                demo_collection_network_types = (
-                    ",".join(trainer_config.demo_collection_network_types)
-                    if trainer_config.demo_collection_network_types
-                    else (
-                        ",".join(randomization_config.network_types)
-                        if bool(trainer_config.demo_collection_use_domain_randomization) and bool(randomization_config.enabled)
-                        else "fixed"
-                    )
+            demo_collection_network_types = (
+                ",".join(trainer_config.demo_collection_network_types)
+                if trainer_config.demo_collection_network_types
+                else (
+                    ",".join(randomization_config.network_types)
+                    if bool(trainer_config.demo_collection_use_domain_randomization) and bool(randomization_config.enabled)
+                    else "fixed"
                 )
+            )
             print(
                 "Demo CFG : collection_steps={0}, behavior={1}, use_domain_randomization={2}, network_types={3}, runtime={4}, actor_bc_updates={5}, critic_pretrain_updates={6}, critic_target={7}, n_step={8}, batch_size={9}, val_batch_size={10}, val_frac={11}, eval_interval={12}, patience={13}, min_improve={14}, dataset_path={15}, save_ckpt={16}, ckpt_name={17}, stop_after={18}".format(
                     trainer_config.demo_collection_env_steps,
