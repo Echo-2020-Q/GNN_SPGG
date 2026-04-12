@@ -422,12 +422,12 @@ BASE_EXPERIMENT = {
         "actor_lr":  1e-4,
 
         # Critic 学习率。
-        "critic_lr":  1e-5,
+        "critic_lr":  1e-4,
 
         # 学习率调度类型：
         # - "constant"          ：固定学习率
         # - "exponential_decay" ：指数退火，lr = max(lr_final, lr_init * decay_rate^(step / decay_steps))
-        "lr_schedule_type": "exponential_decay",
+        "lr_schedule_type": "constant",
 
         # 指数退火的最小学习率下界。
         "lr_final": 5e-6,
@@ -594,7 +594,7 @@ BASE_EXPERIMENT = {
         "warmup_actor_bc_coef": 1.0,
 
         # warm-up 结束后，继续在 demo 样本上保留一个较轻的行为克隆锚点。
-        "actor_demo_bc_coef": 0.8,
+        "actor_demo_bc_coef": 0.2,
 
         # warm-up 结束后，demo BC 系数线性衰减到 0 的总 rollout 步数比例。
         # 例如 0.50 表示到总 rollout 步数的 20% 时衰减到 0。
@@ -602,15 +602,15 @@ BASE_EXPERIMENT = {
 
         # 是否把 demo BC 的衰减起点对齐到 teacher release 时刻。
         # True 时，BC 不再因为“release 很晚”而在解锁前几乎衰减光。
-        "actor_demo_bc_decay_from_teacher_release": True,
+        "actor_demo_bc_decay_from_teacher_release": False,
 
         # 是否按 handoff stage 控制 demo BC：
         # stage 1 保持 BC 锚点，stage 2 才开始真正衰减。
-        "actor_demo_bc_stage_aware": True,
+        "actor_demo_bc_stage_aware": False,
 
         # 是否启用 actor BC 的 Q-filter。
         # 启用后，online 阶段只在 critic 认为 demo 动作优于当前 actor 动作时，才对该 demo transition 施加 BC。
-        "actor_bc_q_filter_enabled": True,
+        "actor_bc_q_filter_enabled": False,
 
         # Q-filter 的最小优势边际：
         # 仅当 Q_demo > Q_actor + margin 时，该 demo transition 才参与 BC。
@@ -773,7 +773,7 @@ BASE_EXPERIMENT = {
         "critic_bridge_teacher_return_aux_coef": 0.5,
 
         # warm-up 结束后，是否让 teacher 先和 actor 混合接管，而不是立刻纯 actor。
-        "teacher_takeover_enabled": True,
+        "teacher_takeover_enabled": False,
 
         # teacher takeover 阶段使用的启发式行为源。
         # 当前只支持 "pool_power_mix"。
@@ -803,7 +803,7 @@ BASE_EXPERIMENT = {
 
         # 是否启用“达标后再退场”的 adaptive teacher release。
         # 启用后，teacher 会先保持在高权重，直到 online 评估显示 actor/critic 达到稳定阈值，再开始按 teacher_takeover_* 的 schedule 衰减。
-        "adaptive_teacher_release_enabled": True,
+        "adaptive_teacher_release_enabled": False,
 
         # teacher 脱手门控模式：
         # - "legacy"           : 使用 return / actor_bc_val / critic_val 的联合门槛
@@ -846,11 +846,11 @@ BASE_EXPERIMENT = {
 
         # 是否在 adaptive teacher release 真正解锁前，一直禁止 actor 的 Q 更新。
         # 这样可以先保持 imitation 锚点，等 teacher 退场门槛满足后再做 RL 提升。
-        "freeze_actor_q_until_teacher_release": True,
+        "freeze_actor_q_until_teacher_release": False,
 
         # online 阶段 actor 的 Q 项初始系数。
         # 早期让 actor loss 以 BC 为主，Q 为辅。
-        "online_actor_q_coef_initial": 0.05,
+        "online_actor_q_coef_initial": 0.2,
 
         # online 阶段 actor 的 Q 项最终系数。
         "online_actor_q_coef_final": 1.0,
@@ -883,7 +883,7 @@ BASE_EXPERIMENT = {
         "train_every": 1,
 
         # 每个外层训练迭代做多少次梯度更新。
-        "gradient_steps_per_update": 4,
+        "gradient_steps_per_update": 2,
 
         # TD3 delayed policy update 频率。
         "policy_delay": 2,
@@ -896,7 +896,7 @@ BASE_EXPERIMENT = {
         "replay_max_collapse_sample_ratio": 0.20,
 
         # target network soft update 系数 tau。
-        "tau": 0.001,
+        "tau": 0.005,
 
         # rollout 时在 logits 空间加噪声的标准差。
         "rollout_logit_noise_std": 0.10,
@@ -1003,7 +1003,7 @@ BASE_EXPERIMENT = {
         "fixed_graph_bank_sampling": "uniform",
 
         # 允许采样的节点数集合。
-        "num_nodes_choices": [20],
+        "num_nodes_choices": [50],
 
         # regular 图可采样的度集合。
         "regular_degree_choices": [4],
