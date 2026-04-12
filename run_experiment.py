@@ -508,7 +508,7 @@ BASE_EXPERIMENT = {
         # replay 采样策略：
         # - "fifo"                     ：原始单一 FIFO replay
         # - "topology_stratified_mixed": 按拓扑分层，并混合 recent / long_term / demo 三类样本
-        "replay_strategy": "topology_stratified_mixed",
+        "replay_strategy": "fifo",
 
         # replay 中允许显式分层的拓扑类型集合。
         # 设为 None 时，自动继承 domain_randomization.network_types；
@@ -628,7 +628,7 @@ BASE_EXPERIMENT = {
         # 1) 固定专家轨迹收集
         # 2) actor BC 预训练
         # 3) critic 预训练
-        "demo_pretrain_enabled": True,
+        "demo_pretrain_enabled": False,
 
         # demo 预收集的总环境步数。
         # 这些步数不会计入 online warm-up，也不会计入 total_env_steps。
@@ -641,7 +641,7 @@ BASE_EXPERIMENT = {
         # demo 预收集时是否启用 domain randomization。
         # True 时默认覆盖 domain_randomization.network_types 的全域拓扑；
         # False 时退回到当前 base env 的固定图。
-        "demo_collection_use_domain_randomization": True,
+        "demo_collection_use_domain_randomization": False,
 
         # demo 预收集允许覆盖的拓扑类型子集。
         # 设为 None 时，自动继承 domain_randomization.network_types。
@@ -709,11 +709,11 @@ BASE_EXPERIMENT = {
         # 是否启用 critic bridge phase：
         # actor BC pretrain 后，先用 actor-only / teacher-actor mix rollout 一批 bridge 数据，
         # 再只训练 critic 用标准 TD target 适应 actor 分布，最后再进入 online training。
-        "critic_bridge_enabled": True,
+        "critic_bridge_enabled": False,
 
         # critic bridge collection 的总环境步数。
         # 这些步数不计入 warm-up，也不计入 total_env_steps。
-        "critic_bridge_env_steps": 500_000,
+        "critic_bridge_env_steps": 300_000,
 
         # critic bridge 阶段只训练 critic 的最大更新次数。
         "critic_bridge_updates": 2_000,
@@ -850,7 +850,7 @@ BASE_EXPERIMENT = {
 
         # online 阶段 actor 的 Q 项初始系数。
         # 早期让 actor loss 以 BC 为主，Q 为辅。
-        "online_actor_q_coef_initial": 0.2,
+        "online_actor_q_coef_initial": 1.0,
 
         # online 阶段 actor 的 Q 项最终系数。
         "online_actor_q_coef_final": 1.0,
@@ -860,11 +860,11 @@ BASE_EXPERIMENT = {
 
         # 是否把 actor Q ramp 的起点对齐到 teacher release 时刻。
         # True 时，release 晚不会导致 actor_q 一解锁就接近满强度。
-        "online_actor_q_ramp_from_teacher_release": True,
+        "online_actor_q_ramp_from_teacher_release": False,
 
         # 是否按 handoff stage 控制 actor Q：
         # stage 1 维持 initial，stage 2 才开始真正 ramp。
-        "online_actor_q_stage_aware": True,
+        "online_actor_q_stage_aware": False,
 
         # critic 损失类型：
         # - "mse"
@@ -980,7 +980,7 @@ BASE_EXPERIMENT = {
         "enabled": True,
 
         # worker 采样时允许出现的网络类型集合。
-        "network_types": ["regular", "erdos_renyi", "small_world", "scale_free"],
+        "network_types": ["regular"],#["regular", "erdos_renyi", "small_world", "scale_free"],
 
         # 与上面 network_types 一一对应的采样权重。
         # 设为 None 时，默认对这些网络类型均匀采样。
@@ -1064,22 +1064,22 @@ BASE_EXPERIMENT = {
                 "num_nodes": 50,
                 "regular_degree": 4,
             },
-            {
-                "network_type": "erdos_renyi",
-                "num_nodes": 50,
-                "er_target_mean_degree": 4.0,
-            },
-            {
-                "network_type": "small_world",
-                "num_nodes": 50,
-                "ws_degree": 4,
-                "ws_rewiring_prob": 0.10,
-            },
-            {
-                "network_type": "scale_free",
-                "num_nodes": 50,
-                "ba_attachments_per_new_node": 2,
-            },
+            # {
+            #     "network_type": "erdos_renyi",
+            #     "num_nodes": 50,
+            #     "er_target_mean_degree": 4.0,
+            # },
+            # {
+            #     "network_type": "small_world",
+            #     "num_nodes": 50,
+            #     "ws_degree": 4,
+            #     "ws_rewiring_prob": 0.10,
+            # },
+            # {
+            #     "network_type": "scale_free",
+            #     "num_nodes": 50,
+            #     "ba_attachments_per_new_node": 2,
+            # },
         ],
     },
 
@@ -1088,7 +1088,7 @@ BASE_EXPERIMENT = {
     # ---------------------------
     "curriculum": {
         # 是否启用按训练进度逐步扩展网络类型的 curriculum。
-        "enabled": True,
+        "enabled": False,
 
         # 当前先只支持按训练 update 进度切阶段。
         # 后续如果需要，再加按 f_c / eval 指标收敛触发的模式。
