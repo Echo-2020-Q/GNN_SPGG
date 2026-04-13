@@ -419,10 +419,10 @@ BASE_EXPERIMENT = {
         "learning_rate": 1e-4,
 
         # Actor 学习率。
-        "actor_lr":  1e-4,
+        "actor_lr":  3e-5,
 
         # Critic 学习率。
-        "critic_lr":  1e-4,
+        "critic_lr":  5e-5,
 
         # 学习率调度类型：
         # - "constant"          ：固定学习率
@@ -476,11 +476,11 @@ BASE_EXPERIMENT = {
         # Actor loss 里的分配熵正则权重。
         # 这是训练目标里的辅助项，不是环境 reward。
         # > 0 会鼓励分配更平滑、更不那么尖锐。
-        "actor_entropy_coef":  5e-4,
+        "actor_entropy_coef":  1e-3,
 
         # Actor loss 里的 valid logits L2 正则权重。
         # > 0 会抑制 logits 绝对值过大，减轻策略过尖。
-        "actor_logit_l2_coef": 5e-5,
+        "actor_logit_l2_coef": 5e-4,
 
         # TD3 twin critics 的状态编码器隐藏维度。
         # 对应 GraphActionCritic 里 state encoder 的 hidden_dim。
@@ -876,8 +876,8 @@ BASE_EXPERIMENT = {
 
         # Actor / Critic 的梯度裁剪范数。
         # 设为 None 表示关闭裁剪。
-        "actor_grad_clip_norm": 10.0,
-        "critic_grad_clip_norm": 10.0,
+        "actor_grad_clip_norm": 5.0,
+        "critic_grad_clip_norm": 5.0,
 
         # 每隔多少个外层训练迭代做一次 learner 更新。
         "train_every": 1,
