@@ -103,7 +103,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "0409_spgg_GNN_50Nodes_200length_Fermi_FixedTopology_StagedTeacher",#CUDACUDACUDA
+    "experiment_name": "0413_spgg_GNN_50Nodes_200length_Fermi_TD3_Regular&BA_Codex'sParam",#CUDACUDACUDA
     #记得改CUDACUDACUDACUDACUDACUDACUDACUDACUDACUDACUDA
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -980,11 +980,11 @@ BASE_EXPERIMENT = {
         "enabled": True,
 
         # worker 采样时允许出现的网络类型集合。
-        "network_types": ["regular"],#["regular", "erdos_renyi", "small_world", "scale_free"],
+        "network_types": ["regular", "scale_free"],#["regular", "erdos_renyi", "small_world", "scale_free"],
 
         # 与上面 network_types 一一对应的采样权重。
         # 设为 None 时，默认对这些网络类型均匀采样。
-        "network_type_weights": None,
+        "network_type_weights": [0.5,0.5],#None,
 
         # 是否为每种拓扑预生成固定的 k 张图，并在训练 / demo collection 时只从这组图里抽样。
         # False: 每次 reset 都按随机 seed 重新生成图。
@@ -1075,11 +1075,11 @@ BASE_EXPERIMENT = {
             #     "ws_degree": 4,
             #     "ws_rewiring_prob": 0.10,
             # },
-            # {
-            #     "network_type": "scale_free",
-            #     "num_nodes": 50,
-            #     "ba_attachments_per_new_node": 2,
-            # },
+            {
+                "network_type": "scale_free",
+                "num_nodes": 50,
+                "ba_attachments_per_new_node": 2,
+            },
         ],
     },
 
