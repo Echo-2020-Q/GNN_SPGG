@@ -4998,6 +4998,12 @@ def run_gnn_training_mode(
             policy=policy,
             output_dir=output_dir,
         )
+        post_training_eval_summary: dict[str, float] | None = None
+        if evaluation_summaries:
+            post_training_eval_summary = summarize_rule_based_episodes(
+                evaluation_summaries,
+                [float(item["episode_return"]) for item in evaluation_summaries],
+            )
         if writer is not None:
             final_env_steps = int(history[-1].get("global_env_steps", 0)) if history else 0
             _log_tensorboard_post_training_evaluation(
@@ -5020,6 +5026,16 @@ def run_gnn_training_mode(
             "post_training_eval_model_source": post_training_eval_model_source,
             "post_training_eval_checkpoint": post_training_eval_checkpoint,
             "post_training_evaluation": evaluation_summaries,
+            "summary": (
+                dict(post_training_eval_summary)
+                if post_training_eval_summary is not None
+                else (dict(history[-1]) if history else {})
+            ),
+            "summary_source": (
+                "post_training_evaluation/{0}".format(post_training_eval_model_source)
+                if post_training_eval_summary is not None
+                else "final_metrics"
+            ),
             "final_metrics": history[-1] if history else {},
         }
     finally:
@@ -5055,7 +5071,8 @@ def print_final_summary(results: Mapping[str, Any]) -> None:
     summary = results.get("summary")
     if summary is None:
         summary = results.get("final_metrics", {})
-    print("Final summary:")
+    summary_source = str(results.get("summary_source", "final_metrics"))
+    print("Final summary [{0}]:".format(summary_source))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
