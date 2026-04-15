@@ -103,7 +103,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "0413_spgg_GNN_50Nodes_200length_Fermi_TD3_Regular&BA_Codex'sParam",#CUDACUDACUDA
+    "experiment_name": "0415_40Mspgg_GNN_50Nodes_200length_Fermi_TD3_Regular&BA_Codex'sParam",#CUDACUDACUDA
     #记得改CUDACUDACUDACUDACUDACUDACUDACUDACUDACUDACUDA
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -349,13 +349,13 @@ BASE_EXPERIMENT = {
         # 程序内部会按：
         #   total_updates = ceil((warmup_env_steps + total_env_steps) / (num_workers * effective_steps_per_update))
         # 自动换算成 update 次数。
-        "total_env_steps": 5_000_000,#50_000_000=50M,#episode需要用总的steps除以episode_length=200
+        "total_env_steps": 40_000_000,#50_000_000=50M,#episode需要用总的steps除以episode_length=200
 
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
         # 它不计入上面的 total_env_steps，会额外附加在训练前面。
         # 设为 0 时，不仅没有 warm-up 行为采样，Actor 的 BC 约束也会一起关闭。
-        "warmup_env_steps": 307_200,
+        "warmup_env_steps": 0,#307_200,
 
         # 每隔多少个全局环境步做一次评估。
         # 程序内部会自动换算成 update 间隔。
@@ -419,7 +419,7 @@ BASE_EXPERIMENT = {
         "learning_rate": 1e-4,
 
         # Actor 学习率。
-        "actor_lr":  3e-5,
+        "actor_lr":  1e-5,
 
         # Critic 学习率。
         "critic_lr":  5e-5,
@@ -476,11 +476,11 @@ BASE_EXPERIMENT = {
         # Actor loss 里的分配熵正则权重。
         # 这是训练目标里的辅助项，不是环境 reward。
         # > 0 会鼓励分配更平滑、更不那么尖锐。
-        "actor_entropy_coef":  1e-3,
+        "actor_entropy_coef":  1e-2,
 
         # Actor loss 里的 valid logits L2 正则权重。
         # > 0 会抑制 logits 绝对值过大，减轻策略过尖。
-        "actor_logit_l2_coef": 5e-4,
+        "actor_logit_l2_coef": 1e-3,
 
         # TD3 twin critics 的状态编码器隐藏维度。
         # 对应 GraphActionCritic 里 state encoder 的 hidden_dim。
@@ -850,7 +850,7 @@ BASE_EXPERIMENT = {
 
         # online 阶段 actor 的 Q 项初始系数。
         # 早期让 actor loss 以 BC 为主，Q 为辅。
-        "online_actor_q_coef_initial": 1.0,
+        "online_actor_q_coef_initial": 0.5,
 
         # online 阶段 actor 的 Q 项最终系数。
         "online_actor_q_coef_final": 1.0,
@@ -886,7 +886,7 @@ BASE_EXPERIMENT = {
         "gradient_steps_per_update": 2,
 
         # TD3 delayed policy update 频率。
-        "policy_delay": 2,
+        "policy_delay": 4,
 
         # 将实际合作率过低的 transition 视为塌缩样本。
         "replay_collapse_fc_threshold": 0.10,
@@ -899,19 +899,19 @@ BASE_EXPERIMENT = {
         "tau": 0.005,
 
         # rollout 时在 logits 空间加噪声的标准差。
-        "rollout_logit_noise_std": 0.10,
+        "rollout_logit_noise_std": 0.20,
 
         # rollout 时 logits 噪声的截断范围。
-        "rollout_logit_noise_clip": 0.20,
+        "rollout_logit_noise_clip": 0.30,
 
         # rollout 噪声衰减系数。
         "rollout_noise_decay": 0.9995,
 
         # target policy smoothing 使用的 logits 噪声标准差。
-        "target_logit_noise_std": 0.10,
+        "target_logit_noise_std": 0.05,
 
         # target policy smoothing 的 logits 噪声截断范围。
-        "target_logit_noise_clip": 0.25,
+        "target_logit_noise_clip": 0.15,
 
         # 真实并行的 rollout worker 进程数。
         # num_workers=1 表示单进程采样；num_workers>1 会启动多进程并行采样。
@@ -939,7 +939,7 @@ BASE_EXPERIMENT = {
         # 默认建议先用 "cpu"，让 worker 侧保持最简单、最稳定的本地 CPU rollout。
         # 如果后面要专门做 rollout 推理加速，再改成某张 GPU 或多张 GPU 列表。
         # learner 训练设备仍由下面的 device 单独控制。
-        "rollout_device": "cuda:0",
+        "rollout_device": "cuda:2",
 
         # rollout 推理模式：
         # - "local"       ：每个 worker 自己持有 actor，并在本地前向
@@ -954,7 +954,7 @@ BASE_EXPERIMENT = {
 
         # learner 训练设备：cpu / cuda / cuda:0 等。
         # 这只控制主进程里的 actor/critic 训练，不控制 rollout worker 的推理设备。
-        "device": "cuda:1",
+        "device": "cuda:3",
 
         # 并行 rollout worker 进程内的 PyTorch CPU 线程数。
         # 仅对多进程 worker 生效，用于减少小图前向时的线程争抢。
@@ -1133,7 +1133,7 @@ BASE_EXPERIMENT = {
         "episodes": 5,
 
         # 在 gnn_train 模式下，训练结束后用训练好的策略再评估多少个 episode。
-        "post_training_eval_episodes": 5,
+        "post_training_eval_episodes": 10,
     },
 
     # ---------------------------
