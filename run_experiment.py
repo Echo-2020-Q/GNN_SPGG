@@ -294,7 +294,7 @@ BASE_EXPERIMENT = {
         "lambda_collapse": 0,
 
         # Gini 不平等惩罚项的权重。
-        "lambda_gini": 0.0,
+        "lambda_gini": 5.0,
 
         # Gini 分母的极小修正项，通常不需要改。
         "epsilon": 1e-8,
