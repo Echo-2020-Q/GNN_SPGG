@@ -103,7 +103,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "0415_demo_regularized_graph_td3_regular_ba_actor_only",#CUDACUDACUDA
+    "experiment_name": "0415_demo_regularized_graph_td3_regular_ba_actor_only_qoff_diagnostic",#CUDACUDACUDA
     #记得改CUDACUDACUDACUDACUDACUDACUDACUDACUDACUDACUDA
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -294,7 +294,7 @@ BASE_EXPERIMENT = {
         "lambda_collapse": 0,
 
         # Gini 不平等惩罚项的权重。
-        "lambda_gini": 5.0,
+        "lambda_gini": 0.0,
 
         # Gini 分母的极小修正项，通常不需要改。
         "epsilon": 1e-8,
@@ -349,7 +349,7 @@ BASE_EXPERIMENT = {
         # 程序内部会按：
         #   total_updates = ceil((warmup_env_steps + total_env_steps) / (num_workers * effective_steps_per_update))
         # 自动换算成 update 次数。
-        "total_env_steps": 40_000_000,#50_000_000=50M,#episode需要用总的steps除以episode_length=200
+        "total_env_steps": 2_000_000,#50_000_000=50M,#episode需要用总的steps除以episode_length=200
 
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
@@ -419,10 +419,10 @@ BASE_EXPERIMENT = {
         "learning_rate": 1e-4,
 
         # Actor 学习率。
-        "actor_lr":  1e-5,
+        "actor_lr":  3e-6,
 
         # Critic 学习率。
-        "critic_lr":  5e-5,
+        "critic_lr":  2e-5,
 
         # 学习率调度类型：
         # - "constant"          ：固定学习率
@@ -430,7 +430,7 @@ BASE_EXPERIMENT = {
         "lr_schedule_type": "constant",
 
         # 指数退火的最小学习率下界。
-        "lr_final": 5e-6,
+        "lr_final": 1e-6,
 
         # 指数退火的 decay_rate。
         "lr_decay_rate": 0.05,
@@ -604,11 +604,11 @@ BASE_EXPERIMENT = {
         "warmup_actor_bc_coef": 1.0,
 
         # warm-up 结束后，继续在 demo 样本上保留一个较轻的行为克隆锚点。
-        "actor_demo_bc_coef": 0.5,
+        "actor_demo_bc_coef": 1.0,
 
         # warm-up 结束后，demo BC 系数线性衰减到 0 的总 rollout 步数比例。
         # 例如 0.50 表示到总 rollout 步数的 20% 时衰减到 0。
-        "actor_demo_bc_decay_end_fraction": 0.70,
+        "actor_demo_bc_decay_end_fraction": 1.0,
 
         # 是否把 demo BC 的衰减起点对齐到 teacher release 时刻。
         # True 时，BC 不再因为“release 很晚”而在解锁前几乎衰减光。
@@ -863,13 +863,13 @@ BASE_EXPERIMENT = {
 
         # online 阶段 actor 的 Q 项初始系数。
         # 早期让 actor loss 以 BC 为主，Q 为辅。
-        "online_actor_q_coef_initial": 0.1,
+        "online_actor_q_coef_initial": 0.0,
 
         # online 阶段 actor 的 Q 项最终系数。
-        "online_actor_q_coef_final": 1.0,
+        "online_actor_q_coef_final": 0.0,
 
         # actor Q 系数从 initial 线性升到 final 的总 rollout 步数比例。
-        "online_actor_q_coef_ramp_end_fraction": 0.50,
+        "online_actor_q_coef_ramp_end_fraction": 1.0,
 
         # 是否把 actor Q ramp 的起点对齐到 teacher release 时刻。
         # True 时，release 晚不会导致 actor_q 一解锁就接近满强度。
@@ -899,7 +899,7 @@ BASE_EXPERIMENT = {
         "gradient_steps_per_update": 2,
 
         # TD3 delayed policy update 频率。
-        "policy_delay": 4,
+        "policy_delay": 8,
 
         # 将实际合作率过低的 transition 视为塌缩样本。
         "replay_collapse_fc_threshold": 0.10,
@@ -3511,6 +3511,12 @@ def _format_console_recent_stats_lines(
         ("loss", "loss"),
         ("policy_loss", "policy_loss"),
         ("value_loss", "value_loss"),
+        ("actor_q_loss_raw", "actor_q_raw"),
+        ("actor_q_loss_weighted", "actor_q_w"),
+        ("actor_bc_loss_raw", "actor_bc_raw"),
+        ("actor_bc_loss_weighted", "actor_bc_w"),
+        ("actor_entropy_loss_weighted", "actor_ent_w"),
+        ("actor_logit_l2_weighted", "logit_l2_w"),
         ("mean_rollout_reward", "mean_rollout_reward"),
         ("entropy", "entropy"),
         ("actor_logit_l2", "actor_logit_l2"),
@@ -3525,10 +3531,25 @@ def _format_console_recent_stats_lines(
         ("q_filter_margin_mean", "qf_margin"),
         ("actor_grad_norm", "actor_grad_norm"),
         ("critic_grad_norm", "critic_grad_norm"),
+        ("actor_q_grad_norm", "actor_q_grad"),
+        ("actor_q_grad_norm_weighted", "actor_q_grad_w"),
+        ("actor_bc_grad_norm", "actor_bc_grad"),
+        ("actor_bc_grad_norm_weighted", "actor_bc_grad_w"),
+        ("actor_q_bc_grad_cosine", "q_bc_cos"),
         ("actor_grad_norm_pre_clip", "actor_grad_pre"),
         ("actor_grad_norm_post_clip", "actor_grad_post"),
         ("critic_grad_norm_pre_clip", "critic_grad_pre"),
         ("critic_grad_norm_post_clip", "critic_grad_post"),
+        ("critic_target_mean", "target_mean"),
+        ("critic_target_std", "target_std"),
+        ("critic_target_min", "target_min"),
+        ("critic_target_max", "target_max"),
+        ("critic_q1_mean", "q1_mean"),
+        ("critic_q2_mean", "q2_mean"),
+        ("critic_td_error_abs_mean", "td_abs"),
+        ("critic_td_error_demo", "td_demo"),
+        ("critic_td_error_recent", "td_recent"),
+        ("critic_td_error_long_term", "td_long"),
         ("actor_lr", "actor_lr"),
         ("critic_lr", "critic_lr"),
         ("replay_size", "replay_size"),
@@ -3680,7 +3701,13 @@ def _tensorboard_tag_for_metric(metric_name: str) -> Optional[str]:
         "actor_grad_norm_post_clip",
         "critic_grad_norm_pre_clip",
         "critic_grad_norm_post_clip",
+        "actor_q_grad_norm",
+        "actor_q_grad_norm_weighted",
+        "actor_bc_grad_norm",
+        "actor_bc_grad_norm_weighted",
     }:
+        return "grad/{0}".format(metric_name)
+    if metric_name == "actor_q_bc_grad_cosine":
         return "grad/{0}".format(metric_name)
     if metric_name == "replay_size":
         return "replay/size"
@@ -3697,6 +3724,12 @@ def _tensorboard_tag_for_metric(metric_name: str) -> Optional[str]:
         "critic_loss",
         "actor_loss",
         "actor_q_loss",
+        "actor_q_loss_raw",
+        "actor_q_loss_weighted",
+        "actor_bc_loss_raw",
+        "actor_bc_loss_weighted",
+        "actor_entropy_loss_weighted",
+        "actor_logit_l2_weighted",
         "actor_reg_loss",
     }:
         return "loss/{0}".format(metric_name)
