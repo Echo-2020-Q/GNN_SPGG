@@ -1312,6 +1312,205 @@ class ReplayBuffer:
             return None, {}
         return _concat_replay_batches(sampled_batches), source_counts
 
+    def _fifo_candidate_indices_by_topology(
+        self,
+        *,
+        require_demo: bool = False,
+        require_pool_power_demo: bool = False,
+    ) -> dict[str, np.ndarray]:
+        assert self._fifo_storage is not None
+        storage = self._fifo_storage
+        if len(storage) <= 0:
+            return {}
+        assert storage._topology_id_buffer is not None
+        size = int(storage._size)
+        topology_ids = storage._topology_id_buffer[:size].detach().cpu().numpy().astype(np.int64, copy=False)
+        candidate_mask = np.ones(size, dtype=np.bool_)
+        if require_demo:
+            assert storage._is_demo_buffer is not None
+            candidate_mask &= storage._is_demo_buffer[:size].detach().cpu().numpy().astype(np.bool_, copy=False)
+        if require_pool_power_demo:
+            assert storage._pool_power_demo_flag_buffer is not None
+            candidate_mask &= storage._pool_power_demo_flag_buffer[:size].detach().cpu().numpy().astype(
+                np.bool_,
+                copy=False,
+            )
+        if not np.any(candidate_mask):
+            return {}
+
+        grouped: dict[str, np.ndarray] = {}
+        for topology_id in np.unique(topology_ids[candidate_mask]):
+            topology_mask = np.logical_and(candidate_mask, topology_ids == int(topology_id))
+            topology_indices = np.flatnonzero(topology_mask)
+            if topology_indices.size <= 0:
+                continue
+            grouped[self._resolve_topology_name(int(topology_id))] = topology_indices.astype(np.int64, copy=False)
+        return grouped
+
+    def _fifo_max_sample_count_for_topology(
+        self,
+        candidate_indices: np.ndarray,
+        max_collapse_ratio: float | None,
+    ) -> int:
+        assert self._fifo_storage is not None
+        storage = self._fifo_storage
+        if candidate_indices.size <= 0:
+            return 0
+        if max_collapse_ratio is None or storage._collapse_flag_buffer is None:
+            return int(candidate_indices.size)
+
+        ratio = min(max(float(max_collapse_ratio), 0.0), 1.0)
+        if ratio >= 1.0:
+            return int(candidate_indices.size)
+
+        collapse_flags = storage._collapse_flag_buffer[candidate_indices].detach().cpu().numpy().astype(
+            np.bool_,
+            copy=False,
+        )
+        collapse_count = int(np.sum(collapse_flags))
+        non_collapse_count = int(candidate_indices.size) - collapse_count
+        if ratio <= 0.0:
+            return non_collapse_count
+        if non_collapse_count <= 0:
+            return 0
+        allowed_collapse = int(
+            np.floor((ratio * float(non_collapse_count)) / max(1.0 - ratio, 1e-12))
+        )
+        return non_collapse_count + min(collapse_count, allowed_collapse)
+
+    def _record_last_sample_topology_stats(
+        self,
+        topology_counts: Mapping[str, int],
+        sample_size: int,
+        *,
+        demo_only: bool = False,
+    ) -> None:
+        self._last_sample_stats = {
+            "replay_sample_size": float(sample_size),
+            **(
+                {"replay_source_frac_demo": 1.0}
+                if demo_only
+                else {}
+            ),
+            **{
+                "replay_topology_frac_{0}".format(topology_name): float(count) / float(max(sample_size, 1))
+                for topology_name, count in sorted(topology_counts.items())
+            },
+        }
+
+    def _sample_fifo_with_topology_collapse_caps(
+        self,
+        *,
+        batch_size: int,
+        max_collapse_ratio: float | None,
+        require_demo: bool = False,
+        require_pool_power_demo: bool = False,
+    ) -> TensorReplayBatch | None:
+        assert self._fifo_storage is not None
+        storage = self._fifo_storage
+        candidate_groups = self._fifo_candidate_indices_by_topology(
+            require_demo=require_demo,
+            require_pool_power_demo=require_pool_power_demo,
+        )
+        if not candidate_groups:
+            return None
+        if max_collapse_ratio is None or len(candidate_groups) <= 1:
+            return None
+
+        topology_names = list(candidate_groups.keys())
+        eligible_counts = [
+            self._fifo_max_sample_count_for_topology(candidate_groups[topology_name], max_collapse_ratio)
+            for topology_name in topology_names
+        ]
+        active_pairs = [
+            (topology_name, candidate_groups[topology_name], int(eligible_count))
+            for topology_name, eligible_count in zip(topology_names, eligible_counts)
+            if int(eligible_count) > 0
+        ]
+        if not active_pairs:
+            return None
+
+        requested = min(int(batch_size), sum(eligible_count for _, _, eligible_count in active_pairs))
+        if requested <= 0:
+            return None
+
+        active_topology_names = [item[0] for item in active_pairs]
+        active_candidate_groups = {item[0]: item[1] for item in active_pairs}
+        target_counts = _allocate_integer_counts(requested, [float(item[2]) for item in active_pairs])
+        selected_by_topology: dict[str, np.ndarray] = {
+            topology_name: np.empty(0, dtype=np.int64) for topology_name in active_topology_names
+        }
+        sampled_parts: list[np.ndarray] = []
+        actual_topology_counts: dict[str, int] = {}
+
+        for topology_name, target_count in zip(active_topology_names, target_counts):
+            if target_count <= 0:
+                continue
+            sampled_indices = storage._sample_candidate_indices_up_to(
+                candidate_indices=active_candidate_groups[topology_name],
+                batch_size=target_count,
+                max_collapse_ratio=max_collapse_ratio,
+                strict_max_collapse_ratio=True,
+            )
+            if sampled_indices.numel() <= 0:
+                continue
+            sampled_np = sampled_indices.detach().cpu().numpy().astype(np.int64, copy=False)
+            selected_by_topology[topology_name] = sampled_np
+            sampled_parts.append(sampled_np)
+            actual_topology_counts[topology_name] = len(sampled_np)
+
+        remaining = requested - sum(actual_topology_counts.values())
+        while remaining > 0:
+            made_progress = False
+            for topology_name in active_topology_names:
+                candidate_indices = active_candidate_groups[topology_name]
+                selected_indices = selected_by_topology[topology_name]
+                if selected_indices.size > 0:
+                    residual_candidates = candidate_indices[
+                        ~np.isin(candidate_indices, selected_indices, assume_unique=False)
+                    ]
+                else:
+                    residual_candidates = candidate_indices
+                if residual_candidates.size <= 0:
+                    continue
+                sampled_indices = storage._sample_candidate_indices_up_to(
+                    candidate_indices=residual_candidates,
+                    batch_size=1,
+                    max_collapse_ratio=max_collapse_ratio,
+                    strict_max_collapse_ratio=True,
+                )
+                if sampled_indices.numel() <= 0:
+                    continue
+                sampled_np = sampled_indices.detach().cpu().numpy().astype(np.int64, copy=False)
+                selected_by_topology[topology_name] = np.concatenate(
+                    [selected_by_topology[topology_name], sampled_np],
+                    axis=0,
+                )
+                sampled_parts.append(sampled_np)
+                actual_topology_counts[topology_name] = actual_topology_counts.get(topology_name, 0) + len(sampled_np)
+                remaining -= len(sampled_np)
+                made_progress = True
+                if remaining <= 0:
+                    break
+            if not made_progress:
+                break
+
+        if not sampled_parts:
+            return None
+        sampled_indices = np.concatenate(sampled_parts, axis=0)
+        if sampled_indices.size <= 0:
+            return None
+        self._rng.shuffle(sampled_indices)
+        batch = storage._batch_from_indices(
+            torch.as_tensor(sampled_indices, dtype=torch.int64, device="cpu")
+        )
+        self._record_last_sample_topology_stats(
+            actual_topology_counts,
+            len(batch),
+            demo_only=require_demo,
+        )
+        return batch
+
     def get_last_sample_stats(self) -> dict[str, float]:
         with self._lock:
             return dict(self._last_sample_stats)
@@ -1395,24 +1594,22 @@ class ReplayBuffer:
         with self._lock:
             if self.replay_strategy == "fifo":
                 assert self._fifo_storage is not None
-                batch = self._fifo_storage.sample(
+                batch = self._sample_fifo_with_topology_collapse_caps(
                     batch_size=batch_size,
-                    device=None,
                     max_collapse_ratio=max_collapse_ratio,
                 )
+                if batch is None:
+                    batch = self._fifo_storage.sample(
+                        batch_size=batch_size,
+                        device=None,
+                        max_collapse_ratio=max_collapse_ratio,
+                    )
                 topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64, copy=False)
                 topology_counts: dict[str, int] = {}
                 for topology_id in np.unique(topology_ids):
                     topology_name = self._resolve_topology_name(int(topology_id))
                     topology_counts[topology_name] = int(np.sum(topology_ids == int(topology_id)))
-                sample_size = max(len(batch), 1)
-                self._last_sample_stats = {
-                    "replay_sample_size": float(len(batch)),
-                    **{
-                        "replay_topology_frac_{0}".format(topology_name): float(count) / float(sample_size)
-                        for topology_name, count in sorted(topology_counts.items())
-                    },
-                }
+                self._record_last_sample_topology_stats(topology_counts, len(batch))
             else:
                 active_topologies = [
                     topology_name
@@ -1497,13 +1694,20 @@ class ReplayBuffer:
         with self._lock:
             if self.replay_strategy == "fifo":
                 assert self._fifo_storage is not None
-                batch = self._fifo_storage.sample_filtered_up_to(
+                batch = self._sample_fifo_with_topology_collapse_caps(
                     batch_size=batch_size,
                     max_collapse_ratio=max_collapse_ratio,
-                    strict_max_collapse_ratio=False,
                     require_demo=True,
                     require_pool_power_demo=(self.demo_behavior_source == "pool_power_mix"),
                 )
+                if batch is None:
+                    batch = self._fifo_storage.sample_filtered_up_to(
+                        batch_size=batch_size,
+                        max_collapse_ratio=max_collapse_ratio,
+                        strict_max_collapse_ratio=False,
+                        require_demo=True,
+                        require_pool_power_demo=(self.demo_behavior_source == "pool_power_mix"),
+                    )
                 if batch is None:
                     raise ValueError("Cannot sample demo batch from an empty replay buffer.")
                 topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64, copy=False)
@@ -1511,15 +1715,7 @@ class ReplayBuffer:
                 for topology_id in np.unique(topology_ids):
                     topology_name = self._resolve_topology_name(int(topology_id))
                     topology_counts[topology_name] = int(np.sum(topology_ids == int(topology_id)))
-                sample_size = max(len(batch), 1)
-                self._last_sample_stats = {
-                    "replay_sample_size": float(len(batch)),
-                    "replay_source_frac_demo": 1.0,
-                    **{
-                        "replay_topology_frac_{0}".format(topology_name): float(count) / float(sample_size)
-                        for topology_name, count in sorted(topology_counts.items())
-                    },
-                }
+                self._record_last_sample_topology_stats(topology_counts, len(batch), demo_only=True)
             else:
                 active_topologies = [
                     topology_name

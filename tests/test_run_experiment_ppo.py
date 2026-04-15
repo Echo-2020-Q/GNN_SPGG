@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import tempfile
 import unittest
 from copy import deepcopy
@@ -76,6 +77,14 @@ class RunExperimentPPOSmokeTests(unittest.TestCase):
             self.assertEqual(len(results["post_training_evaluation"]), 1)
             self.assertTrue((output_dir / "checkpoints" / "latest.pt").exists())
             self.assertTrue((output_dir / "checkpoints" / "final.pt").exists())
+            top_k_manifest_path = output_dir / "checkpoints" / "top_k_manifest.json"
+            self.assertTrue(top_k_manifest_path.exists())
+            top_k_manifest = json.loads(top_k_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(top_k_manifest["metric"], "eval_return_mean")
+            self.assertGreaterEqual(len(top_k_manifest["checkpoints"]), 1)
+            self.assertLessEqual(len(top_k_manifest["checkpoints"]), spec["training"]["top_k_checkpoints"])
+            self.assertEqual(len(results["top_k_checkpoints"]), len(top_k_manifest["checkpoints"]))
+            self.assertTrue(Path(top_k_manifest["checkpoints"][0]["path"]).exists())
 
     def test_resume_from_ppo_checkpoint_continues_training(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

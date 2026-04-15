@@ -69,6 +69,7 @@ class GraphTD3Config:
     critic_pretrain_updates: int = 0
     demo_pretrain_batch_size: int | None = None
     demo_pretrain_validation_batch_size: int | None = None
+    demo_pretrain_validation_episodes: int = 4
     demo_validation_fraction: float = 0.10
     demo_pretrain_eval_interval: int = 200
     demo_pretrain_patience: int = 5
@@ -291,6 +292,8 @@ class GraphTD3Config:
             raise ValueError("demo_pretrain_batch_size must be positive when provided.")
         if self.demo_pretrain_validation_batch_size is not None and self.demo_pretrain_validation_batch_size <= 0:
             raise ValueError("demo_pretrain_validation_batch_size must be positive when provided.")
+        if self.demo_pretrain_validation_episodes <= 0:
+            raise ValueError("demo_pretrain_validation_episodes must be positive.")
         if self.demo_validation_fraction < 0.0 or self.demo_validation_fraction >= 1.0:
             raise ValueError("demo_validation_fraction must be in [0, 1).")
         if self.demo_pretrain_eval_interval <= 0:

@@ -898,6 +898,10 @@ class RolloutWorker:
         rewards: list[float] = []
         completed_episodes = 0
         behavior_source_counts: dict[str, int] = {}
+        warmup_action_count = 0
+        teacher_takeover_action_count = 0
+        actor_action_count = 0
+        forced_action_count = 0
         cooperation_rates: list[float] = []
         mean_resources: list[float] = []
         gini_values: list[float] = []
@@ -962,6 +966,7 @@ class RolloutWorker:
                     behavior_source_counts[str(forced_behavior_source)] = (
                         behavior_source_counts.get(str(forced_behavior_source), 0) + 1
                     )
+                    forced_action_count += 1
                     continue
                 is_warmup = (collected_steps + batch_offset) < warmup_budget
                 if is_warmup:
@@ -970,6 +975,7 @@ class RolloutWorker:
                     is_demo_by_slot[slot_index] = True
                     behavior_source_by_slot[slot_index] = behavior_source
                     behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
+                    warmup_action_count += 1
                     continue
                 current_global_step = int(global_env_start_step) + int(collected_steps + batch_offset)
                 if teacher_takeover_override_prob is None:
@@ -991,6 +997,7 @@ class RolloutWorker:
                     is_demo_by_slot[slot_index] = True
                     behavior_source_by_slot[slot_index] = behavior_source
                     behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
+                    teacher_takeover_action_count += 1
                     continue
                 actor_slots.append(slot_index)
                 actor_observations.append(observation)
@@ -1068,6 +1075,7 @@ class RolloutWorker:
                     behavior_source = actor_behavior_sources[actor_batch_index]
                     behavior_source_by_slot[slot_index] = behavior_source
                     behavior_source_counts[behavior_source] = behavior_source_counts.get(behavior_source, 0) + 1
+                    actor_action_count += 1
 
             for slot_index in batch_slots:
                 observation = self.observations[slot_index]
@@ -1155,6 +1163,12 @@ class RolloutWorker:
             "behavior_source_counts": behavior_source_counts,
             "teacher_takeover_prob_mean": float(np.mean(teacher_takeover_probs)) if teacher_takeover_probs else 0.0,
         }
+        non_warmup_non_forced_actions = teacher_takeover_action_count + actor_action_count
+        metrics["teacher_takeover_active_frac"] = (
+            float(teacher_takeover_action_count) / float(max(non_warmup_non_forced_actions, 1))
+        )
+        total_action_decisions = warmup_action_count + forced_action_count + non_warmup_non_forced_actions
+        metrics["warmup_active_frac"] = float(warmup_action_count) / float(max(total_action_decisions, 1))
         replay_stack_start = perf_counter()
         replay_batch = stack_tensor_transitions([record.transition for record in transition_records])
         metrics["stack_transitions_seconds"] = float(perf_counter() - replay_stack_start)

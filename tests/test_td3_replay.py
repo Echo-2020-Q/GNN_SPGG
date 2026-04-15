@@ -157,6 +157,52 @@ class TensorReplayTests(unittest.TestCase):
         self.assertIn("replay_topology_frac_regular", sample_stats)
         self.assertIn("replay_topology_frac_scale_free", sample_stats)
 
+    def test_fifo_sampling_enforces_collapse_cap_per_topology(self) -> None:
+        buffer = ReplayBuffer(
+            capacity=40,
+            seed=13,
+            replay_strategy="fifo",
+            topology_names=("regular", "scale_free"),
+        )
+
+        for index in range(12):
+            buffer.add(
+                TensorTransition.from_step(
+                    obs=self._make_observation(offset=0.01 * index),
+                    action=self._make_action(offset=0.01 * index),
+                    reward=float(index),
+                    next_obs=self._make_observation(offset=0.01 * (index + 1)),
+                    done=False,
+                    collapse_flag=(index < 10),
+                    topology_name="regular",
+                )
+            )
+        for index in range(12):
+            buffer.add(
+                TensorTransition.from_step(
+                    obs=self._make_observation(offset=0.02 * index),
+                    action=self._make_action(offset=0.02 * index),
+                    reward=float(index),
+                    next_obs=self._make_observation(offset=0.02 * (index + 1)),
+                    done=False,
+                    collapse_flag=False,
+                    topology_name="scale_free",
+                )
+            )
+
+        batch = buffer.sample(batch_size=12, max_collapse_ratio=0.20)
+        sample_stats = buffer.get_last_sample_stats()
+        topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64)
+        collapse_flags = batch.collapse_flag.detach().cpu().numpy().astype(np.bool_)
+
+        self.assertGreaterEqual(len(np.unique(topology_ids)), 2)
+        for topology_id in np.unique(topology_ids):
+            topology_mask = topology_ids == int(topology_id)
+            topology_collapse_ratio = float(np.mean(collapse_flags[topology_mask]))
+            self.assertLessEqual(topology_collapse_ratio, 0.20 + 1e-8)
+        self.assertIn("replay_topology_frac_regular", sample_stats)
+        self.assertIn("replay_topology_frac_scale_free", sample_stats)
+
     def test_pool_power_demo_buffer_keeps_pool_power_mix_samples(self) -> None:
         buffer = ReplayBuffer(
             capacity=24,
@@ -243,6 +289,55 @@ class TensorReplayTests(unittest.TestCase):
         for topology_id in np.unique(topology_ids):
             topology_mask = topology_ids == int(topology_id)
             self.assertLessEqual(float(np.mean(collapse_flags[topology_mask])), 0.20 + 1e-8)
+        self.assertAlmostEqual(sample_stats.get("replay_source_frac_demo", 0.0), 1.0)
+
+    def test_sample_demo_fifo_enforces_collapse_cap_per_topology(self) -> None:
+        buffer = ReplayBuffer(
+            capacity=40,
+            seed=29,
+            replay_strategy="fifo",
+            topology_names=("regular", "scale_free"),
+        )
+        for index in range(12):
+            buffer.add(
+                TensorTransition.from_step(
+                    obs=self._make_observation(offset=0.01 * index),
+                    action=self._make_action(offset=0.01 * index),
+                    reward=float(index),
+                    next_obs=self._make_observation(offset=0.01 * (index + 1)),
+                    done=False,
+                    is_demo=True,
+                    collapse_flag=(index < 10),
+                    topology_name="regular",
+                    pool_power_demo_flag=True,
+                )
+            )
+        for index in range(12):
+            buffer.add(
+                TensorTransition.from_step(
+                    obs=self._make_observation(offset=0.02 * index),
+                    action=self._make_action(offset=0.02 * index),
+                    reward=float(index),
+                    next_obs=self._make_observation(offset=0.02 * (index + 1)),
+                    done=False,
+                    is_demo=True,
+                    collapse_flag=False,
+                    topology_name="scale_free",
+                    pool_power_demo_flag=True,
+                )
+            )
+
+        batch = buffer.sample_demo(batch_size=12, max_collapse_ratio=0.20)
+        sample_stats = buffer.get_last_sample_stats()
+        topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64)
+        collapse_flags = batch.collapse_flag.detach().cpu().numpy().astype(np.bool_)
+
+        self.assertTrue(torch.all(batch.is_demo))
+        self.assertGreaterEqual(len(np.unique(topology_ids)), 2)
+        for topology_id in np.unique(topology_ids):
+            topology_mask = topology_ids == int(topology_id)
+            topology_collapse_ratio = float(np.mean(collapse_flags[topology_mask]))
+            self.assertLessEqual(topology_collapse_ratio, 0.20 + 1e-8)
         self.assertAlmostEqual(sample_stats.get("replay_source_frac_demo", 0.0), 1.0)
 
     def test_state_dict_round_trip_preserves_new_replay_metadata(self) -> None:

@@ -334,7 +334,7 @@ class GraphTD3Trainer:
                 }
             )
         if include_quick_eval:
-            quick_eval_episodes = max(1, min(int(self.config.eval_episodes), 4))
+            quick_eval_episodes = max(1, int(self.config.demo_pretrain_validation_episodes))
             quick_eval = self.evaluate(num_episodes=quick_eval_episodes)
             metrics["quick_eval_return_mean"] = float(quick_eval.get("return_mean", 0.0))
             metrics["quick_eval_return_per_step_mean"] = float(quick_eval.get("return_per_step_mean", 0.0))
@@ -793,6 +793,8 @@ class GraphTD3Trainer:
             self.replay_buffer.load_state_dict(dict(checkpoint["replay_buffer_state"]))
 
             worker_states = list(checkpoint["worker_states"])
+            if worker_states and not self._rollout_runtime_initialized and len(self.workers) == 0:
+                self._initialize_rollout_runtime()
             if len(worker_states) != len(self.workers):
                 raise ValueError(
                     "Checkpoint worker count {0} does not match current trainer worker count {1}.".format(
@@ -1312,6 +1314,8 @@ class GraphTD3Trainer:
     def _run_demo_pretrain(self) -> dict[str, float | str | bool | None]:
         summary: dict[str, float | str | bool | None] = {
             "enabled": bool(self.config.demo_pretrain_enabled),
+            "phase_demo_pretrain": 1.0,
+            "phase_critic_bridge": 1.0 if bool(self.config.critic_bridge_enabled) else 0.0,
             "demo_collection_env_steps": float(self.config.demo_collection_env_steps),
             "demo_replay_size_after_collection": float(self.replay_buffer.demo_size()),
             "demo_train_replay_size_after_split": float(self.replay_buffer.demo_size()),
@@ -2088,6 +2092,8 @@ class GraphTD3Trainer:
                 "actor_q_loss": 0.0,
                 "actor_entropy": 0.0,
                 "actor_logit_l2": 0.0,
+                "actor_row_max_mean": 0.0,
+                "actor_self_allocation_mean": 0.0,
                 "actor_reg_loss": 0.0,
                 "loss": 0.0,
                 "replay_size": float(len(self.replay_buffer)),
@@ -2152,6 +2158,12 @@ class GraphTD3Trainer:
             mean_rollout_inference_batch_size = float(np.mean([item.get("inference_batch_size_mean", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
             max_rollout_inference_batch_size = float(max((item.get("inference_batch_size_max", 0.0) for item in rollout_metrics), default=0.0))
             mean_teacher_takeover_prob = float(np.mean([item.get("teacher_takeover_prob_mean", 0.0) for item in rollout_metrics])) if rollout_metrics else 0.0
+            mean_teacher_takeover_active_frac = float(
+                np.mean([item.get("teacher_takeover_active_frac", 0.0) for item in rollout_metrics])
+            ) if rollout_metrics else 0.0
+            mean_warmup_active_frac = float(
+                np.mean([item.get("warmup_active_frac", 0.0) for item in rollout_metrics])
+            ) if rollout_metrics else 0.0
             total_rollout_steps_collected = float(sum(item.get("steps_collected", 0.0) for item in rollout_metrics))
             rollout_steps_per_second = (
                 total_rollout_steps_collected / rollout_collect_seconds
@@ -2165,6 +2177,7 @@ class GraphTD3Trainer:
             evaluation_seconds = 0.0
             metrics = {
                 "update": float(update),
+                "phase_online_td3": 1.0,
                 "loss": float(learner_metrics["loss"]),
                 "policy_loss": float(learner_metrics["actor_loss"]),
                 "value_loss": float(learner_metrics["critic_loss"]),
@@ -2176,6 +2189,8 @@ class GraphTD3Trainer:
                 "actor_q_loss": float(learner_metrics["actor_q_loss"]),
                 "actor_entropy": float(learner_metrics["actor_entropy"]),
                 "actor_logit_l2": float(learner_metrics["actor_logit_l2"]),
+                "actor_row_max_mean": float(learner_metrics.get("actor_row_max_mean", 0.0)),
+                "actor_self_allocation_mean": float(learner_metrics.get("actor_self_allocation_mean", 0.0)),
                 "actor_reg_loss": float(learner_metrics["actor_reg_loss"]),
                 "actor_bc_loss": float(learner_metrics.get("actor_bc_loss", 0.0)),
                 "actor_bc_coef": float(learner_metrics.get("actor_bc_coef", 0.0)),
@@ -2185,6 +2200,8 @@ class GraphTD3Trainer:
                 "replay_teacher_frac": float(learner_metrics.get("replay_teacher_frac", 0.0)),
                 "replay_collapse_frac": float(learner_metrics.get("replay_collapse_frac", 0.0)),
                 "teacher_takeover_prob": mean_teacher_takeover_prob,
+                "teacher_takeover_active_frac": mean_teacher_takeover_active_frac,
+                "warmup_active_frac": mean_warmup_active_frac,
                 "teacher_handoff_stage": float(self.teacher_handoff_stage),
                 "teacher_handoff_soft_released": 1.0 if int(self.teacher_handoff_stage) >= 1 else 0.0,
                 "teacher_handoff_full_released": 1.0 if int(self.teacher_handoff_stage) >= 2 else 0.0,
@@ -2232,7 +2249,13 @@ class GraphTD3Trainer:
                 **rollout_sync_metrics,
             }
             for key, value in learner_metrics.items():
-                if key.startswith("replay_source_frac_") or key.startswith("replay_topology_frac_"):
+                if (
+                    key.startswith("replay_")
+                    or key.startswith("q_filter_")
+                    or key.startswith("critic_bridge_")
+                    or key.endswith("_grad_norm_pre_clip")
+                    or key.endswith("_grad_norm_post_clip")
+                ):
                     metrics[key] = float(value)
             total_behavior_samples = float(sum(behavior_counts.values()))
             for source in (

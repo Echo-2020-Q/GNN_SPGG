@@ -233,6 +233,27 @@ class GraphTD3LearnerPretrainTests(unittest.TestCase):
             float(late_metrics["critic_grad_norm_post_clip"]),
         )
 
+    def test_train_step_keeps_demo_bc_coef_without_online_warmup(self) -> None:
+        learner = self._make_learner()
+        learner.config.warmup_steps = 0
+        learner.config.policy_delay = 1
+        learner.config.total_updates = 10
+        learner.config.steps_per_update = 1
+        learner.config.num_workers = 1
+        learner.config.demo_pretrain_enabled = True
+        learner.config.actor_demo_bc_coef = 0.5
+        learner.config.actor_demo_bc_decay_end_fraction = 0.7
+
+        metrics = learner.train_step(global_env_steps=0)
+
+        self.assertAlmostEqual(float(metrics["actor_bc_coef"]), 0.5, places=6)
+        self.assertIn("actor_row_max_mean", metrics)
+        self.assertIn("actor_self_allocation_mean", metrics)
+        self.assertGreaterEqual(float(metrics["actor_row_max_mean"]), 0.0)
+        self.assertLessEqual(float(metrics["actor_row_max_mean"]), 1.0)
+        self.assertGreaterEqual(float(metrics["actor_self_allocation_mean"]), 0.0)
+        self.assertLessEqual(float(metrics["actor_self_allocation_mean"]), 1.0)
+
     def test_freeze_actor_during_warmup_skips_actor_updates(self) -> None:
         learner = self._make_learner()
         learner.config.warmup_steps = 10

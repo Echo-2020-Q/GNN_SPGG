@@ -153,6 +153,8 @@ class GraphTD3Learner:
         self.last_actor_loss = 0.0
         self.last_actor_entropy = 0.0
         self.last_actor_logit_l2 = 0.0
+        self.last_actor_row_max_mean = 0.0
+        self.last_actor_self_allocation_mean = 0.0
         self.last_actor_reg_loss = 0.0
         self.last_actor_q_loss = 0.0
         self.last_actor_bc_loss = 0.0
@@ -280,6 +282,8 @@ class GraphTD3Learner:
             "last_actor_q_loss": float(self.last_actor_q_loss),
             "last_actor_entropy": float(self.last_actor_entropy),
             "last_actor_logit_l2": float(self.last_actor_logit_l2),
+            "last_actor_row_max_mean": float(self.last_actor_row_max_mean),
+            "last_actor_self_allocation_mean": float(self.last_actor_self_allocation_mean),
             "last_actor_reg_loss": float(self.last_actor_reg_loss),
             "last_actor_bc_loss": float(self.last_actor_bc_loss),
             "last_actor_bc_coef": float(self.last_actor_bc_coef),
@@ -314,6 +318,8 @@ class GraphTD3Learner:
         self.last_actor_q_loss = float(state_dict["last_actor_q_loss"])
         self.last_actor_entropy = float(state_dict["last_actor_entropy"])
         self.last_actor_logit_l2 = float(state_dict["last_actor_logit_l2"])
+        self.last_actor_row_max_mean = float(state_dict.get("last_actor_row_max_mean", 0.0))
+        self.last_actor_self_allocation_mean = float(state_dict.get("last_actor_self_allocation_mean", 0.0))
         self.last_actor_reg_loss = float(state_dict["last_actor_reg_loss"])
         self.last_actor_bc_loss = float(state_dict.get("last_actor_bc_loss", 0.0))
         self.last_actor_bc_coef = float(state_dict.get("last_actor_bc_coef", 0.0))
@@ -349,7 +355,9 @@ class GraphTD3Learner:
         teacher_handoff_stage: int = 0,
         teacher_full_release_env_step: int | None = None,
     ) -> float:
-        if int(self.config.warmup_steps) <= 0:
+        if float(self.config.actor_demo_bc_coef) <= 0.0:
+            return 0.0
+        if int(self.config.warmup_steps) <= 0 and not bool(self.config.demo_pretrain_enabled):
             return 0.0
 
         if global_env_steps is None:
@@ -1025,6 +1033,8 @@ class GraphTD3Learner:
                 "actor_q_loss": self.last_actor_q_loss,
                 "actor_entropy": self.last_actor_entropy,
                 "actor_logit_l2": self.last_actor_logit_l2,
+                "actor_row_max_mean": self.last_actor_row_max_mean,
+                "actor_self_allocation_mean": self.last_actor_self_allocation_mean,
                 "actor_reg_loss": self.last_actor_reg_loss,
                 "actor_bc_loss": self.last_actor_bc_loss,
                 "actor_bc_coef": self.last_actor_bc_coef,
@@ -1091,6 +1101,8 @@ class GraphTD3Learner:
             "actor_q_loss": self.last_actor_q_loss,
             "actor_entropy": self.last_actor_entropy,
             "actor_logit_l2": self.last_actor_logit_l2,
+            "actor_row_max_mean": self.last_actor_row_max_mean,
+            "actor_self_allocation_mean": self.last_actor_self_allocation_mean,
             "actor_reg_loss": self.last_actor_reg_loss,
             "actor_bc_loss": self.last_actor_bc_loss,
             "actor_bc_coef": self.last_actor_bc_coef,
@@ -1308,6 +1320,9 @@ class GraphTD3Learner:
         total_actor_q = 0.0
         total_entropy = 0.0
         total_entropy_rows = 0
+        total_row_max = 0.0
+        total_self_allocation = 0.0
+        total_allocation_rows = 0
         total_logit_square = 0.0
         total_valid_logits = int(observations["local_mask"].sum().item())
         total_demo_valid_entries = int((observations["local_mask"] & effective_demo_mask.view(-1, 1, 1)).sum().item())
@@ -1342,6 +1357,10 @@ class GraphTD3Learner:
 
             total_entropy += float(entropy_sum.item())
             total_entropy_rows += entropy_rows
+            valid_row_max = allocation.masked_fill(~chunk_observations["local_mask"], -torch.inf).amax(dim=-1)
+            total_row_max += float(valid_row_max.sum().item())
+            total_self_allocation += float(torch.diagonal(allocation, dim1=-2, dim2=-1).sum().item())
+            total_allocation_rows += int(allocation.shape[0] * allocation.shape[1])
 
             chunk_demo_mask = effective_demo_mask[start:end]
             if bool(chunk_demo_mask.any().item()) and total_demo_valid_entries > 0:
@@ -1372,6 +1391,8 @@ class GraphTD3Learner:
 
         actor_q_loss = -(total_actor_q / float(batch_size))
         mean_entropy = total_entropy / float(max(total_entropy_rows, 1))
+        mean_row_max = total_row_max / float(max(total_allocation_rows, 1))
+        mean_self_allocation = total_self_allocation / float(max(total_allocation_rows, 1))
         mean_logit_l2 = total_logit_square / float(max(total_valid_logits, 1)) if total_valid_logits > 0 else 0.0
         actor_reg_loss = (
             (-float(self.config.actor_entropy_coef) * mean_entropy)
@@ -1388,6 +1409,8 @@ class GraphTD3Learner:
         self.last_actor_q_loss = float(actor_q_loss)
         self.last_actor_entropy = float(mean_entropy)
         self.last_actor_logit_l2 = float(mean_logit_l2)
+        self.last_actor_row_max_mean = float(mean_row_max)
+        self.last_actor_self_allocation_mean = float(mean_self_allocation)
         self.last_actor_reg_loss = float(actor_reg_loss)
         self.last_actor_bc_loss = float(actor_bc_loss)
         self.last_q_filter_enabled = float(q_filter_metrics["q_filter_enabled"])
@@ -1400,6 +1423,8 @@ class GraphTD3Learner:
             "actor_q_loss": self.last_actor_q_loss,
             "actor_entropy": self.last_actor_entropy,
             "actor_logit_l2": self.last_actor_logit_l2,
+            "actor_row_max_mean": self.last_actor_row_max_mean,
+            "actor_self_allocation_mean": self.last_actor_self_allocation_mean,
             "actor_reg_loss": self.last_actor_reg_loss,
             "actor_bc_loss": self.last_actor_bc_loss,
             "actor_bc_coef": self.last_actor_bc_coef,

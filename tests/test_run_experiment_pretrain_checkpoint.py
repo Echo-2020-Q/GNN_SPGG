@@ -18,6 +18,7 @@ if NUMPY_AVAILABLE and TORCH_AVAILABLE:
         build_env_config,
         build_graph,
         build_output_dir,
+        build_trainer_config,
         run_gnn_training_mode,
     )
 
@@ -70,10 +71,52 @@ class RunExperimentDemoPretrainCheckpointTests(unittest.TestCase):
         training["actor_bc_pretrain_updates"] = 1
         training["critic_pretrain_updates"] = 1
         training["demo_pretrain_batch_size"] = 2
+        training["demo_pretrain_validation_episodes"] = 1
+        training["critic_bridge_enabled"] = True
+        training["critic_bridge_env_steps"] = 4
+        training["critic_bridge_updates"] = 1
+        training["critic_bridge_batch_size"] = 2
+        training["critic_bridge_eval_interval"] = 1
+        training["critic_bridge_patience"] = 1
+        training["critic_bridge_teacher_return_aux_schedule"] = "fixed"
+        training["critic_bridge_teacher_return_aux_coef"] = 0.0
         training["save_demo_pretrain_checkpoint"] = True
         training["demo_pretrain_checkpoint_name"] = "demo_pretrained.pt"
         training["stop_after_demo_pretrain"] = True
         return spec
+
+    def test_base_experiment_uses_demo_regularized_actor_only_td3_defaults(self) -> None:
+        config = build_trainer_config(BASE_EXPERIMENT)
+
+        self.assertEqual(
+            BASE_EXPERIMENT["experiment_name"],
+            "0415_demo_regularized_graph_td3_regular_ba_actor_only",
+        )
+        self.assertTrue(bool(config.demo_pretrain_enabled))
+        self.assertFalse(bool(config.teacher_takeover_enabled))
+        self.assertFalse(bool(config.adaptive_teacher_release_enabled))
+        self.assertFalse(bool(config.actor_bc_q_filter_enabled))
+        self.assertEqual(config.replay_strategy, "topology_stratified_mixed")
+        self.assertEqual(tuple(config.replay_topology_names), ("regular", "scale_free"))
+        self.assertAlmostEqual(float(config.replay_demo_fraction), 0.50)
+        self.assertAlmostEqual(float(config.replay_long_term_fraction), 0.35)
+        self.assertAlmostEqual(float(config.replay_recent_fraction), 0.15)
+        self.assertTrue(bool(config.demo_collection_use_domain_randomization))
+        self.assertEqual(tuple(config.demo_collection_network_types), ("regular", "scale_free"))
+        self.assertAlmostEqual(float(config.actor_demo_bc_coef), 0.5)
+        self.assertAlmostEqual(float(config.actor_demo_bc_decay_end_fraction), 0.70)
+        self.assertAlmostEqual(float(config.online_actor_q_coef_initial), 0.1)
+        self.assertAlmostEqual(float(config.online_actor_q_coef_final), 1.0)
+        self.assertAlmostEqual(float(config.online_actor_q_coef_ramp_end_fraction), 0.50)
+        self.assertAlmostEqual(float(config.actor_entropy_coef), 5e-3)
+        self.assertAlmostEqual(float(config.actor_logit_l2_coef), 1e-4)
+        self.assertTrue(bool(config.critic_bridge_enabled))
+        self.assertEqual(config.critic_bridge_behavior_mode, "actor_only")
+        self.assertAlmostEqual(float(config.critic_bridge_teacher_takeover_prob), 0.0)
+        self.assertAlmostEqual(float(config.critic_bridge_teacher_return_aux_coef), 0.0)
+        self.assertEqual(config.critic_bridge_teacher_return_aux_schedule, "fixed")
+        self.assertEqual(int(config.critic_bridge_updates), 1000)
+        self.assertEqual(int(config.demo_pretrain_validation_episodes), 5)
 
     def test_demo_pretrain_checkpoint_save_and_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
