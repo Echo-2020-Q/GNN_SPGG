@@ -103,7 +103,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "0415_40Mspgg_GNN_50Nodes_200length_Fermi_TD3_Regular&BA_Codex'sParam",#CUDACUDACUDA
+    "experiment_name": "0415_demo_regularized_graph_td3_regular_ba_actor_only",#CUDACUDACUDA
     #记得改CUDACUDACUDACUDACUDACUDACUDACUDACUDACUDACUDA
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -453,6 +453,16 @@ BASE_EXPERIMENT = {
         # 只有在该 update 触发评估时才会比较和更新。
         "save_best_checkpoint": True,
 
+        # 是否额外保存表现最好的 top-k checkpoints。
+        # 默认仍按 eval_return_mean 排名，只在触发评估的 update 上更新。
+        "save_top_k_checkpoints": True,
+
+        # top-k checkpoint 保留数量。
+        "top_k_checkpoints": 5,
+
+        # top-k checkpoint 使用的指标名；当前默认对应周期评估返回的 eval_return_mean。
+        "top_k_checkpoint_metric": "eval_return_mean",
+
         # checkpoint 模式：
         # - "lightweight" ：只保存 learner / optimizer / 历史 / update 进度，文件小很多，
         #                   但恢复时不会找回 replay buffer 和 worker 当前环境状态。
@@ -476,11 +486,11 @@ BASE_EXPERIMENT = {
         # Actor loss 里的分配熵正则权重。
         # 这是训练目标里的辅助项，不是环境 reward。
         # > 0 会鼓励分配更平滑、更不那么尖锐。
-        "actor_entropy_coef":  1e-2,
+        "actor_entropy_coef":  5e-3,
 
         # Actor loss 里的 valid logits L2 正则权重。
         # > 0 会抑制 logits 绝对值过大，减轻策略过尖。
-        "actor_logit_l2_coef": 1e-3,
+        "actor_logit_l2_coef": 1e-4,
 
         # TD3 twin critics 的状态编码器隐藏维度。
         # 对应 GraphActionCritic 里 state encoder 的 hidden_dim。
@@ -508,16 +518,16 @@ BASE_EXPERIMENT = {
         # replay 采样策略：
         # - "fifo"                     ：原始单一 FIFO replay
         # - "topology_stratified_mixed": 按拓扑分层，并混合 recent / long_term / demo 三类样本
-        "replay_strategy": "fifo",
+        "replay_strategy": "topology_stratified_mixed",
 
         # replay 中允许显式分层的拓扑类型集合。
         # 设为 None 时，自动继承 domain_randomization.network_types；
         # 若 domain_randomization 未开启，则自动退回到 ["fixed"]。
-        "replay_topology_names": None,
+        "replay_topology_names": ["regular", "scale_free"],
 
         # topology_stratified_mixed 下，recent 缓冲区容量占比。
         # recent 用普通 FIFO，负责跟踪当前训练分布。
-        "replay_recent_fraction": 0.50,
+        "replay_recent_fraction": 0.15,
 
         # topology_stratified_mixed 下，long_term 缓冲区容量占比。
         # long_term 用 reservoir 保留全历史代表样本，负责减轻遗忘。
@@ -525,7 +535,7 @@ BASE_EXPERIMENT = {
 
         # topology_stratified_mixed 下，demo 缓冲区容量占比。
         # 当前 demo 缓冲区专门保留 pool_power_mix 产生的样本。
-        "replay_demo_fraction": 0.15,
+        "replay_demo_fraction": 0.50,
 
         # demo 缓冲区收集哪类 demo 行为源。
         # 当前只支持 "pool_power_mix"。
@@ -594,11 +604,11 @@ BASE_EXPERIMENT = {
         "warmup_actor_bc_coef": 1.0,
 
         # warm-up 结束后，继续在 demo 样本上保留一个较轻的行为克隆锚点。
-        "actor_demo_bc_coef": 0.2,
+        "actor_demo_bc_coef": 0.5,
 
         # warm-up 结束后，demo BC 系数线性衰减到 0 的总 rollout 步数比例。
         # 例如 0.50 表示到总 rollout 步数的 20% 时衰减到 0。
-        "actor_demo_bc_decay_end_fraction": 0.50,
+        "actor_demo_bc_decay_end_fraction": 0.70,
 
         # 是否把 demo BC 的衰减起点对齐到 teacher release 时刻。
         # True 时，BC 不再因为“release 很晚”而在解锁前几乎衰减光。
@@ -628,7 +638,7 @@ BASE_EXPERIMENT = {
         # 1) 固定专家轨迹收集
         # 2) actor BC 预训练
         # 3) critic 预训练
-        "demo_pretrain_enabled": False,
+        "demo_pretrain_enabled": True,
 
         # demo 预收集的总环境步数。
         # 这些步数不会计入 online warm-up，也不会计入 total_env_steps。
@@ -641,11 +651,11 @@ BASE_EXPERIMENT = {
         # demo 预收集时是否启用 domain randomization。
         # True 时默认覆盖 domain_randomization.network_types 的全域拓扑；
         # False 时退回到当前 base env 的固定图。
-        "demo_collection_use_domain_randomization": False,
+        "demo_collection_use_domain_randomization": True,
 
         # demo 预收集允许覆盖的拓扑类型子集。
         # 设为 None 时，自动继承 domain_randomization.network_types。
-        "demo_collection_network_types": None,
+        "demo_collection_network_types": ["regular", "scale_free"],
 
         # demo 预收集运行时：
         # - "parallel_cpu"  : 单独启动并行 CPU teacher workers，保留多进程吞吐，避开 local CUDA rollout worker
@@ -667,6 +677,9 @@ BASE_EXPERIMENT = {
         # 为了避免 validation/quick-check 一次占用过多显存，默认比训练 batch 更小。
         # 设为 None 时，会自动取 min(demo_pretrain_batch_size, 128)。
         "demo_pretrain_validation_batch_size": 128,
+
+        # demo pretrain / bridge 阶段 actor-only quick eval 使用的 episode 数。
+        "demo_pretrain_validation_episodes": 5,
 
         # demo hold-out 验证集比例。
         # 这些样本不会进入 train replay，只用于 pretrain 阶段的验证与 early stopping。
@@ -709,14 +722,14 @@ BASE_EXPERIMENT = {
         # 是否启用 critic bridge phase：
         # actor BC pretrain 后，先用 actor-only / teacher-actor mix rollout 一批 bridge 数据，
         # 再只训练 critic 用标准 TD target 适应 actor 分布，最后再进入 online training。
-        "critic_bridge_enabled": False,
+        "critic_bridge_enabled": True,
 
         # critic bridge collection 的总环境步数。
         # 这些步数不计入 warm-up，也不计入 total_env_steps。
         "critic_bridge_env_steps": 300_000,
 
         # critic bridge 阶段只训练 critic 的最大更新次数。
-        "critic_bridge_updates": 2_000,
+        "critic_bridge_updates": 1_000,
 
         # critic bridge 的 batch 大小。
         # 设为 None 时，回退到 demo_pretrain_batch_size，再回退到 batch_size。
@@ -749,7 +762,7 @@ BASE_EXPERIMENT = {
         # critic bridge 的 teacher-return aux 调度方式：
         # - "fixed"    : 使用固定系数
         # - "adaptive" : 只有 bridge 验证收敛到一定程度后，才把 aux 系数降一档
-        "critic_bridge_teacher_return_aux_schedule": "adaptive",
+        "critic_bridge_teacher_return_aux_schedule": "fixed",
 
         # 当 critic_bridge_teacher_return_aux_schedule="adaptive" 时使用的分档系数。
         # 这些值必须单调不增；bridge 会从左到右逐档衰减。
@@ -770,7 +783,7 @@ BASE_EXPERIMENT = {
         # bridge 主损失仍是 actor 分布上的 TD target；这里额外用 demo replay 上的 teacher-return
         # 保持 critic 不要在过渡阶段完全丢掉 pretrain 学到的价值尺度。
         # 当 schedule="adaptive" 时，这个值只作为兼容回退，不参与主逻辑。
-        "critic_bridge_teacher_return_aux_coef": 0.5,
+        "critic_bridge_teacher_return_aux_coef": 0.0,
 
         # warm-up 结束后，是否让 teacher 先和 actor 混合接管，而不是立刻纯 actor。
         "teacher_takeover_enabled": False,
@@ -850,7 +863,7 @@ BASE_EXPERIMENT = {
 
         # online 阶段 actor 的 Q 项初始系数。
         # 早期让 actor loss 以 BC 为主，Q 为辅。
-        "online_actor_q_coef_initial": 0.5,
+        "online_actor_q_coef_initial": 0.1,
 
         # online 阶段 actor 的 Q 项最终系数。
         "online_actor_q_coef_final": 1.0,
@@ -2088,6 +2101,7 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         critic_pretrain_updates=training.get("critic_pretrain_updates", 0),
         demo_pretrain_batch_size=training.get("demo_pretrain_batch_size"),
         demo_pretrain_validation_batch_size=training.get("demo_pretrain_validation_batch_size"),
+        demo_pretrain_validation_episodes=training.get("demo_pretrain_validation_episodes", 4),
         demo_validation_fraction=training.get("demo_validation_fraction", 0.10),
         demo_pretrain_eval_interval=training.get("demo_pretrain_eval_interval", 200),
         demo_pretrain_patience=training.get("demo_pretrain_patience", 5),
@@ -3484,6 +3498,7 @@ def _format_console_recent_stats_lines(
         ("rollout_payoff_mean", "train_payoff_mean"),
         ("rollout_pool_grown_mean", "train_pool_grown"),
         ("rollout_pool_mean", "train_pool"),
+        ("phase_online_td3", "phase_online"),
         ("eval_cooperation_mean", "f_c"),
         ("eval_gini_mean", "gini"),
         ("eval_return_mean", "return_mean"),
@@ -3499,6 +3514,8 @@ def _format_console_recent_stats_lines(
         ("mean_rollout_reward", "mean_rollout_reward"),
         ("entropy", "entropy"),
         ("actor_logit_l2", "actor_logit_l2"),
+        ("actor_row_max_mean", "actor_row_max"),
+        ("actor_self_allocation_mean", "actor_self_alloc"),
         ("actor_bc_loss", "actor_bc_loss"),
         ("actor_bc_coef", "actor_bc_coef"),
         ("actor_q_coef", "actor_q_coef"),
@@ -3748,6 +3765,9 @@ def _log_tensorboard_static_metadata(
         "static/training/actor_bc_pretrain_updates": float(spec["training"].get("actor_bc_pretrain_updates", 0)),
         "static/training/critic_pretrain_updates": float(spec["training"].get("critic_pretrain_updates", 0)),
         "static/training/demo_critic_pretrain_n_step": float(spec["training"].get("demo_critic_pretrain_n_step", 20)),
+        "static/training/demo_pretrain_validation_episodes": float(
+            spec["training"].get("demo_pretrain_validation_episodes", 4)
+        ),
         "static/training/save_demo_pretrain_checkpoint": float(
             1.0 if spec["training"].get("save_demo_pretrain_checkpoint", False) else 0.0
         ),
@@ -3947,6 +3967,8 @@ def _log_tensorboard_demo_pretrain_summary(
     summary: Mapping[str, Any],
 ) -> None:
     scalar_keys = {
+        "phase_demo_pretrain": "phase/demo_pretrain",
+        "phase_critic_bridge": "phase/critic_bridge",
         "demo_collection_env_steps": "demo_pretrain/demo_collection_env_steps",
         "demo_replay_size_after_collection": "demo_pretrain/demo_replay_size_after_collection",
         "demo_train_replay_size_after_split": "demo_pretrain/demo_train_replay_size_after_split",
@@ -4573,6 +4595,13 @@ def run_gnn_training_mode(
         should_save_checkpoints = bool(training.get("save_checkpoints", False))
         save_final_checkpoint = bool(training.get("save_final_checkpoint", True))
         save_best_checkpoint = bool(training.get("save_best_checkpoint", True))
+        save_top_k_checkpoints = bool(training.get("save_top_k_checkpoints", False))
+        top_k_checkpoints = int(training.get("top_k_checkpoints", 0))
+        top_k_checkpoint_metric = str(training.get("top_k_checkpoint_metric", "eval_return_mean"))
+        if top_k_checkpoints < 0:
+            raise ValueError("training.top_k_checkpoints must be >= 0.")
+        if save_top_k_checkpoints and top_k_checkpoints == 0:
+            save_top_k_checkpoints = False
         save_demo_pretrain_checkpoint = bool(training.get("save_demo_pretrain_checkpoint", False)) if algo == "td3" else False
         demo_pretrain_checkpoint_name = str(training.get("demo_pretrain_checkpoint_name", "demo_pretrained.pt"))
         stop_after_demo_pretrain = bool(training.get("stop_after_demo_pretrain", False)) if algo == "td3" else False
@@ -4593,6 +4622,9 @@ def run_gnn_training_mode(
         if checkpoint_mode not in {"lightweight", "full_resume"}:
             raise ValueError("training.checkpoint_mode must be one of {'lightweight', 'full_resume'}.")
         best_eval_return = float("-inf")
+        top_k_checkpoint_dir = checkpoint_dir / "top_k"
+        top_k_manifest_path = checkpoint_dir / "top_k_manifest.json"
+        top_k_checkpoint_entries: list[dict[str, Any]] = []
         demo_pretrain_checkpoint_path: str | None = None
         demo_pretrain_eval_summary: dict[str, Any] | None = None
         resumed_update = 0
@@ -4629,8 +4661,16 @@ def run_gnn_training_mode(
             except TypeError:
                 return torch.load(checkpoint_path, map_location="cpu")
 
-        if should_save_checkpoints or save_final_checkpoint or save_best_checkpoint or save_demo_pretrain_checkpoint:
+        if (
+            should_save_checkpoints
+            or save_final_checkpoint
+            or save_best_checkpoint
+            or save_top_k_checkpoints
+            or save_demo_pretrain_checkpoint
+        ):
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if save_top_k_checkpoints:
+            top_k_checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         if resume_from_checkpoint:
             checkpoint_path = Path(str(resume_from_checkpoint)).expanduser()
@@ -4718,6 +4758,159 @@ def run_gnn_training_mode(
             print("{0}: {1}".format(log_prefix, checkpoint_path))
             return checkpoint_path
 
+        def _top_k_checkpoint_sort_key(entry: Mapping[str, Any]) -> tuple[float, int, str]:
+            return (
+                -float(entry["score"]),
+                int(entry.get("update", 0)),
+                str(entry.get("path", "")),
+            )
+
+        def _write_top_k_checkpoint_manifest() -> None:
+            if not save_top_k_checkpoints:
+                return
+            ranked_entries = sorted(top_k_checkpoint_entries, key=_top_k_checkpoint_sort_key)
+            for rank, entry in enumerate(ranked_entries, start=1):
+                entry["rank"] = int(rank)
+            top_k_checkpoint_entries[:] = ranked_entries
+            manifest = {
+                "metric": top_k_checkpoint_metric,
+                "mode": "max",
+                "k": int(top_k_checkpoints),
+                "checkpoints": ranked_entries,
+            }
+            top_k_manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+        def _load_top_k_checkpoint_manifest() -> None:
+            if not save_top_k_checkpoints or not top_k_manifest_path.exists():
+                return
+            try:
+                manifest = json.loads(top_k_manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return
+            if str(manifest.get("metric", top_k_checkpoint_metric)) != top_k_checkpoint_metric:
+                return
+
+            loaded_entries: list[dict[str, Any]] = []
+            for raw_entry in manifest.get("checkpoints", []):
+                if not isinstance(raw_entry, Mapping):
+                    continue
+                checkpoint_path = Path(str(raw_entry.get("path", "")))
+                if not checkpoint_path.is_absolute():
+                    checkpoint_path = checkpoint_dir / checkpoint_path
+                if not checkpoint_path.exists():
+                    continue
+                try:
+                    score = float(raw_entry["score"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                loaded_entries.append(
+                    {
+                        "rank": int(raw_entry.get("rank", 0)),
+                        "metric": top_k_checkpoint_metric,
+                        "score": score,
+                        "update": int(raw_entry.get("update", 0)),
+                        "global_env_steps": int(raw_entry.get("global_env_steps", 0)),
+                        "path": str(checkpoint_path),
+                    }
+                )
+            top_k_checkpoint_entries[:] = sorted(loaded_entries, key=_top_k_checkpoint_sort_key)[
+                :top_k_checkpoints
+            ]
+            _write_top_k_checkpoint_manifest()
+
+        def _format_top_k_checkpoint_score(score: float) -> str:
+            return "{0:.6f}".format(score).replace("-", "m").replace(".", "p")
+
+        def _sanitize_checkpoint_metric_name(metric_name: str) -> str:
+            safe_chars = []
+            for char in metric_name:
+                if char.isalnum() or char in {"_", "-"}:
+                    safe_chars.append(char)
+                else:
+                    safe_chars.append("_")
+            return "".join(safe_chars).strip("_") or "metric"
+
+        def _next_top_k_checkpoint_filename(update: int, score: float) -> str:
+            metric_name = _sanitize_checkpoint_metric_name(top_k_checkpoint_metric)
+            score_text = _format_top_k_checkpoint_score(score)
+            base = "top_k/{0}_update_{1:06d}_score_{2}".format(metric_name, update, score_text)
+            candidate = "{0}.pt".format(base)
+            suffix = 1
+            while (checkpoint_dir / candidate).exists():
+                suffix += 1
+                candidate = "{0}_v{1}.pt".format(base, suffix)
+            return candidate
+
+        def _maybe_save_top_k_checkpoint(
+            metrics: Mapping[str, float],
+            *,
+            extra_payload: Mapping[str, Any] | None = None,
+        ) -> Path | None:
+            if not save_top_k_checkpoints or top_k_checkpoint_metric not in metrics:
+                return None
+            metric_value = float(metrics[top_k_checkpoint_metric])
+            if not bool(np.isfinite(metric_value)):
+                return None
+            worst_kept_score = (
+                min(float(entry["score"]) for entry in top_k_checkpoint_entries)
+                if top_k_checkpoint_entries
+                else float("-inf")
+            )
+            if len(top_k_checkpoint_entries) >= top_k_checkpoints and metric_value <= worst_kept_score:
+                return None
+
+            update = int(metrics["update"])
+            checkpoint_filename = _next_top_k_checkpoint_filename(update, metric_value)
+            payload_extra = {
+                "top_k_checkpoint_metric": top_k_checkpoint_metric,
+                "top_k_checkpoint_score": metric_value,
+            }
+            if extra_payload is not None:
+                payload_extra.update(dict(extra_payload))
+            checkpoint_path = _save_checkpoint(
+                checkpoint_filename,
+                update=update,
+                metrics=metrics,
+                extra_payload=payload_extra,
+                log_prefix="Top-k checkpoint saved",
+            )
+            top_k_checkpoint_entries.append(
+                {
+                    "rank": 0,
+                    "metric": top_k_checkpoint_metric,
+                    "score": metric_value,
+                    "update": update,
+                    "global_env_steps": int(metrics.get("global_env_steps", 0)),
+                    "path": str(checkpoint_path),
+                }
+            )
+            ranked_entries = sorted(top_k_checkpoint_entries, key=_top_k_checkpoint_sort_key)
+            kept_entries = ranked_entries[:top_k_checkpoints]
+            removed_entries = ranked_entries[top_k_checkpoints:]
+            top_k_checkpoint_entries[:] = kept_entries
+            for entry in removed_entries:
+                old_path = Path(str(entry.get("path", "")))
+                try:
+                    if not old_path.is_absolute():
+                        old_path = checkpoint_dir / old_path
+                    resolved_old_path = old_path.resolve()
+                    resolved_top_k_dir = top_k_checkpoint_dir.resolve()
+                    if resolved_top_k_dir not in resolved_old_path.parents:
+                        continue
+                    if resolved_old_path.exists():
+                        old_path = resolved_old_path
+                        old_path.unlink()
+                        print("Top-k checkpoint pruned: {0}".format(old_path))
+                except OSError:
+                    pass
+            _write_top_k_checkpoint_manifest()
+            return checkpoint_path
+
+        _load_top_k_checkpoint_manifest()
+
         def _build_demo_pretrain_eval_summary(
             *,
             num_episodes: int,
@@ -4752,6 +4945,7 @@ def run_gnn_training_mode(
                 if eval_return > best_eval_return:
                     best_eval_return = eval_return
                     _save_checkpoint("best_eval.pt", update=update, metrics=metrics)
+            _maybe_save_top_k_checkpoint(metrics)
             if writer is not None:
                 _log_tensorboard_update_metrics(
                     writer,
@@ -4845,7 +5039,7 @@ def run_gnn_training_mode(
                     _log_tensorboard_demo_pretrain_summary(writer, demo_pretrain_summary)
                 demo_pretrain_summary_logged = True
 
-            demo_pretrain_eval_episodes = max(1, min(int(effective_trainer_config.eval_episodes), 4))
+            demo_pretrain_eval_episodes = max(1, int(effective_trainer_config.demo_pretrain_validation_episodes))
             raw_demo_pretrain_eval = trainer.evaluate(num_episodes=demo_pretrain_eval_episodes)
             pretrain_eval_return = float(raw_demo_pretrain_eval.get("return_mean", 0.0))
             best_eval_return = pretrain_eval_return
@@ -4886,6 +5080,10 @@ def run_gnn_training_mode(
                 raw_metrics=raw_demo_pretrain_eval,
                 checkpoint_path=demo_pretrain_checkpoint_path,
             )
+            _maybe_save_top_k_checkpoint(
+                pretrain_eval_metrics,
+                extra_payload={"demo_pretrain_eval_summary": dict(demo_pretrain_eval_summary)},
+            )
             if demo_pretrain_checkpoint_path is not None:
                 enriched_checkpoint_path = Path(demo_pretrain_checkpoint_path)
                 checkpoint_payload = _load_checkpoint_payload(enriched_checkpoint_path)
@@ -4913,6 +5111,7 @@ def run_gnn_training_mode(
                     "demo_pretrain_checkpoint_path": demo_pretrain_checkpoint_path,
                     "stopped_after_demo_pretrain": True,
                     "history": [],
+                    "top_k_checkpoints": [dict(entry) for entry in top_k_checkpoint_entries],
                     "post_training_eval_model_source": (
                         "demo_pretrain_checkpoint" if demo_pretrain_checkpoint_path is not None else "demo_pretrain_eval"
                     ),
@@ -5029,6 +5228,7 @@ def run_gnn_training_mode(
             "demo_pretrain_checkpoint_path": demo_pretrain_checkpoint_path,
             "stopped_after_demo_pretrain": False,
             "history": history,
+            "top_k_checkpoints": [dict(entry) for entry in top_k_checkpoint_entries],
             "post_training_eval_model_source": post_training_eval_model_source,
             "post_training_eval_checkpoint": post_training_eval_checkpoint,
             "post_training_evaluation": evaluation_summaries,
