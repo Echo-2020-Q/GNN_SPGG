@@ -103,7 +103,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "0415_demo_regularized_graph_td3_regular_ba_actor_only_qoff_diagnostic",#CUDACUDACUDA
+    "experiment_name": "0416_demo_regularized_graph_td3_regular_ba_guard/BC_floor/Q_cap",#CUDACUDACUDA
     #记得改CUDACUDACUDACUDACUDACUDACUDACUDACUDACUDACUDA
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -419,7 +419,7 @@ BASE_EXPERIMENT = {
         "learning_rate": 1e-4,
 
         # Actor 学习率。
-        "actor_lr":  3e-6,
+        "actor_lr":  1e-5,
 
         # Critic 学习率。
         "critic_lr":  2e-5,
@@ -486,11 +486,11 @@ BASE_EXPERIMENT = {
         # Actor loss 里的分配熵正则权重。
         # 这是训练目标里的辅助项，不是环境 reward。
         # > 0 会鼓励分配更平滑、更不那么尖锐。
-        "actor_entropy_coef":  5e-3,
+        "actor_entropy_coef":  1e-3,
 
         # Actor loss 里的 valid logits L2 正则权重。
         # > 0 会抑制 logits 绝对值过大，减轻策略过尖。
-        "actor_logit_l2_coef": 1e-4,
+        "actor_logit_l2_coef": 1e-5,
 
         # TD3 twin critics 的状态编码器隐藏维度。
         # 对应 GraphActionCritic 里 state encoder 的 hidden_dim。
@@ -609,6 +609,10 @@ BASE_EXPERIMENT = {
         # warm-up 结束后，demo BC 系数线性衰减到 0 的总 rollout 步数比例。
         # 例如 0.50 表示到总 rollout 步数的 20% 时衰减到 0。
         "actor_demo_bc_decay_end_fraction": 1.0,
+
+        # demo BC 的最小保底系数。
+        # 训练后期即使 schedule 衰减完成，也至少保留这么强的 imitation 锚点。
+        "actor_demo_bc_min_coef": 0.25,
 
         # 是否把 demo BC 的衰减起点对齐到 teacher release 时刻。
         # True 时，BC 不再因为“release 很晚”而在解锁前几乎衰减光。
@@ -863,13 +867,13 @@ BASE_EXPERIMENT = {
 
         # online 阶段 actor 的 Q 项初始系数。
         # 早期让 actor loss 以 BC 为主，Q 为辅。
-        "online_actor_q_coef_initial": 0.0,
+        "online_actor_q_coef_initial": 0.02,
 
         # online 阶段 actor 的 Q 项最终系数。
-        "online_actor_q_coef_final": 0.0,
+        "online_actor_q_coef_final": 0.1,
 
         # actor Q 系数从 initial 线性升到 final 的总 rollout 步数比例。
-        "online_actor_q_coef_ramp_end_fraction": 1.0,
+        "online_actor_q_coef_ramp_end_fraction": 0.4,
 
         # 是否把 actor Q ramp 的起点对齐到 teacher release 时刻。
         # True 时，release 晚不会导致 actor_q 一解锁就接近满强度。
@@ -878,6 +882,10 @@ BASE_EXPERIMENT = {
         # 是否按 handoff stage 控制 actor Q：
         # stage 1 维持 initial，stage 2 才开始真正 ramp。
         "online_actor_q_stage_aware": False,
+
+        # 是否启用 periodic eval 驱动的 regression guard。
+        # 它会在性能连续退化时先降温，再 actor rollback，最坏情况下 full rollback。
+        "regression_guard_enabled": True,
 
         # critic 损失类型：
         # - "mse"
@@ -899,7 +907,7 @@ BASE_EXPERIMENT = {
         "gradient_steps_per_update": 2,
 
         # TD3 delayed policy update 频率。
-        "policy_delay": 8,
+        "policy_delay": 4,
 
         # 将实际合作率过低的 transition 视为塌缩样本。
         "replay_collapse_fc_threshold": 0.10,
@@ -2082,6 +2090,7 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
         warmup_actor_bc_coef=training.get("warmup_actor_bc_coef", 1.0),
         actor_demo_bc_coef=training.get("actor_demo_bc_coef", 0.25),
         actor_demo_bc_decay_end_fraction=training.get("actor_demo_bc_decay_end_fraction", 0.50),
+        actor_demo_bc_min_coef=training.get("actor_demo_bc_min_coef", 0.0),
         actor_demo_bc_decay_from_teacher_release=training.get(
             "actor_demo_bc_decay_from_teacher_release",
             True,
@@ -2201,6 +2210,109 @@ def build_trainer_config(spec: Mapping[str, Any]) -> Any:
             True,
         ),
         online_actor_q_stage_aware=training.get("online_actor_q_stage_aware", True),
+        regression_guard_enabled=training.get("regression_guard_enabled", False),
+        regression_guard_stable_min_cooperation=training.get(
+            "regression_guard_stable_min_cooperation",
+            0.95,
+        ),
+        regression_guard_stable_max_collapse_rate=training.get(
+            "regression_guard_stable_max_collapse_rate",
+            0.05,
+        ),
+        regression_guard_stable_required_evals=training.get(
+            "regression_guard_stable_required_evals",
+            2,
+        ),
+        regression_guard_mild_return_ratio=training.get("regression_guard_mild_return_ratio", 0.96),
+        regression_guard_mild_cooperation_ratio=training.get(
+            "regression_guard_mild_cooperation_ratio",
+            0.95,
+        ),
+        regression_guard_mild_max_collapse_rate=training.get(
+            "regression_guard_mild_max_collapse_rate",
+            0.05,
+        ),
+        regression_guard_mild_required_evals=training.get("regression_guard_mild_required_evals", 2),
+        regression_guard_mild_actor_lr_scale=training.get(
+            "regression_guard_mild_actor_lr_scale",
+            0.5,
+        ),
+        regression_guard_mild_actor_q_cap=training.get("regression_guard_mild_actor_q_cap", 0.05),
+        regression_guard_mild_actor_bc_floor=training.get(
+            "regression_guard_mild_actor_bc_floor",
+            0.30,
+        ),
+        regression_guard_mild_cooldown_evals=training.get("regression_guard_mild_cooldown_evals", 2),
+        regression_guard_moderate_return_ratio=training.get(
+            "regression_guard_moderate_return_ratio",
+            0.90,
+        ),
+        regression_guard_moderate_min_cooperation=training.get(
+            "regression_guard_moderate_min_cooperation",
+            0.85,
+        ),
+        regression_guard_moderate_max_collapse_rate=training.get(
+            "regression_guard_moderate_max_collapse_rate",
+            0.15,
+        ),
+        regression_guard_moderate_actor_lr_scale=training.get(
+            "regression_guard_moderate_actor_lr_scale",
+            0.5,
+        ),
+        regression_guard_moderate_actor_q_cap=training.get(
+            "regression_guard_moderate_actor_q_cap",
+            0.03,
+        ),
+        regression_guard_moderate_actor_bc_floor=training.get(
+            "regression_guard_moderate_actor_bc_floor",
+            0.40,
+        ),
+        regression_guard_moderate_cooldown_evals=training.get(
+            "regression_guard_moderate_cooldown_evals",
+            2,
+        ),
+        regression_guard_severe_return_ratio=training.get("regression_guard_severe_return_ratio", 0.80),
+        regression_guard_severe_min_cooperation=training.get(
+            "regression_guard_severe_min_cooperation",
+            0.70,
+        ),
+        regression_guard_severe_max_collapse_rate=training.get(
+            "regression_guard_severe_max_collapse_rate",
+            0.30,
+        ),
+        regression_guard_severe_actor_lr_scale=training.get(
+            "regression_guard_severe_actor_lr_scale",
+            0.25,
+        ),
+        regression_guard_severe_critic_lr_scale=training.get(
+            "regression_guard_severe_critic_lr_scale",
+            0.5,
+        ),
+        regression_guard_severe_actor_q_cap=training.get("regression_guard_severe_actor_q_cap", 0.0),
+        regression_guard_severe_actor_bc_floor=training.get(
+            "regression_guard_severe_actor_bc_floor",
+            0.50,
+        ),
+        regression_guard_severe_cooldown_evals=training.get(
+            "regression_guard_severe_cooldown_evals",
+            1,
+        ),
+        regression_guard_recovery_return_ratio=training.get(
+            "regression_guard_recovery_return_ratio",
+            0.97,
+        ),
+        regression_guard_recovery_cooperation_ratio=training.get(
+            "regression_guard_recovery_cooperation_ratio",
+            0.95,
+        ),
+        regression_guard_recovery_max_collapse_rate=training.get(
+            "regression_guard_recovery_max_collapse_rate",
+            0.05,
+        ),
+        regression_guard_recovery_required_evals=training.get(
+            "regression_guard_recovery_required_evals",
+            2,
+        ),
         critic_loss_type=training.get("critic_loss_type", "huber"),
         critic_huber_delta=training.get("critic_huber_delta", 1.0),
         actor_grad_clip_norm=training.get("actor_grad_clip_norm", 5.0),
@@ -4291,12 +4403,70 @@ def run_trained_policy_evaluation(
     env_config: SPGGConfig,
     policy: Any,
     output_dir: Path,
+    eval_env_factories: Optional[Sequence[Any]] = None,
 ) -> List[Dict[str, float]]:
     import torch
 
-    eval_env = SPGGEnv(env_config, graph)
     episode_summaries: List[Dict[str, float]] = []
     rollout = spec["rollout"]
+    episode_counter = 0
+
+    if eval_env_factories:
+        base_seed = int(spec["seed"]) + 10_000
+        for family_index, factory in enumerate(eval_env_factories):
+            family_rng = np.random.default_rng(base_seed + family_index)
+            for local_episode_index in range(1, rollout["post_training_eval_episodes"] + 1):
+                episode_counter += 1
+                eval_env, metadata = factory.sample_environment(family_rng)
+                eval_graph = {
+                    node: list(neighbors)
+                    for node, neighbors in enumerate(eval_env.graph.neighbors)
+                }
+                network_type = str(metadata.get("network_type", "unknown"))
+                observation = eval_env.reset(seed=base_seed + family_index * 10_000 + local_episode_index)
+                done = False
+                episode_return = 0.0
+                time_index = 0
+                history = [capture_record(time_index, observation)]
+
+                while not done:
+                    with torch.no_grad():
+                        action_output = policy.deterministic_action(observation)
+                    allocation = action_output.allocation_matrix.detach().cpu().numpy()
+                    observation, reward, done, info = eval_env.step(allocation)
+                    time_index += 1
+                    episode_return += reward
+                    history.append(capture_record(time_index, observation, reward=reward, info=info))
+
+                summary = summarize_episode(history)
+                summary["episode_return"] = float(episode_return)
+                summary["episode_index"] = float(episode_counter)
+                summary["family_episode_index"] = float(local_episode_index)
+                summary["network_type"] = network_type
+                episode_summaries.append(summary)
+
+                print(
+                    "[Post-Train Eval {0:03d}] network={1} return={2:.6f}, final_actual_cooperation={3:.6f}, final_gini={4:.6f}".format(
+                        episode_counter,
+                        network_type,
+                        episode_return,
+                        summary["final_actual_cooperation"],
+                        summary["final_gini"],
+                    )
+                )
+
+                save_visualizations_for_history(
+                    spec=spec,
+                    graph=eval_graph,
+                    history=history,
+                    output_dir=output_dir,
+                    episode_index=episode_counter,
+                    phase_name="post_train_eval_{0}".format(network_type),
+                )
+
+        return episode_summaries
+
+    eval_env = SPGGEnv(env_config, graph)
 
     for episode_index in range(1, rollout["post_training_eval_episodes"] + 1):
         observation = eval_env.reset(seed=spec["seed"] + 10_000 + episode_index)
@@ -4564,6 +4734,39 @@ def run_gnn_training_mode(
                     trainer_config.critic_huber_delta,
                     trainer_config.actor_grad_clip_norm,
                     trainer_config.critic_grad_clip_norm,
+                )
+            )
+            print(
+                "Guard CFG: enabled={0}, bc_floor={1}, stable(f_c>={2:.2f}, collapse<={3:.2f}, need={4}), mild(need={5}, return<{6:.2f}xbest, f_c<{7:.2f}xbest, collapse>{8:.2f}, actor_lr*={9:.2f}, actor_q<={10:.2f}, bc>={11:.2f}), moderate(return<{12:.2f}xbest, f_c<{13:.2f}, collapse>{14:.2f}, actor rollback, actor_lr*={15:.2f}, actor_q<={16:.2f}, bc>={17:.2f}), severe(return<{18:.2f}xbest, f_c<{19:.2f}, collapse>{20:.2f}, full rollback, actor_lr*={21:.2f}, critic_lr*={22:.2f}, actor_q<={23:.2f}, bc>={24:.2f}), recovery(return>={25:.2f}xbest, f_c>={26:.2f}xbest, collapse<={27:.2f}, need={28})".format(
+                    trainer_config.regression_guard_enabled,
+                    trainer_config.actor_demo_bc_min_coef,
+                    trainer_config.regression_guard_stable_min_cooperation,
+                    trainer_config.regression_guard_stable_max_collapse_rate,
+                    trainer_config.regression_guard_stable_required_evals,
+                    trainer_config.regression_guard_mild_required_evals,
+                    trainer_config.regression_guard_mild_return_ratio,
+                    trainer_config.regression_guard_mild_cooperation_ratio,
+                    trainer_config.regression_guard_mild_max_collapse_rate,
+                    trainer_config.regression_guard_mild_actor_lr_scale,
+                    trainer_config.regression_guard_mild_actor_q_cap,
+                    trainer_config.regression_guard_mild_actor_bc_floor,
+                    trainer_config.regression_guard_moderate_return_ratio,
+                    trainer_config.regression_guard_moderate_min_cooperation,
+                    trainer_config.regression_guard_moderate_max_collapse_rate,
+                    trainer_config.regression_guard_moderate_actor_lr_scale,
+                    trainer_config.regression_guard_moderate_actor_q_cap,
+                    trainer_config.regression_guard_moderate_actor_bc_floor,
+                    trainer_config.regression_guard_severe_return_ratio,
+                    trainer_config.regression_guard_severe_min_cooperation,
+                    trainer_config.regression_guard_severe_max_collapse_rate,
+                    trainer_config.regression_guard_severe_actor_lr_scale,
+                    trainer_config.regression_guard_severe_critic_lr_scale,
+                    trainer_config.regression_guard_severe_actor_q_cap,
+                    trainer_config.regression_guard_severe_actor_bc_floor,
+                    trainer_config.regression_guard_recovery_return_ratio,
+                    trainer_config.regression_guard_recovery_cooperation_ratio,
+                    trainer_config.regression_guard_recovery_max_collapse_rate,
+                    trainer_config.regression_guard_recovery_required_evals,
                 )
             )
         print(
@@ -5235,6 +5438,7 @@ def run_gnn_training_mode(
             env_config=env_config,
             policy=policy,
             output_dir=output_dir,
+            eval_env_factories=getattr(trainer.evaluator, "env_factories", None),
         )
         post_training_eval_summary: dict[str, float] | None = None
         if evaluation_summaries:
