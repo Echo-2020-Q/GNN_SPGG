@@ -23,6 +23,15 @@ TOPOLOGY_NAME_TO_ID: dict[str, int] = {
 }
 TOPOLOGY_ID_TO_NAME: dict[int, str] = {value: key for key, value in TOPOLOGY_NAME_TO_ID.items()}
 
+REPLAY_SOURCE_NAME_TO_ID: dict[str, int] = {
+    "unknown": 0,
+    "demo": 1,
+    "recent": 2,
+    "long_term": 3,
+    "fifo": 4,
+}
+REPLAY_SOURCE_ID_TO_NAME: dict[int, str] = {value: key for key, value in REPLAY_SOURCE_NAME_TO_ID.items()}
+
 # First-stage tensor replay stores only the observation fields consumed by the
 # actor/critic training path. This keeps semantics unchanged while removing
 # unnecessary CPU memory traffic from unused observation arrays.
@@ -67,6 +76,16 @@ def topology_name_to_id(name: str | None) -> int:
 
 def topology_id_to_name(topology_id: int) -> str:
     return str(TOPOLOGY_ID_TO_NAME.get(int(topology_id), "unknown"))
+
+
+def replay_source_name_to_id(name: str | None) -> int:
+    if name is None:
+        return int(REPLAY_SOURCE_NAME_TO_ID["unknown"])
+    return int(REPLAY_SOURCE_NAME_TO_ID.get(str(name), REPLAY_SOURCE_NAME_TO_ID["unknown"]))
+
+
+def replay_source_id_to_name(source_id: int) -> str:
+    return str(REPLAY_SOURCE_ID_TO_NAME.get(int(source_id), "unknown"))
 
 
 @dataclass
@@ -270,6 +289,7 @@ class TensorReplayBatch:
     pool_power_demo_flag: Tensor
     demo_return_target: Tensor
     demo_return_valid: Tensor
+    replay_source_id: Tensor | None = None
 
     def to(self, device: torch.device | str) -> "TensorReplayBatch":
         return TensorReplayBatch(
@@ -284,6 +304,9 @@ class TensorReplayBatch:
             pool_power_demo_flag=self.pool_power_demo_flag.to(device=device),
             demo_return_target=self.demo_return_target.to(device=device),
             demo_return_valid=self.demo_return_valid.to(device=device),
+            replay_source_id=(
+                None if self.replay_source_id is None else self.replay_source_id.to(device=device)
+            ),
         )
 
     def __len__(self) -> int:
@@ -302,6 +325,9 @@ class TensorReplayBatch:
             pool_power_demo_flag=self.pool_power_demo_flag.detach().cpu().clone(),
             demo_return_target=self.demo_return_target.detach().cpu().clone(),
             demo_return_valid=self.demo_return_valid.detach().cpu().clone(),
+            replay_source_id=(
+                None if self.replay_source_id is None else self.replay_source_id.detach().cpu().clone()
+            ),
         )
 
 

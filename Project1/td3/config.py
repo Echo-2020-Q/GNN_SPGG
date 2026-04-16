@@ -54,6 +54,7 @@ class GraphTD3Config:
     freeze_actor_q_during_warmup: bool = True
     warmup_actor_bc_coef: float = 1.0
     actor_demo_bc_coef: float = 0.25
+    actor_demo_bc_min_coef: float = 0.0
     actor_demo_bc_decay_end_fraction: float = 0.50
     actor_bc_q_filter_enabled: bool = False
     actor_bc_q_filter_margin: float = 0.0
@@ -124,6 +125,37 @@ class GraphTD3Config:
     online_actor_q_coef_ramp_end_fraction: float = 0.30
     online_actor_q_ramp_from_teacher_release: bool = True
     online_actor_q_stage_aware: bool = True
+    regression_guard_enabled: bool = False
+    regression_guard_stable_min_cooperation: float = 0.95
+    regression_guard_stable_max_collapse_rate: float = 0.05
+    regression_guard_stable_required_evals: int = 2
+    regression_guard_mild_return_ratio: float = 0.96
+    regression_guard_mild_cooperation_ratio: float = 0.95
+    regression_guard_mild_max_collapse_rate: float = 0.05
+    regression_guard_mild_required_evals: int = 2
+    regression_guard_mild_actor_lr_scale: float = 0.50
+    regression_guard_mild_actor_q_cap: float = 0.05
+    regression_guard_mild_actor_bc_floor: float = 0.30
+    regression_guard_mild_cooldown_evals: int = 2
+    regression_guard_moderate_return_ratio: float = 0.90
+    regression_guard_moderate_min_cooperation: float = 0.85
+    regression_guard_moderate_max_collapse_rate: float = 0.15
+    regression_guard_moderate_actor_lr_scale: float = 0.50
+    regression_guard_moderate_actor_q_cap: float = 0.03
+    regression_guard_moderate_actor_bc_floor: float = 0.40
+    regression_guard_moderate_cooldown_evals: int = 2
+    regression_guard_severe_return_ratio: float = 0.80
+    regression_guard_severe_min_cooperation: float = 0.70
+    regression_guard_severe_max_collapse_rate: float = 0.30
+    regression_guard_severe_actor_lr_scale: float = 0.25
+    regression_guard_severe_critic_lr_scale: float = 0.50
+    regression_guard_severe_actor_q_cap: float = 0.0
+    regression_guard_severe_actor_bc_floor: float = 0.50
+    regression_guard_severe_cooldown_evals: int = 1
+    regression_guard_recovery_return_ratio: float = 0.97
+    regression_guard_recovery_cooperation_ratio: float = 0.95
+    regression_guard_recovery_max_collapse_rate: float = 0.05
+    regression_guard_recovery_required_evals: int = 2
     critic_loss_type: str = "huber"
     critic_huber_delta: float = 1.0
     actor_grad_clip_norm: float | None = 5.0
@@ -261,8 +293,10 @@ class GraphTD3Config:
             raise ValueError("warmup_actor_bc_coef must be non-negative.")
         if self.actor_demo_bc_coef < 0.0:
             raise ValueError("actor_demo_bc_coef must be non-negative.")
-        if self.actor_demo_bc_decay_end_fraction < 0.0 or self.actor_demo_bc_decay_end_fraction > 1.0:
-            raise ValueError("actor_demo_bc_decay_end_fraction must be in [0, 1].")
+        if self.actor_demo_bc_min_coef < 0.0:
+            raise ValueError("actor_demo_bc_min_coef must be non-negative.")
+        if self.actor_demo_bc_decay_end_fraction < 0.0:
+            raise ValueError("actor_demo_bc_decay_end_fraction must be non-negative.")
         if not isinstance(self.actor_bc_q_filter_enabled, bool):
             raise ValueError("actor_bc_q_filter_enabled must be a bool.")
         if self.actor_bc_q_filter_margin < 0.0:
@@ -425,6 +459,95 @@ class GraphTD3Config:
             raise ValueError("online_actor_q_coef_final must be non-negative.")
         if self.online_actor_q_coef_ramp_end_fraction < 0.0 or self.online_actor_q_coef_ramp_end_fraction > 1.0:
             raise ValueError("online_actor_q_coef_ramp_end_fraction must be in [0, 1].")
+        if not isinstance(self.regression_guard_enabled, bool):
+            raise ValueError("regression_guard_enabled must be a bool.")
+        if self.regression_guard_stable_min_cooperation < 0.0 or self.regression_guard_stable_min_cooperation > 1.0:
+            raise ValueError("regression_guard_stable_min_cooperation must be in [0, 1].")
+        if (
+            self.regression_guard_stable_max_collapse_rate < 0.0
+            or self.regression_guard_stable_max_collapse_rate > 1.0
+        ):
+            raise ValueError("regression_guard_stable_max_collapse_rate must be in [0, 1].")
+        if self.regression_guard_stable_required_evals <= 0:
+            raise ValueError("regression_guard_stable_required_evals must be positive.")
+        if self.regression_guard_mild_return_ratio <= 0.0 or self.regression_guard_mild_return_ratio > 1.0:
+            raise ValueError("regression_guard_mild_return_ratio must be in (0, 1].")
+        if (
+            self.regression_guard_mild_cooperation_ratio <= 0.0
+            or self.regression_guard_mild_cooperation_ratio > 1.0
+        ):
+            raise ValueError("regression_guard_mild_cooperation_ratio must be in (0, 1].")
+        if self.regression_guard_mild_max_collapse_rate < 0.0 or self.regression_guard_mild_max_collapse_rate > 1.0:
+            raise ValueError("regression_guard_mild_max_collapse_rate must be in [0, 1].")
+        if self.regression_guard_mild_required_evals <= 0:
+            raise ValueError("regression_guard_mild_required_evals must be positive.")
+        if self.regression_guard_mild_actor_lr_scale <= 0.0 or self.regression_guard_mild_actor_lr_scale > 1.0:
+            raise ValueError("regression_guard_mild_actor_lr_scale must be in (0, 1].")
+        if self.regression_guard_mild_actor_q_cap < 0.0:
+            raise ValueError("regression_guard_mild_actor_q_cap must be non-negative.")
+        if self.regression_guard_mild_actor_bc_floor < 0.0:
+            raise ValueError("regression_guard_mild_actor_bc_floor must be non-negative.")
+        if self.regression_guard_mild_cooldown_evals <= 0:
+            raise ValueError("regression_guard_mild_cooldown_evals must be positive.")
+        if self.regression_guard_moderate_return_ratio <= 0.0 or self.regression_guard_moderate_return_ratio > 1.0:
+            raise ValueError("regression_guard_moderate_return_ratio must be in (0, 1].")
+        if self.regression_guard_moderate_min_cooperation < 0.0 or self.regression_guard_moderate_min_cooperation > 1.0:
+            raise ValueError("regression_guard_moderate_min_cooperation must be in [0, 1].")
+        if (
+            self.regression_guard_moderate_max_collapse_rate < 0.0
+            or self.regression_guard_moderate_max_collapse_rate > 1.0
+        ):
+            raise ValueError("regression_guard_moderate_max_collapse_rate must be in [0, 1].")
+        if (
+            self.regression_guard_moderate_actor_lr_scale <= 0.0
+            or self.regression_guard_moderate_actor_lr_scale > 1.0
+        ):
+            raise ValueError("regression_guard_moderate_actor_lr_scale must be in (0, 1].")
+        if self.regression_guard_moderate_actor_q_cap < 0.0:
+            raise ValueError("regression_guard_moderate_actor_q_cap must be non-negative.")
+        if self.regression_guard_moderate_actor_bc_floor < 0.0:
+            raise ValueError("regression_guard_moderate_actor_bc_floor must be non-negative.")
+        if self.regression_guard_moderate_cooldown_evals <= 0:
+            raise ValueError("regression_guard_moderate_cooldown_evals must be positive.")
+        if self.regression_guard_severe_return_ratio <= 0.0 or self.regression_guard_severe_return_ratio > 1.0:
+            raise ValueError("regression_guard_severe_return_ratio must be in (0, 1].")
+        if self.regression_guard_severe_min_cooperation < 0.0 or self.regression_guard_severe_min_cooperation > 1.0:
+            raise ValueError("regression_guard_severe_min_cooperation must be in [0, 1].")
+        if (
+            self.regression_guard_severe_max_collapse_rate < 0.0
+            or self.regression_guard_severe_max_collapse_rate > 1.0
+        ):
+            raise ValueError("regression_guard_severe_max_collapse_rate must be in [0, 1].")
+        if self.regression_guard_severe_actor_lr_scale <= 0.0 or self.regression_guard_severe_actor_lr_scale > 1.0:
+            raise ValueError("regression_guard_severe_actor_lr_scale must be in (0, 1].")
+        if (
+            self.regression_guard_severe_critic_lr_scale <= 0.0
+            or self.regression_guard_severe_critic_lr_scale > 1.0
+        ):
+            raise ValueError("regression_guard_severe_critic_lr_scale must be in (0, 1].")
+        if self.regression_guard_severe_actor_q_cap < 0.0:
+            raise ValueError("regression_guard_severe_actor_q_cap must be non-negative.")
+        if self.regression_guard_severe_actor_bc_floor < 0.0:
+            raise ValueError("regression_guard_severe_actor_bc_floor must be non-negative.")
+        if self.regression_guard_severe_cooldown_evals <= 0:
+            raise ValueError("regression_guard_severe_cooldown_evals must be positive.")
+        if (
+            self.regression_guard_recovery_return_ratio <= 0.0
+            or self.regression_guard_recovery_return_ratio > 1.0
+        ):
+            raise ValueError("regression_guard_recovery_return_ratio must be in (0, 1].")
+        if (
+            self.regression_guard_recovery_cooperation_ratio <= 0.0
+            or self.regression_guard_recovery_cooperation_ratio > 1.0
+        ):
+            raise ValueError("regression_guard_recovery_cooperation_ratio must be in (0, 1].")
+        if (
+            self.regression_guard_recovery_max_collapse_rate < 0.0
+            or self.regression_guard_recovery_max_collapse_rate > 1.0
+        ):
+            raise ValueError("regression_guard_recovery_max_collapse_rate must be in [0, 1].")
+        if self.regression_guard_recovery_required_evals <= 0:
+            raise ValueError("regression_guard_recovery_required_evals must be positive.")
         if self.critic_loss_type not in {"mse", "huber"}:
             raise ValueError("critic_loss_type must be one of {'mse', 'huber'}.")
         if self.critic_huber_delta <= 0.0:

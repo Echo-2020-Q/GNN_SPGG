@@ -138,6 +138,14 @@ class GraphTD3Trainer:
         self.teacher_handoff_stage = 0
         self.teacher_handoff_stable_eval_count = 0
         self.teacher_handoff_regression_eval_count = 0
+        self.regression_guard_mode = "normal"
+        self.regression_guard_cooldown_evals_remaining = 0
+        self.regression_guard_consecutive_mild_evals = 0
+        self.regression_guard_recovery_eval_count = 0
+        self.regression_guard_stable_eval_count = 0
+        self.regression_guard_stable_best_metrics: dict[str, float] | None = None
+        self.regression_guard_stable_best_actor_state: dict[str, Any] | None = None
+        self.regression_guard_stable_best_learner_state: dict[str, Any] | None = None
 
     def preload_demo_replay(
         self,
@@ -220,6 +228,11 @@ class GraphTD3Trainer:
         if len(batches) == 1:
             return batches[0].clone()
         first_batch = batches[0]
+        replay_source_id = (
+            torch.cat([batch.replay_source_id for batch in batches], dim=0)
+            if all(batch.replay_source_id is not None for batch in batches)
+            else None
+        )
         return TensorReplayBatch(
             obs={key: torch.cat([batch.obs[key] for batch in batches], dim=0) for key in first_batch.obs},
             action=TensorReplayActionRecord(
@@ -234,6 +247,7 @@ class GraphTD3Trainer:
             pool_power_demo_flag=torch.cat([batch.pool_power_demo_flag for batch in batches], dim=0),
             demo_return_target=torch.cat([batch.demo_return_target for batch in batches], dim=0),
             demo_return_valid=torch.cat([batch.demo_return_valid for batch in batches], dim=0),
+            replay_source_id=replay_source_id,
         )
 
     def _route_demo_batch_to_train_and_val(
@@ -582,6 +596,359 @@ class GraphTD3Trainer:
         metrics["teacher_handoff_regression_eval_count"] = float(self.teacher_handoff_regression_eval_count)
         return metrics
 
+    @staticmethod
+    def _regression_guard_mode_index(mode: str) -> int:
+        return {
+            "normal": 0,
+            "mild": 1,
+            "moderate": 2,
+            "severe": 3,
+        }.get(str(mode), 0)
+
+    def _regression_guard_metrics_base(self) -> dict[str, float]:
+        stable_best = self.regression_guard_stable_best_metrics or {}
+        return {
+            "regression_guard_enabled": 1.0 if bool(self.config.regression_guard_enabled) else 0.0,
+            "regression_guard_mode": float(self._regression_guard_mode_index(self.regression_guard_mode)),
+            "regression_guard_cooldown_evals_remaining": float(self.regression_guard_cooldown_evals_remaining),
+            "regression_guard_mild_eval_count": float(self.regression_guard_consecutive_mild_evals),
+            "regression_guard_recovery_eval_count": float(self.regression_guard_recovery_eval_count),
+            "regression_guard_stable_eval_count": float(self.regression_guard_stable_eval_count),
+            "regression_guard_has_stable_best": 1.0 if self.regression_guard_stable_best_metrics is not None else 0.0,
+            "regression_guard_stable_best_return": float(stable_best.get("eval_return_mean", 0.0)),
+            "regression_guard_stable_best_cooperation": float(stable_best.get("eval_cooperation_mean", 0.0)),
+            "regression_guard_stable_best_collapse_rate": float(stable_best.get("eval_collapse_rate", 0.0)),
+            "regression_guard_stable_best_update": float(stable_best.get("update", 0.0)),
+            "regression_guard_stable_best_global_env_steps": float(stable_best.get("global_env_steps", 0.0)),
+            "regression_guard_stable_best_updated": 0.0,
+            "regression_guard_just_entered_mild": 0.0,
+            "regression_guard_just_entered_moderate": 0.0,
+            "regression_guard_just_entered_severe": 0.0,
+            "regression_guard_just_recovered": 0.0,
+        }
+
+    def _record_regression_guard_stable_best(
+        self,
+        *,
+        update: int,
+        eval_return_mean: float,
+        eval_cooperation_mean: float,
+        eval_collapse_rate: float,
+    ) -> None:
+        self.regression_guard_stable_best_metrics = {
+            "update": float(update),
+            "global_env_steps": float(self.global_env_steps),
+            "eval_return_mean": float(eval_return_mean),
+            "eval_cooperation_mean": float(eval_cooperation_mean),
+            "eval_collapse_rate": float(eval_collapse_rate),
+        }
+        self.regression_guard_stable_best_actor_state = copy.deepcopy(self.learner.actor_checkpoint_state())
+        self.regression_guard_stable_best_learner_state = self._current_learner_state()
+        print(
+            "Regression Guard | stable_best updated | update={0} | t_env={1} | return={2:.6f} | f_c={3:.6f} | collapse={4:.6f}".format(
+                int(update),
+                int(self.global_env_steps),
+                float(eval_return_mean),
+                float(eval_cooperation_mean),
+                float(eval_collapse_rate),
+            )
+        )
+
+    def _activate_regression_guard_mode(
+        self,
+        mode: str,
+        *,
+        actor_lr_scale: float,
+        critic_lr_scale: float,
+        actor_q_cap: float | None,
+        actor_bc_floor: float | None,
+        cooldown_evals: int,
+    ) -> None:
+        self.regression_guard_mode = str(mode)
+        self.regression_guard_cooldown_evals_remaining = max(0, int(cooldown_evals))
+        self.regression_guard_consecutive_mild_evals = 0
+        self.regression_guard_recovery_eval_count = 0
+        self.learner.set_runtime_training_overrides(
+            actor_lr_scale=float(actor_lr_scale),
+            critic_lr_scale=float(critic_lr_scale),
+            actor_q_coef_cap=actor_q_cap,
+            actor_demo_bc_floor=actor_bc_floor,
+        )
+
+    def _enter_regression_guard_mild(
+        self,
+        *,
+        update: int,
+        eval_return_mean: float,
+        eval_cooperation_mean: float,
+        eval_collapse_rate: float,
+    ) -> None:
+        self._activate_regression_guard_mode(
+            "mild",
+            actor_lr_scale=float(self.config.regression_guard_mild_actor_lr_scale),
+            critic_lr_scale=1.0,
+            actor_q_cap=float(self.config.regression_guard_mild_actor_q_cap),
+            actor_bc_floor=float(self.config.regression_guard_mild_actor_bc_floor),
+            cooldown_evals=int(self.config.regression_guard_mild_cooldown_evals),
+        )
+        print(
+            "Regression Guard | enter mild | update={0} | t_env={1} | return={2:.6f} | f_c={3:.6f} | collapse={4:.6f}".format(
+                int(update),
+                int(self.global_env_steps),
+                float(eval_return_mean),
+                float(eval_cooperation_mean),
+                float(eval_collapse_rate),
+            )
+        )
+
+    def _enter_regression_guard_moderate(
+        self,
+        *,
+        update: int,
+        eval_return_mean: float,
+        eval_cooperation_mean: float,
+        eval_collapse_rate: float,
+    ) -> bool:
+        if self.regression_guard_stable_best_actor_state is not None:
+            self.learner.load_actor_checkpoint_state(self.regression_guard_stable_best_actor_state)
+        self._activate_regression_guard_mode(
+            "moderate",
+            actor_lr_scale=float(self.config.regression_guard_moderate_actor_lr_scale),
+            critic_lr_scale=1.0,
+            actor_q_cap=float(self.config.regression_guard_moderate_actor_q_cap),
+            actor_bc_floor=float(self.config.regression_guard_moderate_actor_bc_floor),
+            cooldown_evals=int(self.config.regression_guard_moderate_cooldown_evals),
+        )
+        print(
+            "Regression Guard | enter moderate(actor rollback) | update={0} | t_env={1} | return={2:.6f} | f_c={3:.6f} | collapse={4:.6f}".format(
+                int(update),
+                int(self.global_env_steps),
+                float(eval_return_mean),
+                float(eval_cooperation_mean),
+                float(eval_collapse_rate),
+            )
+        )
+        return self.regression_guard_stable_best_actor_state is not None
+
+    def _enter_regression_guard_severe(
+        self,
+        *,
+        update: int,
+        eval_return_mean: float,
+        eval_cooperation_mean: float,
+        eval_collapse_rate: float,
+    ) -> bool:
+        if self.regression_guard_stable_best_learner_state is not None:
+            self.learner.load_checkpoint_state(self.regression_guard_stable_best_learner_state)
+        self._activate_regression_guard_mode(
+            "severe",
+            actor_lr_scale=float(self.config.regression_guard_severe_actor_lr_scale),
+            critic_lr_scale=float(self.config.regression_guard_severe_critic_lr_scale),
+            actor_q_cap=float(self.config.regression_guard_severe_actor_q_cap),
+            actor_bc_floor=float(self.config.regression_guard_severe_actor_bc_floor),
+            cooldown_evals=int(self.config.regression_guard_severe_cooldown_evals),
+        )
+        print(
+            "Regression Guard | enter severe(full learner rollback) | update={0} | t_env={1} | return={2:.6f} | f_c={3:.6f} | collapse={4:.6f}".format(
+                int(update),
+                int(self.global_env_steps),
+                float(eval_return_mean),
+                float(eval_cooperation_mean),
+                float(eval_collapse_rate),
+            )
+        )
+        return self.regression_guard_stable_best_learner_state is not None
+
+    def _clear_regression_guard(self, *, update: int) -> None:
+        self.regression_guard_mode = "normal"
+        self.regression_guard_cooldown_evals_remaining = 0
+        self.regression_guard_consecutive_mild_evals = 0
+        self.regression_guard_recovery_eval_count = 0
+        self.learner.clear_runtime_training_overrides()
+        print(
+            "Regression Guard | recovered | update={0} | t_env={1}".format(
+                int(update),
+                int(self.global_env_steps),
+            )
+        )
+
+    def _update_regression_guard(
+        self,
+        *,
+        update: int,
+        eval_return_mean: float,
+        eval_cooperation_mean: float,
+        eval_collapse_rate: float,
+    ) -> tuple[dict[str, float], bool]:
+        metrics = self._regression_guard_metrics_base()
+        if not bool(self.config.regression_guard_enabled):
+            return metrics, False
+
+        sync_actor = False
+        stable_eval_passed = (
+            float(eval_cooperation_mean) >= float(self.config.regression_guard_stable_min_cooperation)
+            and float(eval_collapse_rate) <= float(self.config.regression_guard_stable_max_collapse_rate)
+        )
+        if stable_eval_passed:
+            self.regression_guard_stable_eval_count += 1
+        else:
+            self.regression_guard_stable_eval_count = 0
+
+        stable_best_updated = False
+        stable_required = max(1, int(self.config.regression_guard_stable_required_evals))
+        current_best_return = None
+        if self.regression_guard_stable_best_metrics is not None:
+            current_best_return = float(self.regression_guard_stable_best_metrics.get("eval_return_mean", 0.0))
+        if self.regression_guard_stable_eval_count >= stable_required:
+            if current_best_return is None or float(eval_return_mean) > current_best_return:
+                self._record_regression_guard_stable_best(
+                    update=update,
+                    eval_return_mean=eval_return_mean,
+                    eval_cooperation_mean=eval_cooperation_mean,
+                    eval_collapse_rate=eval_collapse_rate,
+                )
+                stable_best_updated = True
+
+        if self.regression_guard_stable_best_metrics is None:
+            metrics = self._regression_guard_metrics_base()
+            metrics["regression_guard_stable_best_updated"] = 1.0 if stable_best_updated else 0.0
+            return metrics, False
+
+        stable_best_return = float(self.regression_guard_stable_best_metrics.get("eval_return_mean", 0.0))
+        stable_best_cooperation = float(self.regression_guard_stable_best_metrics.get("eval_cooperation_mean", 0.0))
+
+        mild_signal_count = 0
+        if float(eval_return_mean) < stable_best_return * float(self.config.regression_guard_mild_return_ratio):
+            mild_signal_count += 1
+        if float(eval_cooperation_mean) < stable_best_cooperation * float(
+            self.config.regression_guard_mild_cooperation_ratio
+        ):
+            mild_signal_count += 1
+        if float(eval_collapse_rate) > float(self.config.regression_guard_mild_max_collapse_rate):
+            mild_signal_count += 1
+
+        moderate_trigger = (
+            float(eval_return_mean) < stable_best_return * float(self.config.regression_guard_moderate_return_ratio)
+            or float(eval_cooperation_mean) < float(self.config.regression_guard_moderate_min_cooperation)
+            or float(eval_collapse_rate) > float(self.config.regression_guard_moderate_max_collapse_rate)
+        )
+        severe_trigger = (
+            float(eval_return_mean) < stable_best_return * float(self.config.regression_guard_severe_return_ratio)
+            or float(eval_cooperation_mean) < float(self.config.regression_guard_severe_min_cooperation)
+            or float(eval_collapse_rate) > float(self.config.regression_guard_severe_max_collapse_rate)
+        )
+        recovery_passed = (
+            float(eval_return_mean) >= stable_best_return * float(self.config.regression_guard_recovery_return_ratio)
+            and float(eval_cooperation_mean)
+            >= stable_best_cooperation * float(self.config.regression_guard_recovery_cooperation_ratio)
+            and float(eval_collapse_rate) <= float(self.config.regression_guard_recovery_max_collapse_rate)
+        )
+
+        mode = str(self.regression_guard_mode)
+        if mode == "normal":
+            if severe_trigger:
+                sync_actor = self._enter_regression_guard_severe(
+                    update=update,
+                    eval_return_mean=eval_return_mean,
+                    eval_cooperation_mean=eval_cooperation_mean,
+                    eval_collapse_rate=eval_collapse_rate,
+                )
+                metrics = self._regression_guard_metrics_base()
+                metrics["regression_guard_stable_best_updated"] = 1.0 if stable_best_updated else 0.0
+                metrics["regression_guard_just_entered_severe"] = 1.0
+                return metrics, sync_actor
+            if moderate_trigger:
+                sync_actor = self._enter_regression_guard_moderate(
+                    update=update,
+                    eval_return_mean=eval_return_mean,
+                    eval_cooperation_mean=eval_cooperation_mean,
+                    eval_collapse_rate=eval_collapse_rate,
+                )
+                metrics = self._regression_guard_metrics_base()
+                metrics["regression_guard_stable_best_updated"] = 1.0 if stable_best_updated else 0.0
+                metrics["regression_guard_just_entered_moderate"] = 1.0
+                return metrics, sync_actor
+            if mild_signal_count >= 2:
+                self.regression_guard_consecutive_mild_evals += 1
+            else:
+                self.regression_guard_consecutive_mild_evals = 0
+            if self.regression_guard_consecutive_mild_evals >= int(self.config.regression_guard_mild_required_evals):
+                self._enter_regression_guard_mild(
+                    update=update,
+                    eval_return_mean=eval_return_mean,
+                    eval_cooperation_mean=eval_cooperation_mean,
+                    eval_collapse_rate=eval_collapse_rate,
+                )
+                metrics = self._regression_guard_metrics_base()
+                metrics["regression_guard_stable_best_updated"] = 1.0 if stable_best_updated else 0.0
+                metrics["regression_guard_just_entered_mild"] = 1.0
+                return metrics, False
+            metrics = self._regression_guard_metrics_base()
+            metrics["regression_guard_stable_best_updated"] = 1.0 if stable_best_updated else 0.0
+            return metrics, False
+
+        self.regression_guard_consecutive_mild_evals = 0
+        if severe_trigger and mode != "severe":
+            sync_actor = self._enter_regression_guard_severe(
+                update=update,
+                eval_return_mean=eval_return_mean,
+                eval_cooperation_mean=eval_cooperation_mean,
+                eval_collapse_rate=eval_collapse_rate,
+            )
+            metrics = self._regression_guard_metrics_base()
+            metrics["regression_guard_stable_best_updated"] = 1.0 if stable_best_updated else 0.0
+            metrics["regression_guard_just_entered_severe"] = 1.0
+            return metrics, sync_actor
+        if mode == "mild" and moderate_trigger:
+            sync_actor = self._enter_regression_guard_moderate(
+                update=update,
+                eval_return_mean=eval_return_mean,
+                eval_cooperation_mean=eval_cooperation_mean,
+                eval_collapse_rate=eval_collapse_rate,
+            )
+            metrics = self._regression_guard_metrics_base()
+            metrics["regression_guard_stable_best_updated"] = 1.0 if stable_best_updated else 0.0
+            metrics["regression_guard_just_entered_moderate"] = 1.0
+            return metrics, sync_actor
+
+        if recovery_passed:
+            self.regression_guard_recovery_eval_count += 1
+        else:
+            self.regression_guard_recovery_eval_count = 0
+
+        if self.regression_guard_cooldown_evals_remaining > 0:
+            self.regression_guard_cooldown_evals_remaining -= 1
+
+        if (
+            mode == "mild"
+            and not recovery_passed
+            and self.regression_guard_cooldown_evals_remaining <= 0
+        ):
+            sync_actor = self._enter_regression_guard_moderate(
+                update=update,
+                eval_return_mean=eval_return_mean,
+                eval_cooperation_mean=eval_cooperation_mean,
+                eval_collapse_rate=eval_collapse_rate,
+            )
+            metrics = self._regression_guard_metrics_base()
+            metrics["regression_guard_stable_best_updated"] = 1.0 if stable_best_updated else 0.0
+            metrics["regression_guard_just_entered_moderate"] = 1.0
+            return metrics, sync_actor
+
+        if (
+            self.regression_guard_recovery_eval_count >= int(self.config.regression_guard_recovery_required_evals)
+            and self.regression_guard_cooldown_evals_remaining <= 0
+        ):
+            self._clear_regression_guard(update=update)
+            metrics = self._regression_guard_metrics_base()
+            metrics["regression_guard_stable_best_updated"] = 1.0 if stable_best_updated else 0.0
+            metrics["regression_guard_just_recovered"] = 1.0
+            return metrics, False
+
+        metrics = self._regression_guard_metrics_base()
+        metrics["regression_guard_stable_best_updated"] = 1.0 if stable_best_updated else 0.0
+        return metrics, False
+
     def _shutdown_rollout_runtime(self) -> None:
         for worker in self.workers:
             close_method = getattr(worker, "close", None)
@@ -748,6 +1115,16 @@ class GraphTD3Trainer:
             "teacher_handoff_stage": int(self.teacher_handoff_stage),
             "teacher_handoff_stable_eval_count": int(self.teacher_handoff_stable_eval_count),
             "teacher_handoff_regression_eval_count": int(self.teacher_handoff_regression_eval_count),
+            "regression_guard_mode": str(self.regression_guard_mode),
+            "regression_guard_cooldown_evals_remaining": int(self.regression_guard_cooldown_evals_remaining),
+            "regression_guard_consecutive_mild_evals": int(self.regression_guard_consecutive_mild_evals),
+            "regression_guard_recovery_eval_count": int(self.regression_guard_recovery_eval_count),
+            "regression_guard_stable_eval_count": int(self.regression_guard_stable_eval_count),
+            "regression_guard_stable_best_metrics": (
+                None if self.regression_guard_stable_best_metrics is None else dict(self.regression_guard_stable_best_metrics)
+            ),
+            "regression_guard_stable_best_actor_state": copy.deepcopy(self.regression_guard_stable_best_actor_state),
+            "regression_guard_stable_best_learner_state": copy.deepcopy(self.regression_guard_stable_best_learner_state),
         }
         if checkpoint_mode == "full_resume":
             payload["replay_buffer_state"] = self.replay_buffer.state_dict()
@@ -782,6 +1159,25 @@ class GraphTD3Trainer:
         )
         self.teacher_handoff_stable_eval_count = int(checkpoint.get("teacher_handoff_stable_eval_count", 0))
         self.teacher_handoff_regression_eval_count = int(checkpoint.get("teacher_handoff_regression_eval_count", 0))
+        self.regression_guard_mode = str(checkpoint.get("regression_guard_mode", "normal"))
+        self.regression_guard_cooldown_evals_remaining = int(
+            checkpoint.get("regression_guard_cooldown_evals_remaining", 0)
+        )
+        self.regression_guard_consecutive_mild_evals = int(
+            checkpoint.get("regression_guard_consecutive_mild_evals", 0)
+        )
+        self.regression_guard_recovery_eval_count = int(checkpoint.get("regression_guard_recovery_eval_count", 0))
+        self.regression_guard_stable_eval_count = int(checkpoint.get("regression_guard_stable_eval_count", 0))
+        regression_guard_stable_best_metrics = checkpoint.get("regression_guard_stable_best_metrics")
+        self.regression_guard_stable_best_metrics = (
+            None if regression_guard_stable_best_metrics is None else dict(regression_guard_stable_best_metrics)
+        )
+        self.regression_guard_stable_best_actor_state = copy.deepcopy(
+            checkpoint.get("regression_guard_stable_best_actor_state")
+        )
+        self.regression_guard_stable_best_learner_state = copy.deepcopy(
+            checkpoint.get("regression_guard_stable_best_learner_state")
+        )
         checkpoint_mode = str(
             checkpoint.get(
                 "checkpoint_mode",
@@ -2250,7 +2646,10 @@ class GraphTD3Trainer:
             }
             for key, value in learner_metrics.items():
                 if (
-                    key.startswith("replay_")
+                    key.startswith("actor_")
+                    or key.startswith("critic_")
+                    or key.startswith("replay_")
+                    or key.startswith("runtime_")
                     or key.startswith("q_filter_")
                     or key.startswith("critic_bridge_")
                     or key.endswith("_grad_norm_pre_clip")
@@ -2270,6 +2669,7 @@ class GraphTD3Trainer:
                 if total_behavior_samples > 0.0:
                     ratio = float(behavior_counts.get(source, 0)) / total_behavior_samples
                 metrics["behavior_frac_{0}".format(source)] = ratio
+            metrics.update(self._regression_guard_metrics_base())
 
             if update % self.config.eval_interval == 0 or update == total_updates:
                 evaluation_start = perf_counter()
@@ -2308,6 +2708,18 @@ class GraphTD3Trainer:
                     prefixed_key = "eval_{0}".format(key)
                     if prefixed_key not in metrics:
                         metrics[prefixed_key] = float(value)
+                regression_guard_metrics, should_sync_actor = self._update_regression_guard(
+                    update=update,
+                    eval_return_mean=float(evaluation.get("return_mean", 0.0)),
+                    eval_cooperation_mean=float(evaluation.get("cooperation_mean", 0.0)),
+                    eval_collapse_rate=float(evaluation.get("collapse_rate", 0.0)),
+                )
+                metrics.update(regression_guard_metrics)
+                metrics.update(self.learner.runtime_override_metrics())
+                if should_sync_actor and self.workers:
+                    sync_metrics = self._broadcast_actor_state_to_rollout_runtime()
+                    for key, value in sync_metrics.items():
+                        metrics[key] = float(value)
 
             self.history.append(metrics)
             self.completed_updates = update

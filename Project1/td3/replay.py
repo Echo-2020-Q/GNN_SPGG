@@ -12,6 +12,7 @@ from .data import (
     TensorReplayBatch,
     TensorTransition,
     Transition,
+    replay_source_name_to_id,
     topology_id_to_name,
 )
 
@@ -31,6 +32,11 @@ def _concat_replay_batches(batches: Sequence[TensorReplayBatch]) -> TensorReplay
         return batches[0].clone()
 
     first_batch = batches[0]
+    replay_source_id = (
+        torch.cat([batch.replay_source_id for batch in batches], dim=0)
+        if all(batch.replay_source_id is not None for batch in batches)
+        else None
+    )
     return TensorReplayBatch(
         obs={key: torch.cat([batch.obs[key] for batch in batches], dim=0) for key in first_batch.obs},
         action=TensorReplayActionRecord(
@@ -45,6 +51,7 @@ def _concat_replay_batches(batches: Sequence[TensorReplayBatch]) -> TensorReplay
         pool_power_demo_flag=torch.cat([batch.pool_power_demo_flag for batch in batches], dim=0),
         demo_return_target=torch.cat([batch.demo_return_target for batch in batches], dim=0),
         demo_return_valid=torch.cat([batch.demo_return_valid for batch in batches], dim=0),
+        replay_source_id=replay_source_id,
     )
 
 
@@ -63,6 +70,9 @@ def _slice_replay_batch(batch: TensorReplayBatch, indices: Tensor) -> TensorRepl
         pool_power_demo_flag=batch.pool_power_demo_flag.index_select(0, indices),
         demo_return_target=batch.demo_return_target.index_select(0, indices),
         demo_return_valid=batch.demo_return_valid.index_select(0, indices),
+        replay_source_id=(
+            None if batch.replay_source_id is None else batch.replay_source_id.index_select(0, indices)
+        ),
     )
 
 
@@ -81,6 +91,7 @@ def _slice_replay_batch_range(batch: TensorReplayBatch, start: int, end: int) ->
         pool_power_demo_flag=batch.pool_power_demo_flag[start:end],
         demo_return_target=batch.demo_return_target[start:end],
         demo_return_valid=batch.demo_return_valid[start:end],
+        replay_source_id=None if batch.replay_source_id is None else batch.replay_source_id[start:end],
     )
 
 
@@ -89,6 +100,24 @@ def _shuffle_replay_batch(batch: TensorReplayBatch, rng: np.random.Generator) ->
         return batch
     indices = torch.as_tensor(rng.permutation(len(batch)), dtype=torch.int64, device="cpu")
     return _slice_replay_batch(batch, indices)
+
+
+def _with_replay_source_id(batch: TensorReplayBatch, source_name: str) -> TensorReplayBatch:
+    source_id = replay_source_name_to_id(source_name)
+    return TensorReplayBatch(
+        obs=batch.obs,
+        action=batch.action,
+        reward=batch.reward,
+        next_obs=batch.next_obs,
+        done=batch.done,
+        is_demo=batch.is_demo,
+        collapse_flag=batch.collapse_flag,
+        topology_id=batch.topology_id,
+        pool_power_demo_flag=batch.pool_power_demo_flag,
+        demo_return_target=batch.demo_return_target,
+        demo_return_valid=batch.demo_return_valid,
+        replay_source_id=torch.full((len(batch),), int(source_id), dtype=torch.int64, device=batch.reward.device),
+    )
 
 
 def _split_replay_batch_train_val_impl(
@@ -832,6 +861,7 @@ class _TensorReplayStorage:
                 )
                 if batch is None:
                     raise ValueError("Cannot sample demo batch from an empty replay buffer.")
+                batch = _with_replay_source_id(batch, "demo")
                 topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64, copy=False)
                 topology_counts: dict[str, int] = {}
                 for topology_id in np.unique(topology_ids):
@@ -875,7 +905,7 @@ class _TensorReplayStorage:
                             strict_max_collapse_ratio=True,
                         )
                         if sample is not None:
-                            topology_samples.append(sample)
+                            topology_samples.append(_with_replay_source_id(sample, "demo"))
                             remaining_for_topology -= len(sample)
                     for fallback_storage in (
                         self._recent_storages.get(topology_name),
@@ -892,7 +922,7 @@ class _TensorReplayStorage:
                         )
                         if sample is None:
                             continue
-                        topology_samples.append(sample)
+                        topology_samples.append(_with_replay_source_id(sample, "demo"))
                         remaining_for_topology -= len(sample)
                     if not topology_samples:
                         continue
@@ -934,7 +964,7 @@ class _TensorReplayStorage:
                                     break
                         if sample is None:
                             continue
-                        sampled_batches.append(sample)
+                        sampled_batches.append(_with_replay_source_id(sample, "demo"))
                         actual_topology_counts[topology_name] = actual_topology_counts.get(topology_name, 0) + len(sample)
                         remaining -= len(sample)
                         made_progress = True
@@ -1288,7 +1318,7 @@ class ReplayBuffer:
             )
             if sample is None:
                 continue
-            sampled_batches.append(sample)
+            sampled_batches.append(_with_replay_source_id(sample, source_name))
             sampled_count += len(sample)
             source_counts[source_name] = source_counts.get(source_name, 0) + len(sample)
 
@@ -1304,7 +1334,7 @@ class ReplayBuffer:
                 )
                 if sample is None:
                     continue
-                sampled_batches.append(sample)
+                sampled_batches.append(_with_replay_source_id(sample, source_name))
                 source_counts[source_name] = source_counts.get(source_name, 0) + len(sample)
                 remaining -= len(sample)
 
@@ -1604,6 +1634,7 @@ class ReplayBuffer:
                         device=None,
                         max_collapse_ratio=max_collapse_ratio,
                     )
+                batch = _with_replay_source_id(batch, "fifo")
                 topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64, copy=False)
                 topology_counts: dict[str, int] = {}
                 for topology_id in np.unique(topology_ids):
@@ -1710,6 +1741,7 @@ class ReplayBuffer:
                     )
                 if batch is None:
                     raise ValueError("Cannot sample demo batch from an empty replay buffer.")
+                batch = _with_replay_source_id(batch, "demo")
                 topology_ids = batch.topology_id.detach().cpu().numpy().astype(np.int64, copy=False)
                 topology_counts: dict[str, int] = {}
                 for topology_id in np.unique(topology_ids):
