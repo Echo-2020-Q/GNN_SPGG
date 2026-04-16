@@ -349,7 +349,7 @@ BASE_EXPERIMENT = {
         # 程序内部会按：
         #   total_updates = ceil((warmup_env_steps + total_env_steps) / (num_workers * effective_steps_per_update))
         # 自动换算成 update 次数。
-        "total_env_steps": 2_000_000,#50_000_000=50M,#episode需要用总的steps除以episode_length=200
+        "total_env_steps": 10_000_000,#50_000_000=50M,#episode需要用总的steps除以episode_length=200
 
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
