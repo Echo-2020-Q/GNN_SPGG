@@ -654,6 +654,43 @@ class GraphTD3Trainer:
             )
         )
 
+    def seed_regression_guard_stable_best(
+        self,
+        *,
+        update: int,
+        eval_return_mean: float,
+        eval_cooperation_mean: float,
+        eval_collapse_rate: float,
+        source: str = "manual",
+    ) -> None:
+        if not bool(self.config.regression_guard_enabled):
+            return
+        self.regression_guard_stable_eval_count = max(
+            self.regression_guard_stable_eval_count,
+            max(1, int(self.config.regression_guard_stable_required_evals)),
+        )
+        self.regression_guard_mode = "normal"
+        self.regression_guard_cooldown_evals_remaining = 0
+        self.regression_guard_consecutive_mild_evals = 0
+        self.regression_guard_recovery_eval_count = 0
+        self.learner.clear_runtime_training_overrides()
+        self._record_regression_guard_stable_best(
+            update=update,
+            eval_return_mean=eval_return_mean,
+            eval_cooperation_mean=eval_cooperation_mean,
+            eval_collapse_rate=eval_collapse_rate,
+        )
+        print(
+            "Regression Guard | stable_best seeded from {0} | update={1} | t_env={2} | return={3:.6f} | f_c={4:.6f} | collapse={5:.6f}".format(
+                str(source),
+                int(update),
+                int(self.global_env_steps),
+                float(eval_return_mean),
+                float(eval_cooperation_mean),
+                float(eval_collapse_rate),
+            )
+        )
+
     def _activate_regression_guard_mode(
         self,
         mode: str,

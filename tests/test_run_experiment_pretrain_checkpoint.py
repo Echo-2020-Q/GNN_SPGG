@@ -90,7 +90,7 @@ class RunExperimentDemoPretrainCheckpointTests(unittest.TestCase):
 
         self.assertEqual(
             BASE_EXPERIMENT["experiment_name"],
-            "0415_demo_regularized_graph_td3_regular_ba_actor_only",
+            "0415_demo_regularized_graph_td3_regular_ba_actor_only_qoff_diagnostic",
         )
         self.assertTrue(bool(config.demo_pretrain_enabled))
         self.assertFalse(bool(config.teacher_takeover_enabled))
@@ -103,11 +103,11 @@ class RunExperimentDemoPretrainCheckpointTests(unittest.TestCase):
         self.assertAlmostEqual(float(config.replay_recent_fraction), 0.15)
         self.assertTrue(bool(config.demo_collection_use_domain_randomization))
         self.assertEqual(tuple(config.demo_collection_network_types), ("regular", "scale_free"))
-        self.assertAlmostEqual(float(config.actor_demo_bc_coef), 0.5)
-        self.assertAlmostEqual(float(config.actor_demo_bc_decay_end_fraction), 0.70)
-        self.assertAlmostEqual(float(config.online_actor_q_coef_initial), 0.1)
-        self.assertAlmostEqual(float(config.online_actor_q_coef_final), 1.0)
-        self.assertAlmostEqual(float(config.online_actor_q_coef_ramp_end_fraction), 0.50)
+        self.assertAlmostEqual(float(config.actor_demo_bc_coef), 1.0)
+        self.assertAlmostEqual(float(config.actor_demo_bc_decay_end_fraction), 1.0)
+        self.assertAlmostEqual(float(config.online_actor_q_coef_initial), 0.0)
+        self.assertAlmostEqual(float(config.online_actor_q_coef_final), 0.0)
+        self.assertAlmostEqual(float(config.online_actor_q_coef_ramp_end_fraction), 1.0)
         self.assertAlmostEqual(float(config.actor_entropy_coef), 5e-3)
         self.assertAlmostEqual(float(config.actor_logit_l2_coef), 1e-4)
         self.assertTrue(bool(config.critic_bridge_enabled))

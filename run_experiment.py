@@ -359,7 +359,7 @@ BASE_EXPERIMENT = {
 
         # 每隔多少个全局环境步做一次评估。
         # 程序内部会自动换算成 update 间隔。
-        "eval_interval_env_steps": 100_000,
+        "eval_interval_env_steps": 20_000,
 
         # 兼容旧配置的回退项：只有 total_env_steps 为 None 时才使用。
         "total_updates": None,
@@ -608,11 +608,11 @@ BASE_EXPERIMENT = {
 
         # warm-up 结束后，demo BC 系数线性衰减到 0 的总 rollout 步数比例。
         # 例如 0.50 表示到总 rollout 步数的 20% 时衰减到 0。
-        "actor_demo_bc_decay_end_fraction": 1.0,
+        "actor_demo_bc_decay_end_fraction": 5.0,
 
         # demo BC 的最小保底系数。
         # 训练后期即使 schedule 衰减完成，也至少保留这么强的 imitation 锚点。
-        "actor_demo_bc_min_coef": 0.25,
+        "actor_demo_bc_min_coef": 0.5,
 
         # 是否把 demo BC 的衰减起点对齐到 teacher release 时刻。
         # True 时，BC 不再因为“release 很晚”而在解锁前几乎衰减光。
@@ -867,13 +867,13 @@ BASE_EXPERIMENT = {
 
         # online 阶段 actor 的 Q 项初始系数。
         # 早期让 actor loss 以 BC 为主，Q 为辅。
-        "online_actor_q_coef_initial": 0.02,
+        "online_actor_q_coef_initial": 0.00,
 
         # online 阶段 actor 的 Q 项最终系数。
-        "online_actor_q_coef_final": 0.1,
+        "online_actor_q_coef_final": 0.02,
 
         # actor Q 系数从 initial 线性升到 final 的总 rollout 步数比例。
-        "online_actor_q_coef_ramp_end_fraction": 0.4,
+        "online_actor_q_coef_ramp_end_fraction": 1,
 
         # 是否把 actor Q ramp 的起点对齐到 teacher release 时刻。
         # True 时，release 晚不会导致 actor_q 一解锁就接近满强度。
@@ -886,6 +886,15 @@ BASE_EXPERIMENT = {
         # 是否启用 periodic eval 驱动的 regression guard。
         # 它会在性能连续退化时先降温，再 actor rollback，最坏情况下 full rollback。
         "regression_guard_enabled": True,
+
+        # guard 将一个 checkpoint 记为“稳定基线”时要求的最低合作率。
+        "regression_guard_stable_min_cooperation": 0.90,
+
+        # guard 将一个 checkpoint 记为“稳定基线”时允许的最大塌缩率。
+        "regression_guard_stable_max_collapse_rate": 0.05,
+
+        # 满足稳定条件后，至少连续多少次 periodic eval 才升级为 stable_best。
+        "regression_guard_stable_required_evals": 2,
 
         # critic 损失类型：
         # - "mse"
@@ -907,7 +916,7 @@ BASE_EXPERIMENT = {
         "gradient_steps_per_update": 2,
 
         # TD3 delayed policy update 频率。
-        "policy_delay": 4,
+        "policy_delay": 8,
 
         # 将实际合作率过低的 transition 视为塌缩样本。
         "replay_collapse_fc_threshold": 0.10,
@@ -920,7 +929,7 @@ BASE_EXPERIMENT = {
         "tau": 0.005,
 
         # rollout 时在 logits 空间加噪声的标准差。
-        "rollout_logit_noise_std": 0.20,
+        "rollout_logit_noise_std": 0.05,
 
         # rollout 时 logits 噪声的截断范围。
         "rollout_logit_noise_clip": 0.30,
@@ -5288,6 +5297,13 @@ def run_gnn_training_mode(
                     float(raw_demo_pretrain_eval.get("gini_mean", 0.0)),
                     float(raw_demo_pretrain_eval.get("collapse_rate", 0.0)),
                 )
+            )
+            trainer.seed_regression_guard_stable_best(
+                update=int(trainer.completed_updates),
+                eval_return_mean=pretrain_eval_return,
+                eval_cooperation_mean=float(raw_demo_pretrain_eval.get("cooperation_mean", 0.0)),
+                eval_collapse_rate=float(raw_demo_pretrain_eval.get("collapse_rate", 0.0)),
+                source="demo_pretrain_eval",
             )
 
             if save_best_checkpoint:
