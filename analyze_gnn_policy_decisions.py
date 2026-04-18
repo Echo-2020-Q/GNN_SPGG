@@ -101,7 +101,7 @@ SCRIPT_DEFAULTS = {
     # 设为 None 时，会自动输出到：
     # <run_dir>/policy_analysis/<checkpoint_name去掉后缀>/
     # 如果你想把不同分析结果分开放，改成一个显式路径字符串即可。
-    "output_dir": "D:\\PyCharm_Community_Edition_2024_01_04\\Py_Projects\\GNN_SPGG\\outputs\\Pool_dynamic\\0409_spgg_GNN_50Nodes_200length_Fermi_FixedTopology_StagedTeacher\\policy_analysis_500length",
+    "output_dir": "D:\\PyCharm_Community_Edition_2024_01_04\\Py_Projects\\GNN_SPGG\\outputs\\Pool_dynamic\\0409_spgg_GNN_50Nodes_200length_Fermi_FixedTopology_StagedTeacher\\0416_policy_analysis_200length",
 
     # 要评估的图拓扑类型，多个值用英文逗号分隔。
     # 支持：
@@ -111,7 +111,7 @@ SCRIPT_DEFAULTS = {
     # - ws：Watts-Strogatz small-world 图；
     # - ba：Barabasi-Albert scale-free 图。
     # 当前这个默认值表示：固定模型不变，分别放到 Regular / ER / WS / BA 四种图上做迁移测试。
-    "topologies": "regular,er,ws,ba",
+    "topologies": "regular,ba",
 
     # 每种拓扑下跑多少个 deterministic episode。
     # 越大，统计越稳定，但运行越慢、decision_records.csv 也会更大。
@@ -124,7 +124,7 @@ SCRIPT_DEFAULTS = {
     # 每个 episode 最多分析多少步。
     # 设为 None 表示跑完整个 episode_length。
     # 如果你只是想快速看脚本能不能跑通，或者先做小样本预览，可以改成 5、10、20 之类的小值。
-    "max_steps": 500,
+    "max_steps": 200,
 
     # 是否覆盖分析环境本身的 episode_length。
     # 设为 None：沿用训练时 results.json 里的 episode_length。
@@ -132,8 +132,8 @@ SCRIPT_DEFAULTS = {
     # 注意区分：
     # - episode_length_override 控制环境“最多能跑多长”；
     # - max_steps 控制这次分析“最多截到多少步”。
-    # 如果你想比较 200 步训练模型在 500 步长期演化下的行为，这里就应该设为 500。
-    "episode_length_override": 500,
+    # 如果你想比较 200 步训练模型在 200 步长期演化下的行为，这里就应该设为 200。
+    "episode_length_override": 200,
 
     # 每种拓扑导出多少个“时刻快照”用于画图。
     # 脚本会从整个 rollout 过程里均匀抽取这些时间点。
@@ -174,7 +174,7 @@ SCRIPT_DEFAULTS = {
     # True：会把每一行分配拟合成 labor / equal / self 三种机制的组合，
     #       输出 row_mechanism.csv、scarcity_bins.csv、node_income_decomposition.csv 等。
     # False：跳过这部分，适合你只看拓扑表现或特征扰动时使用。
-    "enable_mechanism_analysis": True,
+    "enable_mechanism_analysis": False,
 
     # 做“P_grown / P_upperbound vs 分配机制”分析时，按多少个分位数区间做分箱统计。
     # 更小：更平滑、更稳；
@@ -700,6 +700,35 @@ def _js_divergence(prob_p: np.ndarray, prob_q: np.ndarray) -> float:
     )
 
 
+def _gini_coefficient(values: np.ndarray) -> float:
+    data = np.asarray(values, dtype=np.float64).reshape(-1)
+    if data.size <= 1:
+        return 0.0
+
+    data = np.clip(data, 0.0, None)
+    total = float(np.sum(data))
+    if total <= 1e-12:
+        return 0.0
+
+    sorted_data = np.sort(data)
+    n = int(sorted_data.size)
+    indices = np.arange(1, n + 1, dtype=np.float64)
+    gini = (2.0 * float(np.sum(indices * sorted_data)) / (float(n) * total)) - (float(n) + 1.0) / float(n)
+    return float(np.clip(gini, 0.0, 1.0))
+
+
+def _sender_row_ginis(allocation_matrix: np.ndarray, local_mask: np.ndarray) -> np.ndarray:
+    mask = np.asarray(local_mask, dtype=bool)
+    allocation = np.asarray(allocation_matrix, dtype=np.float64)
+    num_nodes = int(mask.shape[0])
+    ginis = np.zeros(num_nodes, dtype=np.float64)
+    for sender in range(num_nodes):
+        valid = mask[sender]
+        row = allocation[sender, valid]
+        ginis[sender] = _gini_coefficient(row)
+    return ginis
+
+
 def _fit_labor_equal_lambda(
     allocation_row: np.ndarray,
     labor_row: np.ndarray,
@@ -771,6 +800,16 @@ def compute_feature_importance(
     rng = np.random.default_rng(seed)
     rows: list[dict[str, Any]] = []
 
+    base_sender_ginis = [
+        _sender_row_ginis(
+            snapshot.policy.allocation_matrix,
+            snapshot.observation["local_mask"].astype(bool, copy=False),
+        )
+        for snapshot in snapshots
+    ]
+    base_sender_gini_means = [float(np.mean(ginis)) for ginis in base_sender_ginis]
+    base_sender_gini_mean_overall = float(np.mean(base_sender_gini_means)) if base_sender_gini_means else 0.0
+
     for feature_key in feature_keys:
         perturbed_observations = [
             _perturb_observation(observation, feature_key, perturbation_mode, rng) for observation in observations
@@ -784,8 +823,10 @@ def compute_feature_importance(
         row_entropy_delta_values: list[float] = []
         row_js_values: list[float] = []
         top1_change_values: list[float] = []
+        sender_row_gini_delta_values: list[float] = []
+        sender_row_gini_cf_means: list[float] = []
 
-        for snapshot, perturbed_output in zip(snapshots, perturbed_outputs):
+        for snapshot_index, (snapshot, perturbed_output) in enumerate(zip(snapshots, perturbed_outputs)):
             mask = snapshot.observation["local_mask"].astype(bool, copy=False)
             base_policy = snapshot.policy
 
@@ -793,7 +834,11 @@ def compute_feature_importance(
                 float(np.mean(np.abs(perturbed_output.allocation_matrix[mask] - base_policy.allocation_matrix[mask])))
             )
             transfer_l1_values.append(
-                float(np.mean(np.abs(perturbed_output.transferred_resources[mask] - base_policy.transferred_resources[mask])))
+                float(
+                    np.mean(
+                        np.abs(perturbed_output.transferred_resources[mask] - base_policy.transferred_resources[mask])
+                    )
+                )
             )
             logit_l1_values.append(float(np.mean(np.abs(perturbed_output.logits[mask] - base_policy.logits[mask]))))
 
@@ -825,6 +870,11 @@ def compute_feature_importance(
             row_js_values.append(row_js / normalizer)
             top1_change_values.append(row_top1_switch / normalizer)
 
+            base_ginis = base_sender_ginis[snapshot_index]
+            cf_ginis = _sender_row_ginis(perturbed_output.allocation_matrix, mask)
+            sender_row_gini_delta_values.append(float(np.mean(np.abs(cf_ginis - base_ginis))))
+            sender_row_gini_cf_means.append(float(np.mean(cf_ginis)))
+
         rows.append(
             {
                 "feature": feature_key,
@@ -837,6 +887,11 @@ def compute_feature_importance(
                 "row_entropy_delta_mean": float(np.mean(row_entropy_delta_values)) if row_entropy_delta_values else 0.0,
                 "row_js_divergence_mean": float(np.mean(row_js_values)) if row_js_values else 0.0,
                 "row_top1_change_rate": float(np.mean(top1_change_values)) if top1_change_values else 0.0,
+                "sender_row_gini_base_mean": base_sender_gini_mean_overall,
+                "sender_row_gini_counterfactual_mean": (
+                    float(np.mean(sender_row_gini_cf_means)) if sender_row_gini_cf_means else 0.0
+                ),
+                "sender_row_gini_delta_mean": float(np.mean(sender_row_gini_delta_values)) if sender_row_gini_delta_values else 0.0,
             }
         )
 
@@ -1396,7 +1451,11 @@ def plot_feature_importance(rows: Sequence[Mapping[str, Any]], output_path: Path
     transfer_scores = [float(row["transfer_l1_mean"]) for row in rows]
     top1_scores = [float(row["row_top1_change_rate"]) for row in rows]
 
-    figure, axes = plt.subplots(1, 3, figsize=(16, 6), constrained_layout=True)
+    has_sender_gini = any("sender_row_gini_delta_mean" in row for row in rows)
+    sender_gini_scores = [float(row.get("sender_row_gini_delta_mean", 0.0)) for row in rows]
+
+    panel_count = 4 if has_sender_gini else 3
+    figure, axes = plt.subplots(1, panel_count, figsize=(16 + (4 if has_sender_gini else 0), 6), constrained_layout=True)
     y_positions = np.arange(len(labels))
 
     axes[0].barh(y_positions, allocation_scores, color="#1f77b4")
@@ -1419,6 +1478,146 @@ def plot_feature_importance(rows: Sequence[Mapping[str, Any]], output_path: Path
     axes[2].set_yticks(y_positions)
     axes[2].set_yticklabels(labels)
     axes[2].invert_yaxis()
+
+    if has_sender_gini:
+        axes[3].barh(y_positions, sender_gini_scores, color="#9467bd")
+        axes[3].set_title("Sender Row Gini Delta")
+        axes[3].set_xlabel("Mean |Δ Gini|")
+        axes[3].set_yticks(y_positions)
+        axes[3].set_yticklabels(labels)
+        axes[3].invert_yaxis()
+
+    figure.savefig(output_path, dpi=180)
+    plt.close(figure)
+
+
+def plot_sender_row_gini_feature_summary(rows: Sequence[Mapping[str, Any]], output_path: Path) -> None:
+    if plt is None or not rows:
+        return
+
+    sorted_rows = sorted(rows, key=lambda row: float(row.get("sender_row_gini_delta_mean", 0.0)), reverse=True)
+    labels = [str(row.get("feature", "")) for row in sorted_rows]
+    base_means = [float(row.get("sender_row_gini_base_mean", float("nan"))) for row in sorted_rows]
+    cf_means = [float(row.get("sender_row_gini_counterfactual_mean", float("nan"))) for row in sorted_rows]
+    delta_means = [float(row.get("sender_row_gini_delta_mean", float("nan"))) for row in sorted_rows]
+
+    y_positions = np.arange(len(labels))
+    figure, axes = plt.subplots(1, 2, figsize=(16, 6), constrained_layout=True)
+
+    axes[0].plot(base_means, y_positions, "o", label="base", color="#1f77b4")
+    axes[0].plot(cf_means, y_positions, "o", label="counterfactual", color="#ff7f0e")
+    for idx, (base_value, cf_value) in enumerate(zip(base_means, cf_means)):
+        if np.isfinite(base_value) and np.isfinite(cf_value):
+            axes[0].plot([base_value, cf_value], [idx, idx], color="gray", alpha=0.4, linewidth=1.0)
+
+    axes[0].set_title("Sender Row Gini: Base vs Counterfactual Mean")
+    axes[0].set_xlabel("Mean Gini")
+    axes[0].set_yticks(y_positions)
+    axes[0].set_yticklabels(labels)
+    axes[0].invert_yaxis()
+    axes[0].set_xlim(0.0, 1.0)
+    axes[0].legend()
+
+    axes[1].barh(y_positions, delta_means, color="#9467bd")
+    axes[1].set_title("Sender Row Gini Sensitivity")
+    axes[1].set_xlabel("Mean |Δ Gini| (across senders)")
+    axes[1].set_yticks(y_positions)
+    axes[1].set_yticklabels(labels)
+    axes[1].invert_yaxis()
+
+    finite_deltas = [float(value) for value in delta_means if np.isfinite(value)]
+    if finite_deltas:
+        axes[1].set_xlim(0.0, float(max(finite_deltas)) * 1.05)
+
+    figure.savefig(output_path, dpi=180)
+    plt.close(figure)
+
+
+def plot_sender_row_gini_distribution_for_feature(
+    actor: GNNAllocationPolicy,
+    snapshots: Sequence[Snapshot],
+    *,
+    feature_key: str,
+    perturbation_mode: str,
+    perturbation_seed: int,
+    batch_size: int,
+    output_path: Path,
+) -> None:
+    if plt is None or not snapshots:
+        return
+
+    observations = [snapshot.observation for snapshot in snapshots]
+    rng = np.random.default_rng(int(perturbation_seed))
+    perturbed_observations = [
+        _perturb_observation(observation, feature_key, perturbation_mode, rng) for observation in observations
+    ]
+    perturbed_outputs = _chunked_policy_forward(actor, perturbed_observations, batch_size)
+
+    base_values: list[np.ndarray] = []
+    counterfactual_values: list[np.ndarray] = []
+    for snapshot, perturbed_output in zip(snapshots, perturbed_outputs):
+        mask = snapshot.observation["local_mask"].astype(bool, copy=False)
+        base_values.append(_sender_row_ginis(snapshot.policy.allocation_matrix, mask))
+        counterfactual_values.append(_sender_row_ginis(perturbed_output.allocation_matrix, mask))
+
+    base_flat = np.concatenate(base_values) if base_values else np.empty(0, dtype=np.float64)
+    cf_flat = (
+        np.concatenate(counterfactual_values) if counterfactual_values else np.empty(0, dtype=np.float64)
+    )
+    base_flat = base_flat[np.isfinite(base_flat)]
+    cf_flat = cf_flat[np.isfinite(cf_flat)]
+    if base_flat.size == 0 or cf_flat.size == 0:
+        return
+
+    aligned_delta_mean = float(np.mean(np.abs(cf_flat - base_flat))) if base_flat.size == cf_flat.size else float("nan")
+
+    bins = np.linspace(0.0, 1.0, 41)
+    figure, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+
+    axes[0].hist(base_flat, bins=bins, density=True, alpha=0.6, label="base", color="#1f77b4")
+    axes[0].hist(
+        cf_flat,
+        bins=bins,
+        density=True,
+        alpha=0.6,
+        label=f"cf({feature_key})",
+        color="#ff7f0e",
+    )
+    axes[0].set_title("Sender Row Gini Distribution")
+    axes[0].set_xlabel("Gini")
+    axes[0].set_ylabel("Density")
+    axes[0].set_xlim(0.0, 1.0)
+    axes[0].legend()
+
+    base_sorted = np.sort(base_flat)
+    cf_sorted = np.sort(cf_flat)
+    axes[1].plot(
+        base_sorted,
+        np.arange(1, base_sorted.size + 1, dtype=np.float64) / float(base_sorted.size),
+        label="base",
+        color="#1f77b4",
+    )
+    axes[1].plot(
+        cf_sorted,
+        np.arange(1, cf_sorted.size + 1, dtype=np.float64) / float(cf_sorted.size),
+        label=f"cf({feature_key})",
+        color="#ff7f0e",
+    )
+    axes[1].set_title("Empirical CDF")
+    axes[1].set_xlabel("Gini")
+    axes[1].set_ylabel("CDF")
+    axes[1].set_xlim(0.0, 1.0)
+    axes[1].set_ylim(0.0, 1.0)
+    axes[1].legend()
+
+    figure.suptitle(
+        (
+            f"Feature={feature_key} | mode={perturbation_mode} | "
+            f"base_mean={float(np.mean(base_flat)):.3f} cf_mean={float(np.mean(cf_flat)):.3f} "
+            f"mean|Δ|={aligned_delta_mean:.3f}"
+        ),
+        fontsize=12,
+    )
 
     figure.savefig(output_path, dpi=180)
     plt.close(figure)
@@ -1685,6 +1884,20 @@ def analyze_single_topology(
         )
     if enable_feature_perturbation:
         plot_feature_importance(feature_importance, output_dir / "feature_importance.png")
+        plot_sender_row_gini_feature_summary(feature_importance, output_dir / "sender_row_gini_feature_summary.png")
+
+        if feature_importance:
+            top_row = max(feature_importance, key=lambda row: float(row.get("sender_row_gini_delta_mean", 0.0)))
+            top_feature = str(top_row.get("feature", "unknown"))
+            plot_sender_row_gini_distribution_for_feature(
+                actor,
+                snapshots,
+                feature_key=top_feature,
+                perturbation_mode=perturbation_mode,
+                perturbation_seed=perturbation_seed,
+                batch_size=batch_size,
+                output_path=output_dir / f"sender_row_gini_distribution_{top_feature}.png",
+            )
     if enable_mechanism_analysis:
         plot_scarcity_mechanism_bins(scarcity_bin_rows, output_dir / "scarcity_vs_mechanism.png")
 
