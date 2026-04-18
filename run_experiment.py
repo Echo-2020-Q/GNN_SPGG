@@ -103,7 +103,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "0416_demo_regularized_graph_td3_regular_ba_guard/BC_floor/Q_cap",#CUDACUDACUDA
+    "experiment_name": "0418_demo_guard_strictrecover_lowq_regular_ba",#CUDACUDACUDA
     #记得改CUDACUDACUDACUDACUDACUDACUDACUDACUDACUDACUDA
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -419,7 +419,7 @@ BASE_EXPERIMENT = {
         "learning_rate": 1e-4,
 
         # Actor 学习率。
-        "actor_lr":  1e-5,
+        "actor_lr":  5e-6,
 
         # Critic 学习率。
         "critic_lr":  2e-5,
@@ -870,7 +870,7 @@ BASE_EXPERIMENT = {
         "online_actor_q_coef_initial": 0.00,
 
         # online 阶段 actor 的 Q 项最终系数。
-        "online_actor_q_coef_final": 0.02,
+        "online_actor_q_coef_final": 0.01,
 
         # actor Q 系数从 initial 线性升到 final 的总 rollout 步数比例。
         "online_actor_q_coef_ramp_end_fraction": 1,
@@ -895,6 +895,56 @@ BASE_EXPERIMENT = {
 
         # 满足稳定条件后，至少连续多少次 periodic eval 才升级为 stable_best。
         "regression_guard_stable_required_evals": 2,
+
+        # mild 退化判定：
+        # return 低于 stable_best 的该比例、或 f_c 低于 stable_best 的该比例、
+        # 或 collapse_rate 超过阈值时，会累计 mild 信号。
+        "regression_guard_mild_return_ratio": 0.96,
+        "regression_guard_mild_cooperation_ratio": 0.95,
+        "regression_guard_mild_max_collapse_rate": 0.05,
+
+        # mild 信号至少连续多少次 periodic eval 才真的进入 mild guard。
+        "regression_guard_mild_required_evals": 2,
+
+        # mild guard 期间的降温强度：
+        # actor_lr 会乘以该系数；actor Q 系数会被 cap 到该上限。
+        # actor_demo_bc_min_coef 如果已经更高，那么 mild_actor_bc_floor 不会额外生效。
+        "regression_guard_mild_actor_lr_scale": 0.25,
+        "regression_guard_mild_actor_q_cap": 0.01,
+        "regression_guard_mild_actor_bc_floor": 0.30,
+        "regression_guard_mild_cooldown_evals": 3,
+
+        # moderate 退化判定：
+        # 比 mild 更严格，触发后会做 actor rollback。
+        "regression_guard_moderate_return_ratio": 0.90,
+        "regression_guard_moderate_min_cooperation": 0.85,
+        "regression_guard_moderate_max_collapse_rate": 0.15,
+
+        # moderate guard 期间的降温强度。
+        "regression_guard_moderate_actor_lr_scale": 0.25,
+        "regression_guard_moderate_actor_q_cap": 0.0,
+        "regression_guard_moderate_actor_bc_floor": 0.40,
+        "regression_guard_moderate_cooldown_evals": 3,
+
+        # severe 退化判定：
+        # 触发后会做 full learner rollback。
+        "regression_guard_severe_return_ratio": 0.80,
+        "regression_guard_severe_min_cooperation": 0.70,
+        "regression_guard_severe_max_collapse_rate": 0.30,
+
+        # severe guard 期间的降温强度。
+        "regression_guard_severe_actor_lr_scale": 0.25,
+        "regression_guard_severe_critic_lr_scale": 0.50,
+        "regression_guard_severe_actor_q_cap": 0.0,
+        "regression_guard_severe_actor_bc_floor": 0.50,
+        "regression_guard_severe_cooldown_evals": 2,
+
+        # guard 恢复到 normal 的条件：
+        # 需要 return / f_c 回到 stable_best 的相应比例以上，且连续满足若干次 periodic eval。
+        "regression_guard_recovery_return_ratio": 0.99,
+        "regression_guard_recovery_cooperation_ratio": 0.98,
+        "regression_guard_recovery_max_collapse_rate": 0.05,
+        "regression_guard_recovery_required_evals": 4,
 
         # critic 损失类型：
         # - "mse"
@@ -929,7 +979,7 @@ BASE_EXPERIMENT = {
         "tau": 0.005,
 
         # rollout 时在 logits 空间加噪声的标准差。
-        "rollout_logit_noise_std": 0.05,
+        "rollout_logit_noise_std": 0.02,
 
         # rollout 时 logits 噪声的截断范围。
         "rollout_logit_noise_clip": 0.30,
@@ -995,7 +1045,7 @@ BASE_EXPERIMENT = {
         "collapse_resource_threshold": 1e-6,
 
         # 兼容旧配置的回退项：只有 eval_interval_env_steps 为 None 时才使用。
-        "eval_interval": None,
+        "eval_interval": 20_000,
 
         # 每次评估多少个 episode。
         "eval_episodes": 8,
