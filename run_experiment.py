@@ -103,7 +103,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "0419_3M_demo_guard_relaxrecover_lowq_regular_ba",#CUDACUDACUDA
+    "experiment_name": "0420_3M_demo_guard_fc078_q005_regular_ba",#CUDACUDACUDA
     #记得改CUDACUDACUDACUDACUDACUDACUDACUDACUDACUDACUDA
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -917,12 +917,12 @@ BASE_EXPERIMENT = {
         # moderate 退化判定：
         # 比 mild 更严格，触发后会做 actor rollback。
         "regression_guard_moderate_return_ratio": 0.90,
-        "regression_guard_moderate_min_cooperation": 0.85,
+        "regression_guard_moderate_min_cooperation": 0.78,
         "regression_guard_moderate_max_collapse_rate": 0.15,
 
         # moderate guard 期间的降温强度。
-        "regression_guard_moderate_actor_lr_scale": 0.25,
-        "regression_guard_moderate_actor_q_cap": 0.0,
+        "regression_guard_moderate_actor_lr_scale": 0.5,
+        "regression_guard_moderate_actor_q_cap": 0.005,
         "regression_guard_moderate_actor_bc_floor": 0.40,
         "regression_guard_moderate_cooldown_evals": 3,
 
@@ -942,7 +942,7 @@ BASE_EXPERIMENT = {
         # guard 恢复到 normal 的条件：
         # 需要 return / f_c 回到 stable_best 的相应比例以上，且连续满足若干次 periodic eval。
         "regression_guard_recovery_return_ratio": 0.96,
-        "regression_guard_recovery_cooperation_ratio": 0.93,
+        "regression_guard_recovery_cooperation_ratio": 0.92,
         "regression_guard_recovery_max_collapse_rate": 0.05,
         "regression_guard_recovery_required_evals": 2,
 
