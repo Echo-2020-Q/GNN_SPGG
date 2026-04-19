@@ -103,7 +103,7 @@ def experiment_console_log_context(spec: Mapping[str, Any], output_dir: Path):
 BASE_EXPERIMENT = {
     # 这次实验的名字。
     # 它会决定输出目录名、结果 JSON 中的实验名，也方便你区分不同实验。
-    "experiment_name": "0418_demo_guard_strictrecover_lowq_regular_ba",#CUDACUDACUDA
+    "experiment_name": "0419_3M_demo_guard_relaxrecover_lowq_regular_ba",#CUDACUDACUDA
     #记得改CUDACUDACUDACUDACUDACUDACUDACUDACUDACUDACUDA
     # 全局随机种子。
     # 用来控制网络生成、环境初始化、批量实验中的随机性。
@@ -349,7 +349,7 @@ BASE_EXPERIMENT = {
         # 程序内部会按：
         #   total_updates = ceil((warmup_env_steps + total_env_steps) / (num_workers * effective_steps_per_update))
         # 自动换算成 update 次数。
-        "total_env_steps": 10_000_000,#50_000_000=50M,#episode需要用总的steps除以episode_length=200
+        "total_env_steps": 3_000_000,#50_000_000=50M,#episode需要用总的steps除以episode_length=200
 
         # warm-up 总环境步数。
         # 这是所有 worker 共享的“全局 warm-up 总步数”，不会再乘 num_workers。
@@ -444,7 +444,7 @@ BASE_EXPERIMENT = {
 
         # checkpoint 保存间隔。
         # 例如 100 表示每 100 个 update 保存一次。
-        "checkpoint_interval": 500,
+        "checkpoint_interval": 200,
 
         # 是否额外保存最终 checkpoint。
         "save_final_checkpoint": True,
@@ -941,10 +941,10 @@ BASE_EXPERIMENT = {
 
         # guard 恢复到 normal 的条件：
         # 需要 return / f_c 回到 stable_best 的相应比例以上，且连续满足若干次 periodic eval。
-        "regression_guard_recovery_return_ratio": 0.99,
-        "regression_guard_recovery_cooperation_ratio": 0.98,
+        "regression_guard_recovery_return_ratio": 0.96,
+        "regression_guard_recovery_cooperation_ratio": 0.93,
         "regression_guard_recovery_max_collapse_rate": 0.05,
-        "regression_guard_recovery_required_evals": 4,
+        "regression_guard_recovery_required_evals": 2,
 
         # critic 损失类型：
         # - "mse"

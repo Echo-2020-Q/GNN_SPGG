@@ -78,7 +78,7 @@ SCRIPT_DEFAULTS = {
     # 建议你把这个名字改成能反映配置的形式，比如：
     # 0416_pool_intervention_original_10ep
    # "output_subdir_name": "0418_regu_ba_resourcepool_intervention_policy_mechanism",
-    "output_subdir_name": "0418_regu_ba_2Wlength_policy_mechanism",
+    "output_subdir_name": "0418_total_regu_ba_policy_mechanism",
 
     # 要分析的图拓扑，多个值用英文逗号分隔。
     # 支持：original, regular, er, ws, ba。
@@ -99,13 +99,13 @@ SCRIPT_DEFAULTS = {
     # 设为 None 表示跑完整个 episode_length。
     # 注意它只是“分析截断上限”，不是环境本身的长度定义。
     # 真正一局最多能跑多长，还要看下面的 episode_length_override。
-    "max_steps": 20000,
+    "max_steps": 200,
 
     # 是否覆盖分析环境里的 episode_length。
     # 如果设为 None，就沿用 results.json 里的原始 episode_length。
     # 如果你想看“200 步训练策略在 500 步长期演化下的机制”，这里就设成 500。
     # 只有当这个值 >= max_steps 时，max_steps 才真的可能跑到那么长。
-    "episode_length_override": 20000,
+    "episode_length_override": 200,
 
     # 把 P_grown / P_upperbound 按多少个分位数区间做分箱统计。
     # 这影响的是“自然状态机制分析”的各种分箱表和图，
@@ -228,16 +228,16 @@ SCRIPT_DEFAULTS = {
 
     # RL-Agent 和 Equal Baseline 这两条 resource intervention 曲线，抽样 row 的 step 下界。
     # 当前 Equal 仍然使用 agent rollout 状态做参考，所以和 RL-Agent 共用这一组。
-    "agent_equal_resource_intervention_step_start": None,
+    "agent_equal_resource_intervention_step_start":1,
 
     # RL-Agent 和 Equal Baseline 这两条 resource intervention 曲线，抽样 row 的 step 上界。
-    "agent_equal_resource_intervention_step_end": None,
+    "agent_equal_resource_intervention_step_end": 50,
 
     # Proportional Baseline 这条 resource intervention 曲线，抽样 row 的 step 下界。
-    "proportional_resource_intervention_step_start": None,
+    "proportional_resource_intervention_step_start": 1,
 
     # Proportional Baseline 这条 resource intervention 曲线，抽样 row 的 step 上界。
-    "proportional_resource_intervention_step_end": None,
+    "proportional_resource_intervention_step_end": 50,
 
     # 分析时是否覆盖环境里的 r。
     # - 设为 None：沿用 results.json 里训练时记录的 r；
