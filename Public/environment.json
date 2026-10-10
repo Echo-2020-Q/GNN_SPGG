@@ -1,0 +1,96 @@
+{
+  "seed": 42,
+  "network": {
+    "type": "regular",
+    "num_nodes": 50,
+    "regular_degree": 4,
+    "er_target_mean_degree": 4.0,
+    "er_edge_prob": null,
+    "ws_degree": 4,
+    "ws_rewiring_prob": 0.1,
+    "ba_attachments_per_new_node": 2,
+    "grid_rows": 10,
+    "grid_cols": 10,
+    "grid_periodic": false
+  },
+  "dynamics": {
+    "alpha": 0.5,
+    "r": 0.5,
+    "p_mode": "dynamic",
+    "p_max": 250.0,
+    "p_c": 50.0,
+    "resource_consumption_mode": "piecewise_linear",
+    "resource_consumption_fixed_mode": "degree_scaled",
+    "resource_consumption_fixed": 5,
+    "resource_consumption_degree_multiplier": 1.0,
+    "resource_consumption_rate": 0.05,
+    "resource_consumption_threshold": 5.0,
+    "strategy_update_rule": "fermi",
+    "beta": 1.0,
+    "q_learning_rate": 0.05,
+    "q_learning_discount": 0.1,
+    "q_learning_epsilon": 0.01,
+    "q_learning_initial_value": 0.0,
+    "episode_length": 200,
+    "initial_resource": 20.0,
+    "initial_cooperation_prob": 0.5
+  },
+  "reward": {
+    "lambda_payoff": 0.0,
+    "lambda_cooperation": 0.0,
+    "lambda_total_resource": 0.026954177897574125,
+    "lambda_collapse": 0,
+    "lambda_gini": 0.0,
+    "epsilon": 1e-08
+  },
+  "reference_graph_seeds": {
+    "regular": [
+      3055,
+      3056,
+      3057,
+      3058,
+      3059,
+      3060,
+      3061,
+      3062,
+      3063,
+      3064
+    ],
+    "scale_free": [
+      5698,
+      5699,
+      5700,
+      5701,
+      5702,
+      5703,
+      5704,
+      5705,
+      5706,
+      5707
+    ],
+    "erdos_renyi": [
+      7221,
+      7222,
+      7223,
+      7224,
+      7225,
+      7226,
+      7227,
+      7228,
+      7229,
+      7230
+    ],
+    "small_world": [
+      7135,
+      7136,
+      7137,
+      7138,
+      7139,
+      7140,
+      7141,
+      7142,
+      7143,
+      7144
+    ]
+  }
+}

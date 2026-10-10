@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv_codex/
 venv/
 env/
 dist/
@@ -9,6 +10,7 @@ build/
 .DS_Store
 
 # Generated experiment artifacts
+/outputs/
 outputs/200frame_fixed_degree_Pmax100_R020_r2_len200/
 outputs/200frame_piecewise_degree_Pmax100_R020_r2_len200/
 outputs/200frame_prop_degree_Pmax100_R020_r2_len200/

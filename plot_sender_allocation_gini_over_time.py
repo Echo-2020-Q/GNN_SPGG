@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -32,7 +33,7 @@ from analyze_gnn_policy_decisions import (
     load_actor_from_run_dir,
     resolve_reference_mean_degree,
     run_deterministic_rollouts,
-    write_csv,
+    write_csv as _write_csv_raw,
 )
 from analyze_gnn_policy_mechanism import _gini_nonnegative, apply_analysis_env_overrides, run_rule_policy_rollouts
 
@@ -48,6 +49,8 @@ TRAIN_DISTRIBUTION_ALIASES = {
     "dr",
 }
 
+SEED_MODE_CHOICES = ("results_json", "results_json")
+
 
 SCRIPT_DEFAULTS = {
     # 训练结果目录。目录下至少需要 results.json 和 checkpoints/。
@@ -60,7 +63,7 @@ SCRIPT_DEFAULTS = {
     "output_dir": None,
 
     # 当 output_dir 为 None 时，输出到 <run_dir>/<output_subdir_name>/。
-    "output_subdir_name": "0419_sender_allocation_gini_over_time",
+    "output_subdir_name": "0419_regu_ba_sender_allocation_gini_over_time",
 
     # 拓扑列表，多个值用英文逗号分隔。
     # 支持：
@@ -71,7 +74,7 @@ SCRIPT_DEFAULTS = {
     # 当 topologies 里包含 train_distribution 时，是否只使用训练分布里的某个子集。
     # 设为 None：使用 results.json 里 domain_randomization.network_types 的全部类型；
     # 设为 "regular,scale_free"：只用训练分布里的这两个拓扑类型。
-    "train_distribution_topologies": None,
+    "train_distribution_topologies": "regular,scale_free",#None,
 
     # 当 topologies 里包含 train_distribution 且训练时启用了 fixed_graph_bank 时，
     # 对每个拓扑类型使用哪一个 graph bank index。
@@ -79,7 +82,7 @@ SCRIPT_DEFAULTS = {
     "train_distribution_graph_bank_index": 0,
 
     # 每种拓扑跑多少个 deterministic episode。
-    "episodes": 10,
+    "episodes": 50,
 
     # 每个 episode 最多截到多少步。None 表示跑完整局。
     "max_steps": 200,
@@ -92,6 +95,16 @@ SCRIPT_DEFAULTS = {
 
     # rollout 的环境随机种子基准值。第 k 个 episode 用 seed + k。
     "seed": 42,
+
+    # 画图时用于“生成/重建拓扑”的 seed 来源。
+    # - "results_json": 尽量按 results.json 里的 spec.seed / fixed_graph_bank_seed 重建图。
+    # - "analysis_seed": 用上面的 seed 作为分析图生成的 seed 基准。
+    "topology_seed_mode": "results_json",
+
+    # 画图时用于 rollout / env.reset 的 seed 来源。
+    # - "results_json": 用 results.json 里的 experiment.seed 作为 rollout 基准 seed。
+    # - "analysis_seed": 用上面的 seed 作为 rollout 基准 seed；多拓扑时仍会按 topology_index 递增。
+    "rollout_seed_mode": "results_json",
 
     # Torch 推理设备。
     "device": "cuda:0" if torch.cuda.is_available() else "cpu",
@@ -149,6 +162,70 @@ class UnitInvestmentProportionalAllocationPolicy(ProportionalContributionPolicy)
     """Allocate each sender's pool in proportion to receivers' current unit_investment values."""
 
 
+def _windows_style_path(path: Path) -> str:
+    text = str(path)
+    if text.startswith("/mnt/") and len(text) > 6 and text[6] == "/":
+        drive_letter = text[5].upper()
+        text = f"{drive_letter}:{text[6:]}"
+    return text.replace("/", "\\")
+
+
+def _short_alias(text: str, *, prefix: str) -> str:
+    sanitized = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in str(text)).strip("_")
+    digest = hashlib.sha1(str(text).encode("utf-8")).hexdigest()[:8]
+    head = sanitized[:12] or prefix
+    return f"{head}_{digest}"
+
+
+def _shortened_filename(path: Path, *, max_total_length: int = 240) -> str:
+    suffix = "".join(path.suffixes)
+    stem = path.name[: -len(suffix)] if suffix else path.name
+    digest = hashlib.sha1(path.name.encode("utf-8")).hexdigest()[:8]
+    parent_length = len(_windows_style_path(path.parent))
+    reserve = len(suffix) + len(digest) + 2
+    max_stem_length = max(1, max_total_length - parent_length - reserve)
+    sanitized_stem = "".join(
+        char if char.isalnum() or char in ("-", "_") else "_" for char in stem
+    ).strip("_")
+    short_stem = (sanitized_stem[:max_stem_length] or "out").rstrip("_-") or "out"
+    candidate = f"{short_stem}_{digest}{suffix}"
+    if len(_windows_style_path(path.with_name(candidate))) <= max_total_length:
+        return candidate
+    return f"f_{digest}{suffix}"
+
+
+def _prepare_output_path(path: Path, *, max_total_length: int = 240) -> Path:
+    candidate = Path(path)
+    if len(_windows_style_path(candidate)) <= max_total_length:
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    candidate = candidate.with_name(_shortened_filename(candidate, max_total_length=max_total_length))
+    if len(_windows_style_path(candidate)) <= max_total_length:
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    short_parent = candidate.parent.parent / _short_alias(candidate.parent.name, prefix="out")
+    candidate = short_parent / _shortened_filename(short_parent / candidate.name, max_total_length=max_total_length)
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
+def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    _write_csv_raw(_prepare_output_path(Path(path)), rows)
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    safe_path = _prepare_output_path(Path(path))
+    with safe_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def _save_figure(figure: Any, output_path: Path) -> None:
+    safe_path = _prepare_output_path(Path(output_path))
+    figure.savefig(safe_path, dpi=220, bbox_inches="tight")
+
+
 def _parse_optional_topology_subset(raw_value: str | None) -> list[str] | None:
     if raw_value is None:
         return None
@@ -165,6 +242,13 @@ def _parse_optional_topology_subset(raw_value: str | None) -> list[str] | None:
 
 def _is_train_distribution_token(name: str) -> bool:
     return str(name).strip().lower() in TRAIN_DISTRIBUTION_ALIASES
+
+
+def _normalize_seed_mode(value: str) -> str:
+    mode = str(value).strip().lower()
+    if mode not in SEED_MODE_CHOICES:
+        raise ValueError(f"Unsupported seed mode: {value}. Expected one of {', '.join(SEED_MODE_CHOICES)}.")
+    return mode
 
 
 def _resolve_train_distribution_topologies(
@@ -201,6 +285,8 @@ def _build_train_distribution_spec(
     topology_name: str,
     *,
     graph_bank_index: int,
+    topology_seed_mode: str,
+    analysis_seed: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     topology = canonicalize_topology_name(topology_name)
     randomization = dict(base_spec.get("domain_randomization", {}))
@@ -231,7 +317,12 @@ def _build_train_distribution_spec(
         int(item) for item in randomization.get("ba_attachment_choices", (int(network.get("ba_attachments_per_new_node", 2)),))
     )
 
-    seed_base = int(randomization.get("fixed_graph_bank_seed", spec["seed"]))
+    topology_seed_mode = _normalize_seed_mode(topology_seed_mode)
+    seed_base = (
+        int(randomization.get("fixed_graph_bank_seed", spec["seed"]))
+        if topology_seed_mode == "results_json"
+        else int(analysis_seed)
+    )
     fixed_graph_bank_enabled = bool(randomization.get("fixed_graph_bank_enabled", False))
     fixed_graph_bank_size = int(randomization.get("fixed_graph_bank_size_per_type", 0))
     type_rng = np.random.default_rng(_domain_randomization_type_seed(seed_base, topology))
@@ -290,6 +381,7 @@ def _build_train_distribution_spec(
         "train_distribution_graph_bank_index": int(graph_bank_index) if fixed_graph_bank_enabled else None,
         "train_distribution_seed_base": int(seed_base),
         "graph_seed": int(sampled_seed),
+        "graph_seed_mode": str(topology_seed_mode),
         "topology": topology,
     }
     return spec, metadata
@@ -302,10 +394,13 @@ def resolve_topology_cases(
     reference_mean_degree: float,
     train_distribution_topologies: Sequence[str] | None,
     train_distribution_graph_bank_index: int,
+    topology_seed_mode: str,
+    analysis_seed: int,
 ) -> list[dict[str, Any]]:
     if not str(raw_topologies).strip():
         raise ValueError("Topology list cannot be empty.")
 
+    topology_seed_mode = _normalize_seed_mode(topology_seed_mode)
     cases: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in str(raw_topologies).split(","):
@@ -321,6 +416,8 @@ def resolve_topology_cases(
                     base_spec,
                     topology,
                     graph_bank_index=int(train_distribution_graph_bank_index),
+                    topology_seed_mode=topology_seed_mode,
+                    analysis_seed=int(analysis_seed),
                 )
                 cases.append(
                     {
@@ -335,19 +432,23 @@ def resolve_topology_cases(
         topology = canonicalize_topology_name(token)
         if topology in seen:
             continue
+        spec = build_spec_for_topology(
+            base_spec,
+            topology,
+            reference_mean_degree=reference_mean_degree,
+        )
+        if topology_seed_mode == "analysis_seed":
+            spec["seed"] = int(analysis_seed)
         cases.append(
             {
                 "topology_name": topology,
-                "spec": build_spec_for_topology(
-                    base_spec,
-                    topology,
-                    reference_mean_degree=reference_mean_degree,
-                ),
+                "spec": spec,
                 "metadata": {
                     "graph_source_mode": "base_spec",
                     "train_distribution_graph_bank_index": None,
                     "train_distribution_seed_base": None,
-                    "graph_seed": None,
+                    "graph_seed": int(spec["seed"]),
+                    "graph_seed_mode": str(topology_seed_mode),
                     "topology": topology,
                 },
             }
@@ -368,6 +469,7 @@ def compute_sender_allocation_gini_rows(
         observation = snapshot.observation
         local_mask = np.asarray(observation["local_mask"], dtype=bool)
         pool_grown = np.asarray(observation["pool_grown"], dtype=np.float64)
+        resources = np.clip(np.asarray(observation["resources"], dtype=np.float64), 0.0, None)
         allocation_matrix = np.asarray(snapshot.policy.allocation_matrix, dtype=np.float64)
 
         for sender in range(local_mask.shape[0]):
@@ -375,6 +477,7 @@ def compute_sender_allocation_gini_rows(
             if valid_receivers.size == 0:
                 continue
             allocation_row = np.asarray(allocation_matrix[sender, valid_receivers], dtype=np.float64)
+            ego_resources = np.asarray(resources[valid_receivers], dtype=np.float64)
             rows.append(
                 {
                     "policy": str(policy_name),
@@ -385,6 +488,8 @@ def compute_sender_allocation_gini_rows(
                     "sender_degree": max(int(valid_receivers.size) - 1, 0),
                     "receiver_count": int(valid_receivers.size),
                     "sender_pool_grown": float(pool_grown[sender]),
+                    "ego_total_resource": float(np.sum(ego_resources)),
+                    "ego_mean_resource": float(np.mean(ego_resources)) if ego_resources.size > 0 else float("nan"),
                     "sender_allocation_gini": _gini_nonnegative(float(pool_grown[sender]) * allocation_row),
                 }
             )
@@ -403,6 +508,7 @@ def compute_sender_allocation_gini_rows_from_policy_on_snapshots(
         observation = snapshot.observation
         local_mask = np.asarray(observation["local_mask"], dtype=bool)
         pool_grown = np.asarray(observation["pool_grown"], dtype=np.float64)
+        resources = np.clip(np.asarray(observation["resources"], dtype=np.float64), 0.0, None)
         allocation_matrix = np.asarray(allocation_policy.allocate(observation), dtype=np.float64)
 
         for sender in range(local_mask.shape[0]):
@@ -410,6 +516,7 @@ def compute_sender_allocation_gini_rows_from_policy_on_snapshots(
             if valid_receivers.size == 0:
                 continue
             allocation_row = np.asarray(allocation_matrix[sender, valid_receivers], dtype=np.float64)
+            ego_resources = np.asarray(resources[valid_receivers], dtype=np.float64)
             rows.append(
                 {
                     "policy": str(policy_name),
@@ -420,6 +527,8 @@ def compute_sender_allocation_gini_rows_from_policy_on_snapshots(
                     "sender_degree": max(int(valid_receivers.size) - 1, 0),
                     "receiver_count": int(valid_receivers.size),
                     "sender_pool_grown": float(pool_grown[sender]),
+                    "ego_total_resource": float(np.sum(ego_resources)),
+                    "ego_mean_resource": float(np.mean(ego_resources)) if ego_resources.size > 0 else float("nan"),
                     "sender_allocation_gini": _gini_nonnegative(float(pool_grown[sender]) * allocation_row),
                 }
             )
@@ -523,6 +632,196 @@ def summarize_sender_allocation_gini_episode_rows_across_topologies(
         )
 
     return aggregated_rows
+
+
+def compute_sender_ego_cooperation_rows(
+    policy_name: str,
+    snapshots: Sequence[Snapshot],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for snapshot in snapshots:
+        observation = snapshot.observation
+        local_mask = np.asarray(observation["local_mask"], dtype=bool)
+        local_actual_cooperators = np.asarray(observation["local_actual_cooperators"], dtype=np.float64)
+
+        for sender in range(local_mask.shape[0]):
+            valid_receivers = np.flatnonzero(local_mask[sender])
+            if valid_receivers.size == 0:
+                continue
+            ego_node_count = int(valid_receivers.size)
+            rows.append(
+                {
+                    "policy": str(policy_name),
+                    "episode": int(snapshot.episode),
+                    "step": int(snapshot.step),
+                    "sender": int(sender),
+                    "sender_degree": max(ego_node_count - 1, 0),
+                    "ego_node_count": ego_node_count,
+                    "ego_cooperation_ratio": float(local_actual_cooperators[sender] / max(ego_node_count, 1)),
+                }
+            )
+    return rows
+
+
+def summarize_sender_ego_cooperation(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not rows:
+        return [], []
+
+    grouped_episode: dict[tuple[str, int, int], list[float]] = {}
+    for row in rows:
+        key = (str(row["policy"]), int(row["episode"]), int(row["step"]))
+        grouped_episode.setdefault(key, []).append(float(row["ego_cooperation_ratio"]))
+
+    episode_step_rows: list[dict[str, Any]] = []
+    grouped_step: dict[tuple[str, int], list[float]] = {}
+    policy_order = {
+        "resource_proportional": 0,
+        "unit_investment_proportional": 1,
+        "agent": 2,
+        "equal": 3,
+    }
+    for (policy_name, episode, step), values in sorted(
+        grouped_episode.items(),
+        key=lambda item: (policy_order.get(item[0][0], 99), item[0][1], item[0][2]),
+    ):
+        array = np.asarray(values, dtype=np.float64)
+        episode_mean = float(np.mean(array))
+        episode_step_rows.append(
+            {
+                "policy": policy_name,
+                "episode": int(episode),
+                "step": int(step),
+                "sender_count": int(array.size),
+                "ego_cooperation_ratio_mean": episode_mean,
+                "ego_cooperation_ratio_std_within_episode": float(np.std(array)),
+            }
+        )
+        grouped_step.setdefault((policy_name, int(step)), []).append(episode_mean)
+
+    step_summary_rows: list[dict[str, Any]] = []
+    for (policy_name, step), values in sorted(
+        grouped_step.items(),
+        key=lambda item: (policy_order.get(item[0][0], 99), item[0][1]),
+    ):
+        array = np.asarray(values, dtype=np.float64)
+        std = float(np.std(array)) if array.size > 0 else float("nan")
+        sem = float(std / np.sqrt(array.size)) if array.size > 0 else float("nan")
+        step_summary_rows.append(
+            {
+                "policy": policy_name,
+                "step": int(step),
+                "episode_count": int(array.size),
+                "ego_cooperation_ratio_mean": float(np.mean(array)) if array.size > 0 else float("nan"),
+                "ego_cooperation_ratio_std": std,
+                "ego_cooperation_ratio_sem": sem,
+            }
+        )
+
+    return episode_step_rows, step_summary_rows
+
+
+def summarize_sender_ego_cooperation_episode_rows_across_topologies(
+    episode_step_rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    if not episode_step_rows:
+        return []
+
+    grouped_step: dict[tuple[str, int], list[float]] = {}
+    for row in episode_step_rows:
+        key = (str(row["policy"]), int(row["step"]))
+        grouped_step.setdefault(key, []).append(float(row["ego_cooperation_ratio_mean"]))
+
+    policy_order = {
+        "resource_proportional": 0,
+        "unit_investment_proportional": 1,
+        "agent": 2,
+        "equal": 3,
+    }
+    aggregated_rows: list[dict[str, Any]] = []
+    for (policy_name, step), values in sorted(
+        grouped_step.items(),
+        key=lambda item: (policy_order.get(item[0][0], 99), item[0][1]),
+    ):
+        array = np.asarray(values, dtype=np.float64)
+        std = float(np.std(array)) if array.size > 0 else float("nan")
+        sem = float(std / np.sqrt(array.size)) if array.size > 0 else float("nan")
+        aggregated_rows.append(
+            {
+                "policy": policy_name,
+                "step": int(step),
+                "sample_count": int(array.size),
+                "ego_cooperation_ratio_mean": float(np.mean(array)) if array.size > 0 else float("nan"),
+                "ego_cooperation_ratio_std": std,
+                "ego_cooperation_ratio_sem": sem,
+            }
+        )
+
+    return aggregated_rows
+
+
+def summarize_sender_allocation_gini_vs_resource(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    resource_key: str,
+    num_bins: int,
+    policies: Sequence[str],
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+
+    valid_rows = [
+        row
+        for row in rows
+        if str(row.get("policy")) in policies and np.isfinite(float(row.get(resource_key, float("nan"))))
+    ]
+    if not valid_rows:
+        return []
+
+    resource_values = np.asarray([float(row[resource_key]) for row in valid_rows], dtype=np.float64)
+    edges = _quantile_edges(resource_values, int(num_bins))
+    if edges.size < 2:
+        return []
+
+    policy_order = {name: index for index, name in enumerate(policies)}
+    summary_rows: list[dict[str, Any]] = []
+    for policy_name in policies:
+        policy_rows = [row for row in valid_rows if str(row["policy"]) == str(policy_name)]
+        if not policy_rows:
+            continue
+        for bin_index in range(edges.size - 1):
+            left_edge = float(edges[bin_index])
+            right_edge = float(edges[bin_index + 1])
+            if bin_index == edges.size - 2:
+                bin_rows = [row for row in policy_rows if left_edge <= float(row[resource_key]) <= right_edge]
+            else:
+                bin_rows = [row for row in policy_rows if left_edge <= float(row[resource_key]) < right_edge]
+            if not bin_rows:
+                continue
+
+            gini_values = np.asarray([float(row["sender_allocation_gini"]) for row in bin_rows], dtype=np.float64)
+            resource_bin_values = np.asarray([float(row[resource_key]) for row in bin_rows], dtype=np.float64)
+            std = float(np.std(gini_values)) if gini_values.size > 0 else float("nan")
+            sem = float(std / np.sqrt(gini_values.size)) if gini_values.size > 0 else float("nan")
+            summary_rows.append(
+                {
+                    "policy": str(policy_name),
+                    "policy_order": int(policy_order.get(str(policy_name), 99)),
+                    "resource_key": str(resource_key),
+                    "bin_index": int(bin_index),
+                    "bin_left": left_edge,
+                    "bin_right": right_edge,
+                    "bin_center": float(np.mean(resource_bin_values)),
+                    "sample_count": int(len(bin_rows)),
+                    "sender_allocation_gini_mean": float(np.mean(gini_values)) if gini_values.size > 0 else float("nan"),
+                    "sender_allocation_gini_std": std,
+                    "sender_allocation_gini_sem": sem,
+                }
+            )
+
+    summary_rows.sort(key=lambda row: (int(row["policy_order"]), int(row["bin_index"])))
+    return summary_rows
 
 
 def _quantile_edges(values: np.ndarray, num_bins: int) -> np.ndarray:
@@ -980,7 +1279,7 @@ def plot_sender_allocation_gini_over_time(
     ax.legend(loc="best")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=220, bbox_inches="tight")
+    _save_figure(figure, output_path)
     plt.close(figure)
 
 
@@ -1049,7 +1348,172 @@ def plot_sender_allocation_gini_over_time_by_topology(
         figure.legend(handles, labels, loc="upper center", ncol=3, frameon=False)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=220, bbox_inches="tight")
+    _save_figure(figure, output_path)
+    plt.close(figure)
+
+
+def plot_sender_ego_cooperation_over_time(
+    step_summary_rows: Sequence[Mapping[str, Any]],
+    output_path: Path,
+    *,
+    style_by_policy: Mapping[str, Mapping[str, str]],
+    policies: Sequence[str],
+    title: str,
+) -> None:
+    if plt is None or not step_summary_rows:
+        return
+
+    figure, ax = plt.subplots(figsize=(11, 6), constrained_layout=True)
+    for policy_name in policies:
+        rows = [row for row in step_summary_rows if str(row["policy"]) == policy_name]
+        if not rows:
+            continue
+        rows.sort(key=lambda row: int(row["step"]))
+        x_values = np.asarray([int(row["step"]) for row in rows], dtype=np.int64)
+        y_values = np.asarray([float(row["ego_cooperation_ratio_mean"]) for row in rows], dtype=np.float64)
+        sem_values = np.asarray([float(row["ego_cooperation_ratio_sem"]) for row in rows], dtype=np.float64)
+        style = style_by_policy[policy_name]
+        ax.plot(
+            x_values,
+            y_values,
+            label=style["label"],
+            color=style["color"],
+            linestyle=style["linestyle"],
+            linewidth=2.2,
+        )
+        if np.any(np.isfinite(sem_values)):
+            lower = np.clip(y_values - sem_values, 0.0, 1.0)
+            upper = np.clip(y_values + sem_values, 0.0, 1.0)
+            mask = np.isfinite(lower) & np.isfinite(upper)
+            if int(np.count_nonzero(mask)) >= 2:
+                ax.fill_between(x_values, lower, upper, where=mask, color=style["color"], alpha=0.16)
+
+    ax.set_title(str(title))
+    ax.set_xlabel("Step t")
+    ax.set_ylabel("Mean Ego Cooperation Ratio")
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _save_figure(figure, output_path)
+    plt.close(figure)
+
+
+def plot_sender_ego_cooperation_over_time_by_topology(
+    all_step_summary_rows: Sequence[Mapping[str, Any]],
+    output_path: Path,
+    *,
+    style_by_policy: Mapping[str, Mapping[str, str]],
+    policies: Sequence[str],
+    title_prefix: str,
+) -> None:
+    if plt is None or not all_step_summary_rows:
+        return
+
+    grouped_rows: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for row in all_step_summary_rows:
+        topology_name = str(row.get("topology", "unknown"))
+        topology_label = str(row.get("topology_label", topology_name))
+        grouped_rows.setdefault((topology_name, topology_label), []).append(row)
+    if not grouped_rows:
+        return
+
+    ordered_groups = sorted(grouped_rows.items(), key=lambda item: item[0][1])
+    panel_count = len(ordered_groups)
+    cols = min(2, panel_count)
+    rows = int(np.ceil(float(panel_count) / float(cols)))
+    figure, axes = plt.subplots(
+        rows,
+        cols,
+        figsize=(6.2 * float(cols), 4.2 * float(rows)),
+        constrained_layout=True,
+        sharex=True,
+        sharey=True,
+    )
+    axes_flat = list(np.asarray(axes).reshape(-1))
+
+    for axis, ((_, topology_label), topology_rows) in zip(axes_flat, ordered_groups):
+        for policy_name in policies:
+            rows_for_policy = [row for row in topology_rows if str(row["policy"]) == policy_name]
+            if not rows_for_policy:
+                continue
+            rows_for_policy.sort(key=lambda row: int(row["step"]))
+            x_values = np.asarray([int(row["step"]) for row in rows_for_policy], dtype=np.int64)
+            y_values = np.asarray([float(row["ego_cooperation_ratio_mean"]) for row in rows_for_policy], dtype=np.float64)
+            style = style_by_policy[policy_name]
+            axis.plot(
+                x_values,
+                y_values,
+                label=style["label"],
+                color=style["color"],
+                linestyle=style["linestyle"],
+                linewidth=2.0,
+            )
+        axis.set_title(f"{title_prefix}: {topology_label}")
+        axis.set_xlabel("Step t")
+        axis.set_ylabel("Mean Ego Cooperation Ratio")
+        axis.set_ylim(0.0, 1.0)
+        axis.grid(alpha=0.25)
+
+    for axis in axes_flat[len(ordered_groups):]:
+        axis.set_axis_off()
+
+    handles, labels = axes_flat[0].get_legend_handles_labels()
+    if handles:
+        figure.legend(handles, labels, loc="upper center", ncol=3, frameon=False)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _save_figure(figure, output_path)
+    plt.close(figure)
+
+
+def plot_sender_allocation_gini_vs_resource(
+    summary_rows: Sequence[Mapping[str, Any]],
+    output_path: Path,
+    *,
+    style_by_policy: Mapping[str, Mapping[str, str]],
+    policies: Sequence[str],
+    title: str,
+    resource_label: str,
+) -> None:
+    if plt is None or not summary_rows:
+        return
+
+    figure, ax = plt.subplots(figsize=(11, 6), constrained_layout=True)
+    for policy_name in policies:
+        rows = [row for row in summary_rows if str(row["policy"]) == str(policy_name)]
+        if not rows:
+            continue
+        rows.sort(key=lambda row: float(row["bin_center"]))
+        x_values = np.asarray([float(row["bin_center"]) for row in rows], dtype=np.float64)
+        y_values = np.asarray([float(row["sender_allocation_gini_mean"]) for row in rows], dtype=np.float64)
+        sem_values = np.asarray([float(row["sender_allocation_gini_sem"]) for row in rows], dtype=np.float64)
+        style = style_by_policy[str(policy_name)]
+        ax.plot(
+            x_values,
+            y_values,
+            label=style["label"],
+            color=style["color"],
+            linestyle=style["linestyle"],
+            linewidth=2.2,
+        )
+        if np.any(np.isfinite(sem_values)):
+            lower = np.clip(y_values - sem_values, 0.0, None)
+            upper = np.clip(y_values + sem_values, 0.0, None)
+            mask = np.isfinite(lower) & np.isfinite(upper)
+            if int(np.count_nonzero(mask)) >= 2:
+                ax.fill_between(x_values, lower, upper, where=mask, color=style["color"], alpha=0.16)
+
+    ax.set_title(str(title))
+    ax.set_xlabel(resource_label)
+    ax.set_ylabel("Mean Sender Allocation Gini")
+    ax.set_ylim(bottom=0.0)
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _save_figure(figure, output_path)
     plt.close(figure)
 
 
@@ -1106,7 +1570,7 @@ def plot_agent_unit_investment_equal_mixture_weights_over_time(
     ax.legend(loc="best")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=220, bbox_inches="tight")
+    _save_figure(figure, output_path)
     plt.close(figure)
 
 
@@ -1165,8 +1629,143 @@ def plot_agent_unit_investment_equal_mixture_vs_resource(
     ax.legend(loc="best")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=220, bbox_inches="tight")
+    _save_figure(figure, output_path)
     plt.close(figure)
+
+
+def plot_agent_unit_investment_equal_mixture_vs_resource_points(
+    summary_rows: Sequence[Mapping[str, Any]],
+    output_path: Path,
+    *,
+    resource_label: str,
+) -> None:
+    if plt is None or not summary_rows:
+        return
+
+    rows = sorted(summary_rows, key=lambda row: float(row["bin_center"]))
+    x_values = np.asarray([float(row["bin_center"]) for row in rows], dtype=np.float64)
+    unit_investment_mean = np.asarray([float(row["weight_unit_investment_mean"]) for row in rows], dtype=np.float64)
+    unit_investment_sem = np.asarray([float(row["weight_unit_investment_sem"]) for row in rows], dtype=np.float64)
+    equal_mean = np.asarray([float(row["weight_equal_mean"]) for row in rows], dtype=np.float64)
+    equal_sem = np.asarray([float(row["weight_equal_sem"]) for row in rows], dtype=np.float64)
+
+    figure, ax = plt.subplots(figsize=(11, 6), constrained_layout=True)
+
+    inv_mask = np.isfinite(x_values) & np.isfinite(unit_investment_mean)
+    if np.any(inv_mask):
+        inv_sem_values = unit_investment_sem[inv_mask]
+        inv_has_sem = bool(np.any(np.isfinite(inv_sem_values)))
+        inv_yerr = np.where(np.isfinite(inv_sem_values), inv_sem_values, 0.0) if inv_has_sem else None
+        ax.errorbar(
+            x_values[inv_mask],
+            unit_investment_mean[inv_mask],
+            yerr=inv_yerr,
+            color="#9467bd",
+            linestyle="--",
+            linewidth=1.3,
+            marker="o",
+            markersize=4.5,
+            capsize=2.5 if inv_has_sem else 0.0,
+            label="w: Proportional by Current Unit Investment",
+        )
+
+    eq_mask = np.isfinite(x_values) & np.isfinite(equal_mean)
+    if np.any(eq_mask):
+        eq_sem_values = equal_sem[eq_mask]
+        eq_has_sem = bool(np.any(np.isfinite(eq_sem_values)))
+        eq_yerr = np.where(np.isfinite(eq_sem_values), eq_sem_values, 0.0) if eq_has_sem else None
+        ax.errorbar(
+            x_values[eq_mask],
+            equal_mean[eq_mask],
+            yerr=eq_yerr,
+            color="#1f77ff",
+            linestyle="--",
+            linewidth=1.3,
+            marker="s",
+            markersize=4.2,
+            capsize=2.5 if eq_has_sem else 0.0,
+            label="1 - w: Equal Allocation",
+        )
+
+    ax.set_title(f"RL-Agent Mixture Weights vs {resource_label} (Point View)")
+    ax.set_xlabel(resource_label)
+    ax.set_ylabel("Mean Mixture Weight")
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _save_figure(figure, output_path)
+    plt.close(figure)
+
+
+def plot_agent_unit_investment_equal_mixture_vs_resource_raw(
+    rows: Sequence[Mapping[str, Any]],
+    output_path: Path,
+    *,
+    resource_key: str,
+    resource_label: str,
+) -> None:
+    if plt is None or not rows:
+        return
+
+    filtered_rows = [
+        row
+        for row in rows
+        if np.isfinite(float(row.get(resource_key, float("nan"))))
+        and np.isfinite(float(row.get("weight_unit_investment", float("nan"))))
+        and np.isfinite(float(row.get("weight_equal", float("nan"))))
+    ]
+    if not filtered_rows:
+        return
+
+    x_values = np.asarray([float(row[resource_key]) for row in filtered_rows], dtype=np.float64)
+    unit_investment_values = np.asarray([float(row["weight_unit_investment"]) for row in filtered_rows], dtype=np.float64)
+    equal_values = np.asarray([float(row["weight_equal"]) for row in filtered_rows], dtype=np.float64)
+
+    figure, ax = plt.subplots(figsize=(11, 6), constrained_layout=True)
+    ax.scatter(
+        x_values,
+        unit_investment_values,
+        s=8.0,
+        alpha=0.12,
+        color="#9467bd",
+        edgecolors="none",
+        label="w: Proportional by Current Unit Investment",
+    )
+    ax.scatter(
+        x_values,
+        equal_values,
+        s=8.0,
+        alpha=0.10,
+        color="#1f77ff",
+        edgecolors="none",
+        label="1 - w: Equal Allocation",
+    )
+
+    ax.set_title(f"RL-Agent Mixture Weights vs {resource_label} (Raw Scatter)")
+    ax.set_xlabel(resource_label)
+    ax.set_ylabel("Mixture Weight")
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _save_figure(figure, output_path)
+    plt.close(figure)
+
+
+def _resolve_rollout_seed(
+    *,
+    rollout_seed_mode: str,
+    analysis_seed: int,
+    results_seed: int,
+    topology_index: int,
+) -> int:
+    mode = _normalize_seed_mode(rollout_seed_mode)
+    if mode == "results_json":
+        return int(results_seed)
+    return int(analysis_seed) + int(topology_index)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1247,6 +1846,20 @@ def parse_args() -> argparse.Namespace:
         help="Base environment seed for analysis rollouts.",
     )
     parser.add_argument(
+        "--topology-seed-mode",
+        type=str,
+        choices=SEED_MODE_CHOICES,
+        default=str(SCRIPT_DEFAULTS["topology_seed_mode"]),
+        help="Whether topology reconstruction uses results.json seeds or the analysis seed.",
+    )
+    parser.add_argument(
+        "--rollout-seed-mode",
+        type=str,
+        choices=SEED_MODE_CHOICES,
+        default=str(SCRIPT_DEFAULTS["rollout_seed_mode"]),
+        help="Whether rollout env.reset seeds use results.json seed or the analysis seed.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=str(SCRIPT_DEFAULTS["device"]),
@@ -1282,6 +1895,7 @@ def analyze_single_topology(
     episode_length_override: int | None,
     rollout_seed: int,
     pool_power_mix_agent_k: float,
+    resource_bin_count: int,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     effective_spec = deepcopy(dict(spec))
@@ -1355,9 +1969,15 @@ def analyze_single_topology(
     raw_rows.extend(compute_sender_allocation_gini_rows("agent", agent_snapshots))
     raw_rows.extend(compute_sender_allocation_gini_rows("equal", equal_snapshots))
     mixture_raw_rows = compute_agent_unit_investment_equal_mixture_rows(agent_snapshots)
+    ego_coop_rows = []
+    ego_coop_rows.extend(compute_sender_ego_cooperation_rows("resource_proportional", resource_prop_snapshots))
+    ego_coop_rows.extend(compute_sender_ego_cooperation_rows("unit_investment_proportional", unit_investment_prop_snapshots))
+    ego_coop_rows.extend(compute_sender_ego_cooperation_rows("agent", agent_snapshots))
+    ego_coop_rows.extend(compute_sender_ego_cooperation_rows("equal", equal_snapshots))
 
     episode_step_rows, step_summary_rows = summarize_sender_allocation_gini(raw_rows)
     mixture_episode_step_rows, mixture_step_summary_rows = summarize_agent_unit_investment_equal_mixture(mixture_raw_rows)
+    ego_coop_episode_step_rows, ego_coop_step_summary_rows = summarize_sender_ego_cooperation(ego_coop_rows)
 
     episode_summary_rows = []
     episode_summary_rows.extend(summarize_episode_rows("resource_proportional", resource_prop_episode_summaries))
@@ -1365,10 +1985,38 @@ def analyze_single_topology(
     episode_summary_rows.extend(summarize_episode_rows("agent", agent_episode_summaries))
     episode_summary_rows.extend(summarize_episode_rows("equal", equal_episode_summaries))
 
+    sender_gini_vs_ego_mean_rows = summarize_sender_allocation_gini_vs_resource(
+        raw_rows,
+        resource_key="ego_mean_resource",
+        num_bins=int(resource_bin_count),
+        policies=NON_AGENT_BASELINE_POLICIES,
+    )
+    sender_gini_vs_sender_pool_rows = summarize_sender_allocation_gini_vs_resource(
+        raw_rows,
+        resource_key="sender_pool_grown",
+        num_bins=int(resource_bin_count),
+        policies=NON_AGENT_BASELINE_POLICIES,
+    )
+    mixture_vs_ego_mean_rows = summarize_agent_unit_investment_equal_mixture_vs_resource(
+        mixture_raw_rows,
+        resource_key="ego_mean_resource",
+        num_bins=int(resource_bin_count),
+    )
+    mixture_vs_ego_total_rows = summarize_agent_unit_investment_equal_mixture_vs_resource(
+        mixture_raw_rows,
+        resource_key="ego_total_resource",
+        num_bins=int(resource_bin_count),
+    )
+    mixture_vs_sender_pool_rows = summarize_agent_unit_investment_equal_mixture_vs_resource(
+        mixture_raw_rows,
+        resource_key="sender_pool_grown",
+        num_bins=int(resource_bin_count),
+    )
+
     style_by_policy = _sender_allocation_style_by_policy(float(pool_power_mix_agent_k))
     plot_sender_allocation_gini_over_time(
         step_summary_rows,
-        output_dir / "sender_allocation_gini_over_time.png",
+        output_dir / "sender_gini.png",
         style_by_policy=style_by_policy,
         policies=NON_AGENT_BASELINE_POLICIES,
         title="Sender Allocation Gini Over Time: Non-Agent Baselines",
@@ -1380,17 +2028,96 @@ def analyze_single_topology(
         policies=AGENT_REFERENCE_POLICIES,
         title="Sender Allocation Gini Over Time: Agent-State Baselines",
     )
-    write_csv(output_dir / "sender_allocation_gini_raw_rows.csv", raw_rows)
-    write_csv(output_dir / "sender_allocation_gini_episode_step_summary.csv", episode_step_rows)
-    write_csv(output_dir / "sender_allocation_gini_step_summary.csv", step_summary_rows)
-    write_csv(output_dir / "policy_episode_summary.csv", episode_summary_rows)
+    write_csv(output_dir / "sender_gini_rows.csv", raw_rows)
+    write_csv(output_dir / "sender_gini_ep_step.csv", episode_step_rows)
+    write_csv(output_dir / "sender_gini_step.csv", step_summary_rows)
+    write_csv(output_dir / "policy_ep.csv", episode_summary_rows)
+    plot_sender_allocation_gini_vs_resource(
+        sender_gini_vs_ego_mean_rows,
+        output_dir / "sender_gini_vs_ego_mean_res.png",
+        style_by_policy=style_by_policy,
+        policies=NON_AGENT_BASELINE_POLICIES,
+        title="Sender Allocation Gini vs Ego Mean Resource",
+        resource_label="Sender Ego Mean Resource",
+    )
+    plot_sender_allocation_gini_vs_resource(
+        sender_gini_vs_sender_pool_rows,
+        output_dir / "sender_gini_vs_sender_pool.png",
+        style_by_policy=style_by_policy,
+        policies=NON_AGENT_BASELINE_POLICIES,
+        title="Sender Allocation Gini vs Sender Pool",
+        resource_label="Sender Pool Grown",
+    )
+    write_csv(output_dir / "sender_gini_vs_ego_mean_res.csv", sender_gini_vs_ego_mean_rows)
+    write_csv(output_dir / "sender_gini_vs_sender_pool.csv", sender_gini_vs_sender_pool_rows)
+    plot_sender_ego_cooperation_over_time(
+        ego_coop_step_summary_rows,
+        output_dir / "ego_coop_over_time.png",
+        style_by_policy=style_by_policy,
+        policies=NON_AGENT_BASELINE_POLICIES,
+        title="Ego Cooperation Ratio Over Time",
+    )
+    write_csv(output_dir / "ego_coop_rows.csv", ego_coop_rows)
+    write_csv(output_dir / "ego_coop_ep_step.csv", ego_coop_episode_step_rows)
+    write_csv(output_dir / "ego_coop_step.csv", ego_coop_step_summary_rows)
     plot_agent_unit_investment_equal_mixture_weights_over_time(
         mixture_step_summary_rows,
-        output_dir / "agent_unitinv_equal_mix_w_over_time.png",
+        output_dir / "agent_mix_w.png",
     )
-    write_csv(output_dir / "agent_unitinv_equal_mix_rows.csv", mixture_raw_rows)
-    write_csv(output_dir / "agent_unitinv_equal_mix_ep_step.csv", mixture_episode_step_rows)
-    write_csv(output_dir / "agent_unitinv_equal_mix_step.csv", mixture_step_summary_rows)
+    plot_agent_unit_investment_equal_mixture_vs_resource(
+        mixture_vs_ego_mean_rows,
+        output_dir / "agent_mix_vs_ego_mean.png",
+        resource_label="Sender Ego Mean Resource",
+    )
+    plot_agent_unit_investment_equal_mixture_vs_resource_points(
+        mixture_vs_ego_mean_rows,
+        output_dir / "agent_mix_vs_ego_mean_pts.png",
+        resource_label="Sender Ego Mean Resource",
+    )
+    plot_agent_unit_investment_equal_mixture_vs_resource_raw(
+        mixture_raw_rows,
+        output_dir / "agent_mix_vs_ego_mean_raw.png",
+        resource_key="ego_mean_resource",
+        resource_label="Sender Ego Mean Resource",
+    )
+    plot_agent_unit_investment_equal_mixture_vs_resource(
+        mixture_vs_ego_total_rows,
+        output_dir / "agent_mix_vs_ego_total.png",
+        resource_label="Sender Ego Total Resource",
+    )
+    plot_agent_unit_investment_equal_mixture_vs_resource_points(
+        mixture_vs_ego_total_rows,
+        output_dir / "agent_mix_vs_ego_total_pts.png",
+        resource_label="Sender Ego Total Resource",
+    )
+    plot_agent_unit_investment_equal_mixture_vs_resource_raw(
+        mixture_raw_rows,
+        output_dir / "agent_mix_vs_ego_total_raw.png",
+        resource_key="ego_total_resource",
+        resource_label="Sender Ego Total Resource",
+    )
+    plot_agent_unit_investment_equal_mixture_vs_resource(
+        mixture_vs_sender_pool_rows,
+        output_dir / "agent_mix_vs_pool.png",
+        resource_label="Sender Pool Grown",
+    )
+    plot_agent_unit_investment_equal_mixture_vs_resource_points(
+        mixture_vs_sender_pool_rows,
+        output_dir / "agent_mix_vs_pool_pts.png",
+        resource_label="Sender Pool Grown",
+    )
+    plot_agent_unit_investment_equal_mixture_vs_resource_raw(
+        mixture_raw_rows,
+        output_dir / "agent_mix_vs_pool_raw.png",
+        resource_key="sender_pool_grown",
+        resource_label="Sender Pool Grown",
+    )
+    write_csv(output_dir / "agent_mix_rows.csv", mixture_raw_rows)
+    write_csv(output_dir / "agent_mix_ep.csv", mixture_episode_step_rows)
+    write_csv(output_dir / "agent_mix_step.csv", mixture_step_summary_rows)
+    write_csv(output_dir / "agent_mix_vs_ego_mean.csv", mixture_vs_ego_mean_rows)
+    write_csv(output_dir / "agent_mix_vs_ego_total.csv", mixture_vs_ego_total_rows)
+    write_csv(output_dir / "agent_mix_vs_pool.csv", mixture_vs_sender_pool_rows)
 
     summary = {
         "run_dir": str(run_dir),
@@ -1399,6 +2126,10 @@ def analyze_single_topology(
         "topology_name": topology_name,
         "topology_label": TOPOLOGY_LABELS.get(topology_name, topology_name),
         "topology_metadata": dict(topology_metadata),
+        "graph_seed": topology_metadata.get("graph_seed"),
+        "graph_seed_mode": topology_metadata.get("graph_seed_mode"),
+        "rollout_seed": int(rollout_seed),
+        "rollout_seed_mode": topology_metadata.get("rollout_seed_mode"),
         "episodes": int(episodes),
         "max_steps": None if max_steps is None else int(max_steps),
         "effective_episode_length": int(effective_spec["dynamics"]["episode_length"]),
@@ -1413,10 +2144,10 @@ def analyze_single_topology(
         },
         "matplotlib_available": plt is not None,
         "step_summary_rows": step_summary_rows,
+        "ego_cooperation_step_summary_rows": ego_coop_step_summary_rows,
         "agent_unit_investment_equal_mixture_step_summary_rows": mixture_step_summary_rows,
     }
-    with (output_dir / "sender_allocation_gini_summary.json").open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, ensure_ascii=False, indent=2)
+    _write_json(output_dir / "sender_gini_summary.json", summary)
 
     final_step_by_policy: dict[str, float] = {}
     for policy_name in (
@@ -1441,6 +2172,9 @@ def analyze_single_topology(
             "graph_source_mode": str(topology_metadata.get("graph_source_mode", "unknown")),
             "train_distribution_graph_bank_index": topology_metadata.get("train_distribution_graph_bank_index"),
             "graph_seed": topology_metadata.get("graph_seed"),
+            "graph_seed_mode": topology_metadata.get("graph_seed_mode"),
+            "rollout_seed": int(rollout_seed),
+            "rollout_seed_mode": topology_metadata.get("rollout_seed_mode"),
             "output_dir": str(output_dir),
             "final_step_sender_allocation_gini": final_step_by_policy,
         },
@@ -1452,6 +2186,14 @@ def analyze_single_topology(
             }
             for row in step_summary_rows
         ],
+        "raw_rows": [
+            {
+                **dict(row),
+                "topology": topology_name,
+                "topology_label": TOPOLOGY_LABELS.get(topology_name, topology_name),
+            }
+            for row in raw_rows
+        ],
         "episode_step_rows": [
             {
                 **dict(row),
@@ -1459,6 +2201,22 @@ def analyze_single_topology(
                 "topology_label": TOPOLOGY_LABELS.get(topology_name, topology_name),
             }
             for row in episode_step_rows
+        ],
+        "ego_coop_step_rows": [
+            {
+                **dict(row),
+                "topology": topology_name,
+                "topology_label": TOPOLOGY_LABELS.get(topology_name, topology_name),
+            }
+            for row in ego_coop_step_summary_rows
+        ],
+        "ego_coop_episode_step_rows": [
+            {
+                **dict(row),
+                "topology": topology_name,
+                "topology_label": TOPOLOGY_LABELS.get(topology_name, topology_name),
+            }
+            for row in ego_coop_episode_step_rows
         ],
         "mixture_episode_step_rows": [
             {
@@ -1515,13 +2273,19 @@ def main() -> None:
         reference_mean_degree=reference_mean_degree,
         train_distribution_topologies=train_distribution_topologies,
         train_distribution_graph_bank_index=int(args.train_distribution_graph_bank_index),
+        topology_seed_mode=str(args.topology_seed_mode),
+        analysis_seed=int(args.seed),
     )
 
     topology_summary_rows: list[dict[str, Any]] = []
+    all_topology_sender_gini_raw_rows: list[dict[str, Any]] = []
     all_topology_step_summary_rows: list[dict[str, Any]] = []
     all_topology_episode_step_rows: list[dict[str, Any]] = []
+    all_topology_ego_coop_step_rows: list[dict[str, Any]] = []
+    all_topology_ego_coop_episode_step_rows: list[dict[str, Any]] = []
     all_topology_mixture_episode_step_rows: list[dict[str, Any]] = []
     all_topology_mixture_raw_rows: list[dict[str, Any]] = []
+    results_rollout_seed = int(experiment_spec.get("seed", args.seed))
     for topology_index, case in enumerate(topology_cases):
         topology_name = str(case["topology_name"])
         topology_spec = deepcopy(dict(case["spec"]))
@@ -1529,6 +2293,15 @@ def main() -> None:
             topology_spec,
             env_r_override=None if args.env_r_override is None else float(args.env_r_override),
         )
+        rollout_seed = _resolve_rollout_seed(
+            rollout_seed_mode=str(args.rollout_seed_mode),
+            analysis_seed=int(args.seed),
+            results_seed=results_rollout_seed,
+            topology_index=topology_index,
+        )
+        topology_metadata = dict(case.get("metadata", {}))
+        topology_metadata["rollout_seed_mode"] = str(_normalize_seed_mode(str(args.rollout_seed_mode)))
+        topology_metadata["rollout_seed"] = int(rollout_seed)
         topology_output_dir = output_dir if len(topology_cases) == 1 else (output_dir / topology_name)
         result = analyze_single_topology(
             actor=actor,
@@ -1538,27 +2311,46 @@ def main() -> None:
             output_dir=topology_output_dir,
             spec=topology_spec,
             topology_name=topology_name,
-            topology_metadata=dict(case.get("metadata", {})),
+            topology_metadata=topology_metadata,
             episodes=max(1, int(args.episodes)),
             max_steps=args.max_steps,
             episode_length_override=args.episode_length_override,
-            rollout_seed=int(args.seed) + topology_index,
+            rollout_seed=rollout_seed,
             pool_power_mix_agent_k=float(args.pool_power_mix_agent_k),
+            resource_bin_count=int(args.aggregated_mixture_resource_bin_count),
         )
         topology_summary_rows.append(dict(result["topology_summary_row"]))
+        all_topology_sender_gini_raw_rows.extend([dict(row) for row in result["raw_rows"]])
         all_topology_step_summary_rows.extend([dict(row) for row in result["step_summary_rows"]])
         all_topology_episode_step_rows.extend([dict(row) for row in result["episode_step_rows"]])
+        all_topology_ego_coop_step_rows.extend([dict(row) for row in result["ego_coop_step_rows"]])
+        all_topology_ego_coop_episode_step_rows.extend([dict(row) for row in result["ego_coop_episode_step_rows"]])
         all_topology_mixture_episode_step_rows.extend([dict(row) for row in result["mixture_episode_step_rows"]])
         all_topology_mixture_raw_rows.extend([dict(row) for row in result["mixture_raw_rows"]])
 
     write_csv(output_dir / "topology_summary.csv", topology_summary_rows)
-    write_csv(output_dir / "all_topologies_sender_allocation_gini_step_summary.csv", all_topology_step_summary_rows)
-    with (output_dir / "topology_summary.json").open("w", encoding="utf-8") as handle:
-        json.dump(topology_summary_rows, handle, ensure_ascii=False, indent=2)
+    write_csv(output_dir / "all_topos_sender_gini_step.csv", all_topology_step_summary_rows)
+    write_csv(output_dir / "all_topos_ego_coop_step.csv", all_topology_ego_coop_step_rows)
+    _write_json(output_dir / "topology_summary.json", topology_summary_rows)
     if len(topology_cases) > 1:
         style_by_policy = _sender_allocation_style_by_policy(float(args.pool_power_mix_agent_k))
         aggregated_step_summary_rows = summarize_sender_allocation_gini_episode_rows_across_topologies(
             all_topology_episode_step_rows
+        )
+        aggregated_ego_coop_step_rows = summarize_sender_ego_cooperation_episode_rows_across_topologies(
+            all_topology_ego_coop_episode_step_rows
+        )
+        aggregated_sender_gini_vs_ego_mean_rows = summarize_sender_allocation_gini_vs_resource(
+            all_topology_sender_gini_raw_rows,
+            resource_key="ego_mean_resource",
+            num_bins=int(args.aggregated_mixture_resource_bin_count),
+            policies=NON_AGENT_BASELINE_POLICIES,
+        )
+        aggregated_sender_gini_vs_sender_pool_rows = summarize_sender_allocation_gini_vs_resource(
+            all_topology_sender_gini_raw_rows,
+            resource_key="sender_pool_grown",
+            num_bins=int(args.aggregated_mixture_resource_bin_count),
+            policies=NON_AGENT_BASELINE_POLICIES,
         )
         aggregated_mixture_step_summary_rows = summarize_agent_unit_investment_equal_mixture_episode_rows_across_topologies(
             all_topology_mixture_episode_step_rows
@@ -1573,28 +2365,72 @@ def main() -> None:
             resource_key="ego_total_resource",
             num_bins=int(args.aggregated_mixture_resource_bin_count),
         )
+        aggregated_mixture_vs_sender_pool_rows = summarize_agent_unit_investment_equal_mixture_vs_resource(
+            all_topology_mixture_raw_rows,
+            resource_key="sender_pool_grown",
+            num_bins=int(args.aggregated_mixture_resource_bin_count),
+        )
         write_csv(
-            output_dir / "aggregated_topologies_sender_allocation_gini_step_summary.csv",
+            output_dir / "agg_topos_sender_gini_step.csv",
             aggregated_step_summary_rows,
         )
         write_csv(
-            output_dir / "agg_topos_agent_unitinv_equal_mix_step.csv",
+            output_dir / "agg_topos_ego_coop_step.csv",
+            aggregated_ego_coop_step_rows,
+        )
+        write_csv(
+            output_dir / "agg_topos_sender_allocation_gini_vs_ego_mean_res.csv",
+            aggregated_sender_gini_vs_ego_mean_rows,
+        )
+        write_csv(
+            output_dir / "agg_topos_sender_allocation_gini_vs_ego_sender_pool.csv",
+            aggregated_sender_gini_vs_sender_pool_rows,
+        )
+        write_csv(
+            output_dir / "agg_topos_agent_mix_step.csv",
             aggregated_mixture_step_summary_rows,
         )
         write_csv(
-            output_dir / "agg_topos_agent_unitinv_equal_mix_vs_ego_mean_res.csv",
+            output_dir / "agg_topos_agent_mix_vs_ego_mean.csv",
             aggregated_mixture_vs_ego_mean_rows,
         )
         write_csv(
-            output_dir / "agg_topos_agent_unitinv_equal_mix_vs_ego_total_res.csv",
+            output_dir / "agg_topos_agent_mix_vs_ego_total.csv",
             aggregated_mixture_vs_ego_total_rows,
+        )
+        write_csv(
+            output_dir / "agg_topos_agent_mix_vs_pool.csv",
+            aggregated_mixture_vs_sender_pool_rows,
         )
         plot_sender_allocation_gini_over_time(
             aggregated_step_summary_rows,
-            output_dir / "aggregated_topologies_sender_allocation_gini_over_time.png",
+            output_dir / "agg_topos_sender_gini.png",
             style_by_policy=style_by_policy,
             policies=NON_AGENT_BASELINE_POLICIES,
             title="Aggregated Sender Allocation Gini Over Time: Non-Agent Baselines",
+        )
+        plot_sender_ego_cooperation_over_time(
+            aggregated_ego_coop_step_rows,
+            output_dir / "agg_topos_ego_coop_over_time.png",
+            style_by_policy=style_by_policy,
+            policies=NON_AGENT_BASELINE_POLICIES,
+            title="Aggregated Ego Cooperation Ratio Over Time",
+        )
+        plot_sender_allocation_gini_vs_resource(
+            aggregated_sender_gini_vs_ego_mean_rows,
+            output_dir / "agg_topos_sender_allocation_gini_vs_ego_mean_res.png",
+            style_by_policy=style_by_policy,
+            policies=NON_AGENT_BASELINE_POLICIES,
+            title="Aggregated Sender Allocation Gini vs Ego Mean Resource",
+            resource_label="Sender Ego Mean Resource",
+        )
+        plot_sender_allocation_gini_vs_resource(
+            aggregated_sender_gini_vs_sender_pool_rows,
+            output_dir / "agg_topos_sender_allocation_gini_vs_ego_sender_pool.png",
+            style_by_policy=style_by_policy,
+            policies=NON_AGENT_BASELINE_POLICIES,
+            title="Aggregated Sender Allocation Gini vs Sender Pool",
+            resource_label="Sender Pool Grown",
         )
         plot_sender_allocation_gini_over_time(
             aggregated_step_summary_rows,
@@ -1605,24 +2441,69 @@ def main() -> None:
         )
         plot_agent_unit_investment_equal_mixture_weights_over_time(
             aggregated_mixture_step_summary_rows,
-            output_dir / "agg_topos_agent_unitinv_equal_mix_w_over_time.png",
+            output_dir / "agg_topos_agent_mix_w.png",
         )
         plot_agent_unit_investment_equal_mixture_vs_resource(
             aggregated_mixture_vs_ego_mean_rows,
-            output_dir / "agg_topos_agent_unitinv_equal_mix_vs_ego_mean_res.png",
+            output_dir / "agg_topos_agent_mix_vs_ego_mean.png",
+            resource_label="Sender Ego Mean Resource",
+        )
+        plot_agent_unit_investment_equal_mixture_vs_resource_points(
+            aggregated_mixture_vs_ego_mean_rows,
+            output_dir / "agg_topos_agent_mix_vs_ego_mean_pts.png",
+            resource_label="Sender Ego Mean Resource",
+        )
+        plot_agent_unit_investment_equal_mixture_vs_resource_raw(
+            all_topology_mixture_raw_rows,
+            output_dir / "agg_topos_agent_mix_vs_ego_mean_raw.png",
+            resource_key="ego_mean_resource",
             resource_label="Sender Ego Mean Resource",
         )
         plot_agent_unit_investment_equal_mixture_vs_resource(
             aggregated_mixture_vs_ego_total_rows,
-            output_dir / "agg_topos_agent_unitinv_equal_mix_vs_ego_total_res.png",
+            output_dir / "agg_topos_agent_mix_vs_ego_total.png",
             resource_label="Sender Ego Total Resource",
+        )
+        plot_agent_unit_investment_equal_mixture_vs_resource_points(
+            aggregated_mixture_vs_ego_total_rows,
+            output_dir / "agg_topos_agent_mix_vs_ego_total_pts.png",
+            resource_label="Sender Ego Total Resource",
+        )
+        plot_agent_unit_investment_equal_mixture_vs_resource_raw(
+            all_topology_mixture_raw_rows,
+            output_dir / "agg_topos_agent_mix_vs_ego_total_raw.png",
+            resource_key="ego_total_resource",
+            resource_label="Sender Ego Total Resource",
+        )
+        plot_agent_unit_investment_equal_mixture_vs_resource(
+            aggregated_mixture_vs_sender_pool_rows,
+            output_dir / "agg_topos_agent_mix_vs_pool.png",
+            resource_label="Sender Pool Grown",
+        )
+        plot_agent_unit_investment_equal_mixture_vs_resource_points(
+            aggregated_mixture_vs_sender_pool_rows,
+            output_dir / "agg_topos_agent_mix_vs_pool_pts.png",
+            resource_label="Sender Pool Grown",
+        )
+        plot_agent_unit_investment_equal_mixture_vs_resource_raw(
+            all_topology_mixture_raw_rows,
+            output_dir / "agg_topos_agent_mix_vs_pool_raw.png",
+            resource_key="sender_pool_grown",
+            resource_label="Sender Pool Grown",
         )
         plot_sender_allocation_gini_over_time_by_topology(
             all_topology_step_summary_rows,
-            output_dir / "all_topologies_sender_allocation_gini_over_time.png",
+            output_dir / "all_topos_sender_gini.png",
             style_by_policy=style_by_policy,
             policies=NON_AGENT_BASELINE_POLICIES,
             title_prefix="Non-Agent Baselines",
+        )
+        plot_sender_ego_cooperation_over_time_by_topology(
+            all_topology_ego_coop_step_rows,
+            output_dir / "all_topos_ego_coop_over_time.png",
+            style_by_policy=style_by_policy,
+            policies=NON_AGENT_BASELINE_POLICIES,
+            title_prefix="Ego Cooperation",
         )
         plot_sender_allocation_gini_over_time_by_topology(
             all_topology_step_summary_rows,

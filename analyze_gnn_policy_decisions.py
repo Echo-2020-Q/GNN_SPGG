@@ -881,6 +881,13 @@ def compute_feature_importance(
                 "feature_group": FEATURE_GROUPS.get(feature_key, "unknown"),
                 "perturbation_mode": perturbation_mode,
                 "allocation_l1_mean": float(np.mean(allocation_l1_values)) if allocation_l1_values else 0.0,
+                "allocation_l1_std": float(np.std(allocation_l1_values, ddof=0)) if len(allocation_l1_values) > 1 else 0.0,
+                "allocation_l1_sem": (
+                    float(np.std(allocation_l1_values, ddof=0) / np.sqrt(len(allocation_l1_values)))
+                    if len(allocation_l1_values) > 1
+                    else 0.0
+                ),
+                "allocation_l1_count": int(len(allocation_l1_values)),
                 "transfer_l1_mean": float(np.mean(transfer_l1_values)) if transfer_l1_values else 0.0,
                 "logit_l1_mean": float(np.mean(logit_l1_values)) if logit_l1_values else 0.0,
                 "self_allocation_delta_mean": float(np.mean(self_delta_values)) if self_delta_values else 0.0,
@@ -1282,88 +1289,63 @@ def write_episode_summary_csv(path: Path, summaries: Sequence[EpisodeSummary]) -
     write_csv(path, rows)
 
 
+def collect_decision_records_rows(snapshots: Sequence[Snapshot]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for snapshot in snapshots:
+        observation = snapshot.observation
+        policy = snapshot.policy
+        local_mask = observation["local_mask"].astype(bool, copy=False)
+        degrees = local_mask.sum(axis=1, dtype=np.int64) - 1
+        num_nodes = local_mask.shape[0]
+
+        for sender in range(num_nodes):
+            valid_receivers = np.flatnonzero(local_mask[sender])
+            row_allocation = policy.allocation_matrix[sender, valid_receivers]
+            row_entropy = _entropy(row_allocation)
+            top_receiver = int(valid_receivers[np.argmax(row_allocation)])
+            self_allocation = float(policy.allocation_matrix[sender, sender])
+
+            for receiver in valid_receivers:
+                rows.append(
+                    {
+                        "episode": snapshot.episode,
+                        "step": snapshot.step,
+                        "sender": sender,
+                        "receiver": int(receiver),
+                        "is_self": int(sender == receiver),
+                        "is_top_receiver": int(top_receiver == int(receiver)),
+                        "reward": snapshot.reward,
+                        "cooperation_rate": snapshot.actual_cooperation_rate,
+                        "gini": snapshot.gini,
+                        "sender_pool_grown": float(observation["pool_grown"][sender]),
+                        "sender_resource": float(observation["resources"][sender]),
+                        "sender_pool_raw_norm": float(observation["pool_raw_norm"][sender]),
+                        "sender_resource_norm": float(observation["resource_norm"][sender]),
+                        "sender_degree": int(degrees[sender]),
+                        "sender_degree_norm": float(observation["degree_norm"][sender]),
+                        "sender_strategy_norm": float(observation["strategy_norm"][sender]),
+                        "sender_x_actual": float(observation["x_actual"][sender]),
+                        "receiver_resource": float(observation["resources"][receiver]),
+                        "receiver_pool_raw_norm": float(observation["pool_raw_norm"][receiver]),
+                        "receiver_resource_norm": float(observation["resource_norm"][receiver]),
+                        "receiver_degree": int(degrees[int(receiver)]),
+                        "receiver_degree_norm": float(observation["degree_norm"][receiver]),
+                        "receiver_strategy_norm": float(observation["strategy_norm"][receiver]),
+                        "receiver_x_actual": float(observation["x_actual"][receiver]),
+                        "incoming_receiver": float(policy.incoming_resources[receiver]),
+                        "allocation": float(policy.allocation_matrix[sender, receiver]),
+                        "transferred": float(policy.transferred_resources[sender, receiver]),
+                        "logit": float(policy.logits[sender, receiver]),
+                        "self_allocation": self_allocation,
+                        "row_entropy": row_entropy,
+                    }
+                )
+    return rows
+
+
 def write_decision_records_csv(path: Path, snapshots: Sequence[Snapshot]) -> None:
-    fieldnames = [
-        "episode",
-        "step",
-        "sender",
-        "receiver",
-        "is_self",
-        "is_top_receiver",
-        "reward",
-        "cooperation_rate",
-        "gini",
-        "sender_pool_grown",
-        "sender_resource",
-        "sender_pool_raw_norm",
-        "sender_resource_norm",
-        "sender_degree_norm",
-        "sender_strategy_norm",
-        "sender_x_actual",
-        "receiver_resource",
-        "receiver_pool_raw_norm",
-        "receiver_resource_norm",
-        "receiver_degree_norm",
-        "receiver_strategy_norm",
-        "receiver_x_actual",
-        "incoming_receiver",
-        "allocation",
-        "transferred",
-        "logit",
-        "self_allocation",
-        "row_entropy",
-    ]
-
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-
-        for snapshot in snapshots:
-            observation = snapshot.observation
-            policy = snapshot.policy
-            local_mask = observation["local_mask"].astype(bool, copy=False)
-            num_nodes = local_mask.shape[0]
-
-            for sender in range(num_nodes):
-                valid_receivers = np.flatnonzero(local_mask[sender])
-                row_allocation = policy.allocation_matrix[sender, valid_receivers]
-                row_entropy = _entropy(row_allocation)
-                top_receiver = int(valid_receivers[np.argmax(row_allocation)])
-                self_allocation = float(policy.allocation_matrix[sender, sender])
-
-                for receiver in valid_receivers:
-                    writer.writerow(
-                        {
-                            "episode": snapshot.episode,
-                            "step": snapshot.step,
-                            "sender": sender,
-                            "receiver": int(receiver),
-                            "is_self": int(sender == receiver),
-                            "is_top_receiver": int(top_receiver == int(receiver)),
-                            "reward": snapshot.reward,
-                            "cooperation_rate": snapshot.actual_cooperation_rate,
-                            "gini": snapshot.gini,
-                            "sender_pool_grown": float(observation["pool_grown"][sender]),
-                            "sender_resource": float(observation["resources"][sender]),
-                            "sender_pool_raw_norm": float(observation["pool_raw_norm"][sender]),
-                            "sender_resource_norm": float(observation["resource_norm"][sender]),
-                            "sender_degree_norm": float(observation["degree_norm"][sender]),
-                            "sender_strategy_norm": float(observation["strategy_norm"][sender]),
-                            "sender_x_actual": float(observation["x_actual"][sender]),
-                            "receiver_resource": float(observation["resources"][receiver]),
-                            "receiver_pool_raw_norm": float(observation["pool_raw_norm"][receiver]),
-                            "receiver_resource_norm": float(observation["resource_norm"][receiver]),
-                            "receiver_degree_norm": float(observation["degree_norm"][receiver]),
-                            "receiver_strategy_norm": float(observation["strategy_norm"][receiver]),
-                            "receiver_x_actual": float(observation["x_actual"][receiver]),
-                            "incoming_receiver": float(policy.incoming_resources[receiver]),
-                            "allocation": float(policy.allocation_matrix[sender, receiver]),
-                            "transferred": float(policy.transferred_resources[sender, receiver]),
-                            "logit": float(policy.logits[sender, receiver]),
-                            "self_allocation": self_allocation,
-                            "row_entropy": row_entropy,
-                        }
-                    )
+    rows = collect_decision_records_rows(snapshots)
+    write_csv(path, rows)
 
 
 def _select_snapshot_indices(total_count: int, snapshot_count: int) -> list[int]:

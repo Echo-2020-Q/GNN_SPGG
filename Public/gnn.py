@@ -1,0 +1,674 @@
+"""Pretrained GraphNet actor: deterministic allocation inference only."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping, Sequence
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+Observation = Mapping[str, np.ndarray]
+
+
+@dataclass
+class GNNPolicyConfig:
+    hidden_dim: int = 128
+    num_message_passing_layers: int = 2
+    local_hidden_dim: int = 64
+    score_hidden_dim: int = 64
+    temperature: float = 1.0
+    action_distribution: str = "softmax"
+    dirichlet_alpha_floor: float = 1e-3
+
+    def __post_init__(self) -> None:
+        if self.num_message_passing_layers != 2:
+            raise ValueError("This pretrained architecture uses two GraphNet blocks.")
+        if min(self.hidden_dim, self.local_hidden_dim, self.score_hidden_dim) <= 0:
+            raise ValueError("Hidden dimensions must be positive.")
+        if self.temperature <= 0 or self.dirichlet_alpha_floor <= 0:
+            raise ValueError("Temperature and concentration floor must be positive.")
+        if self.action_distribution not in {"softmax", "dirichlet"}:
+            raise ValueError("Unsupported action distribution.")
+
+
+@dataclass(frozen=True)
+class GraphTensorInput:
+    """Dense GraphNet input for a single graph.
+
+    Shapes:
+    - global_features: [global_input_dim]
+    - node_features: [num_nodes, node_input_dim]
+    - edge_features: [num_nodes, num_nodes, edge_input_dim]
+    - edge_mask: [num_nodes, num_nodes]
+    - ego_mask: [num_nodes, num_nodes]
+    - pool_values: [num_nodes]
+    """
+
+    global_features: Tensor
+    node_features: Tensor
+    edge_features: Tensor
+    edge_mask: Tensor
+    node_mask: Tensor
+    ego_mask: Tensor
+    pool_values: Tensor
+
+
+@dataclass(frozen=True)
+class GraphTensorState:
+    """Intermediate GraphNet state with dense edge tensors."""
+
+    global_features: Tensor
+    node_features: Tensor
+    edge_features: Tensor
+    edge_mask: Tensor
+    node_mask: Tensor
+
+
+@dataclass(frozen=True)
+class BackboneOutput:
+    """Final backbone embeddings used by the local allocation head.
+
+    Shapes:
+    - global_embedding: [backbone_hidden_dim]
+    - node_embeddings: [num_nodes, backbone_hidden_dim]
+    - edge_embeddings: [num_nodes, num_nodes, backbone_hidden_dim]
+    - edge_mask: [num_nodes, num_nodes]
+    - ego_mask: [num_nodes, num_nodes]
+    - pool_values: [num_nodes]
+    """
+
+    global_embedding: Tensor
+    node_embeddings: Tensor
+    edge_embeddings: Tensor
+    edge_mask: Tensor
+    node_mask: Tensor
+    ego_mask: Tensor
+    pool_values: Tensor
+
+
+@dataclass(frozen=True)
+class FlattenedBatchedEgoSubgraphs:
+    """Flattened ego-subgraph batch over (graph, center) pairs."""
+
+    batch_indices: Tensor
+    center_indices: Tensor
+    center_local_indices: Tensor
+    member_indices: Tensor
+    local_node_features: Tensor
+    local_node_mask: Tensor
+    local_edge_features: Tensor
+    local_edge_mask: Tensor
+    local_global_features: Tensor
+    pool_value: Tensor
+
+
+@dataclass(frozen=True)
+class LocalGraphOutput:
+    """Local tiny GraphNet output on one induced ego-subgraph."""
+
+    global_embedding: Tensor
+    node_embeddings: Tensor
+    edge_embeddings: Tensor
+    edge_mask: Tensor
+    node_mask: Tensor
+
+
+class MLP(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.net(inputs)
+
+
+def _apply_partitioned_linear(
+    linear: nn.Linear,
+    inputs: Sequence[Tensor],
+    input_dims: Sequence[int],
+) -> Tensor:
+    """Apply one linear layer to logical input parts without materializing their concat."""
+
+    if len(inputs) != len(input_dims):
+        raise ValueError("inputs and input_dims must have the same length.")
+    if sum(int(item) for item in input_dims) != int(linear.in_features):
+        raise ValueError("input_dims do not match the linear layer input width.")
+
+    output: Tensor | None = None
+    for index, (part, weight) in enumerate(zip(inputs, linear.weight.split(tuple(int(item) for item in input_dims), dim=1))):
+        projected = F.linear(part, weight, linear.bias if index == 0 else None)
+        output = projected if output is None else (output + projected)
+
+    if output is None:
+        raise ValueError("inputs must contain at least one tensor.")
+    return output
+
+
+def _apply_partitioned_mlp(
+    mlp: MLP,
+    inputs: Sequence[Tensor],
+    input_dims: Sequence[int],
+) -> Tensor:
+    """Equivalent to mlp(torch.cat(inputs, dim=-1)) without allocating the concat tensor."""
+
+    hidden = _apply_partitioned_linear(mlp.net[0], inputs, input_dims)
+    hidden = mlp.net[1](hidden)
+    return mlp.net[2](hidden)
+
+
+class ObservationGraphBuilder:
+    """Builds the dense GraphNet tensors (u, V, E) from the environment observation."""
+
+    node_feature_names = (
+        "pool_raw_norm",
+        "resource_norm",
+        "degree_norm",
+        "strategy_norm",
+    )
+    global_feature_names = (
+        "x_actual",
+        "resource_norm",
+        "pool_raw_norm",
+        "gini",
+    )
+
+    @property
+    def node_input_dim(self) -> int:
+        return len(self.node_feature_names)
+
+    @property
+    def edge_input_dim(self) -> int:
+        return 1
+
+    @property
+    def global_input_dim(self) -> int:
+        return len(self.global_feature_names)
+
+    def build(self, observation: Observation, device: torch.device) -> GraphTensorInput:
+        ego_mask = torch.as_tensor(observation["local_mask"], dtype=torch.bool, device=device)
+        if ego_mask.ndim != 2 or ego_mask.size(0) != ego_mask.size(1):
+            raise ValueError("observation['local_mask'] must be a square matrix.")
+
+        edge_mask = ego_mask
+        node_mask = torch.ones(ego_mask.size(0), dtype=torch.bool, device=device)
+
+        node_features = torch.stack(
+            [
+                torch.as_tensor(observation[key], dtype=torch.float32, device=device)
+                for key in self.node_feature_names
+            ],
+            dim=-1,
+        )
+        global_features = torch.stack(
+            [
+                torch.as_tensor(observation[key], dtype=torch.float32, device=device).mean()
+                for key in self.global_feature_names
+            ],
+            dim=0,
+        )
+        edge_features = edge_mask.to(dtype=torch.float32).unsqueeze(-1)
+        pool_values = torch.as_tensor(observation["pool_grown"], dtype=torch.float32, device=device)
+
+        return GraphTensorInput(
+            global_features=global_features,
+            node_features=node_features,
+            edge_features=edge_features,
+            edge_mask=edge_mask,
+            node_mask=node_mask,
+            ego_mask=ego_mask,
+            pool_values=pool_values,
+        )
+
+
+def _masked_edge_sum_by_receiver(edge_features: Tensor, edge_mask: Tensor) -> Tensor:
+    mask = edge_mask.unsqueeze(-1).to(dtype=edge_features.dtype)
+    if edge_features.ndim == 4:
+        return (edge_features * mask).sum(dim=1)
+    return (edge_features * mask).sum(dim=0)
+
+
+def _masked_global_edge_normalized_sum(edge_features: Tensor, edge_mask: Tensor) -> Tensor:
+    mask = edge_mask.unsqueeze(-1).to(dtype=edge_features.dtype)
+    if edge_features.ndim == 4:
+        edge_count = edge_mask.sum(dim=(1, 2)).clamp_min(1).to(dtype=edge_features.dtype).unsqueeze(-1)
+        return (edge_features * mask).sum(dim=(1, 2)) / edge_count
+    edge_count = edge_mask.sum().clamp_min(1).to(dtype=edge_features.dtype)
+    return (edge_features * mask).sum(dim=(0, 1)) / edge_count
+
+
+class GraphNetBlock(nn.Module):
+    """Single dense GraphNet block.
+
+    Input shapes:
+    - u: [global_input_dim]
+    - V: [num_nodes, node_input_dim]
+    - E: [num_nodes, num_nodes, edge_input_dim]
+    - edge_mask: [num_nodes, num_nodes]
+
+    Output shapes:
+    - u': [global_output_dim]
+    - V': [num_nodes, node_output_dim]
+    - E': [num_nodes, num_nodes, edge_output_dim]
+    """
+
+    def __init__(
+        self,
+        global_input_dim: int,
+        node_input_dim: int,
+        edge_input_dim: int,
+        hidden_dim: int,
+        global_output_dim: int,
+        node_output_dim: int,
+        edge_output_dim: int,
+    ):
+        super().__init__()
+        self.edge_model = MLP(
+            edge_input_dim + (2 * node_input_dim) + global_input_dim,
+            hidden_dim,
+            edge_output_dim,
+        )
+        self.node_model = MLP(
+            node_input_dim + edge_output_dim + global_input_dim,
+            hidden_dim,
+            node_output_dim,
+        )
+        self.global_model = MLP(
+            global_input_dim + node_output_dim + edge_output_dim,
+            hidden_dim,
+            global_output_dim,
+        )
+
+    def forward(self, state: GraphTensorState) -> GraphTensorState:
+        squeeze_batch = state.node_features.ndim == 2
+        if squeeze_batch:
+            global_features = state.global_features.unsqueeze(0)
+            node_features = state.node_features.unsqueeze(0)
+            edge_features = state.edge_features.unsqueeze(0)
+            edge_mask = state.edge_mask.unsqueeze(0)
+            node_mask = state.node_mask.unsqueeze(0)
+        else:
+            global_features = state.global_features
+            node_features = state.node_features
+            edge_features = state.edge_features
+            edge_mask = state.edge_mask
+            node_mask = state.node_mask
+
+        batch_size, num_nodes = node_features.shape[:2]
+        updated_edges = _apply_partitioned_mlp(
+            self.edge_model,
+            (
+                edge_features,
+                node_features[:, :, None, :],
+                node_features[:, None, :, :],
+                global_features[:, None, None, :],
+            ),
+            (
+                int(edge_features.size(-1)),
+                int(node_features.size(-1)),
+                int(node_features.size(-1)),
+                int(global_features.size(-1)),
+            ),
+        )
+        updated_edges = updated_edges * edge_mask.unsqueeze(-1).to(dtype=updated_edges.dtype)
+
+        aggregated_edge_messages = _masked_edge_sum_by_receiver(updated_edges, edge_mask)
+        updated_nodes = _apply_partitioned_mlp(
+            self.node_model,
+            (
+                node_features,
+                aggregated_edge_messages,
+                global_features[:, None, :],
+            ),
+            (
+                int(node_features.size(-1)),
+                int(aggregated_edge_messages.size(-1)),
+                int(global_features.size(-1)),
+            ),
+        )
+        updated_nodes = updated_nodes * node_mask.unsqueeze(-1).to(dtype=updated_nodes.dtype)
+
+        node_count = node_mask.sum(dim=1).clamp_min(1).to(dtype=updated_nodes.dtype).unsqueeze(-1)
+        aggregated_nodes = updated_nodes.sum(dim=1) / node_count
+        aggregated_edges = _masked_global_edge_normalized_sum(updated_edges, edge_mask)
+        updated_global = _apply_partitioned_mlp(
+            self.global_model,
+            (
+                global_features,
+                aggregated_nodes,
+                aggregated_edges,
+            ),
+            (
+                int(global_features.size(-1)),
+                int(aggregated_nodes.size(-1)),
+                int(aggregated_edges.size(-1)),
+            ),
+        )
+        if squeeze_batch:
+            return GraphTensorState(
+                global_features=updated_global.squeeze(0),
+                node_features=updated_nodes.squeeze(0),
+                edge_features=updated_edges.squeeze(0),
+                edge_mask=edge_mask.squeeze(0),
+                node_mask=node_mask.squeeze(0),
+            )
+
+        return GraphTensorState(
+            global_features=updated_global,
+            node_features=updated_nodes,
+            edge_features=updated_edges,
+            edge_mask=edge_mask,
+            node_mask=node_mask,
+        )
+
+
+class TwoLayerGraphNetBackbone(nn.Module):
+    """Two sequential GraphNet blocks producing u*, V*, E*."""
+
+    def __init__(
+        self,
+        global_input_dim: int,
+        node_input_dim: int,
+        edge_input_dim: int,
+        hidden_dim: int,
+    ):
+        super().__init__()
+        self.block1 = GraphNetBlock(
+            global_input_dim=global_input_dim,
+            node_input_dim=node_input_dim,
+            edge_input_dim=edge_input_dim,
+            hidden_dim=hidden_dim,
+            global_output_dim=hidden_dim,
+            node_output_dim=hidden_dim,
+            edge_output_dim=hidden_dim,
+        )
+        self.block2 = GraphNetBlock(
+            global_input_dim=hidden_dim,
+            node_input_dim=hidden_dim,
+            edge_input_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            global_output_dim=hidden_dim,
+            node_output_dim=hidden_dim,
+            edge_output_dim=hidden_dim,
+        )
+
+    def forward(self, graph_input: GraphTensorInput) -> BackboneOutput:
+        state = GraphTensorState(
+            global_features=graph_input.global_features,
+            node_features=graph_input.node_features,
+            edge_features=graph_input.edge_features,
+            edge_mask=graph_input.edge_mask,
+            node_mask=graph_input.node_mask,
+        )
+        state = self.block1(state)
+        state = self.block2(state)
+        return BackboneOutput(
+            global_embedding=state.global_features,
+            node_embeddings=state.node_features,
+            edge_embeddings=state.edge_features,
+            edge_mask=graph_input.edge_mask,
+            node_mask=graph_input.node_mask,
+            ego_mask=graph_input.ego_mask,
+            pool_values=graph_input.pool_values,
+        )
+
+
+def ensure_batched_backbone_output(backbone_output: BackboneOutput) -> BackboneOutput:
+    if backbone_output.node_embeddings.ndim == 3:
+        return backbone_output
+    if backbone_output.node_embeddings.ndim != 2:
+        raise ValueError("BackboneOutput node_embeddings must have rank 2 or 3.")
+    return BackboneOutput(
+        global_embedding=backbone_output.global_embedding.unsqueeze(0),
+        node_embeddings=backbone_output.node_embeddings.unsqueeze(0),
+        edge_embeddings=backbone_output.edge_embeddings.unsqueeze(0),
+        edge_mask=backbone_output.edge_mask.unsqueeze(0),
+        node_mask=backbone_output.node_mask.unsqueeze(0),
+        ego_mask=backbone_output.ego_mask.unsqueeze(0),
+        pool_values=backbone_output.pool_values.unsqueeze(0),
+    )
+
+
+def extract_batched_center_chunk_ego_subgraphs(
+    backbone_output: BackboneOutput,
+    center_indices: Sequence[int] | Tensor,
+) -> FlattenedBatchedEgoSubgraphs:
+    backbone_output = ensure_batched_backbone_output(backbone_output)
+    batch_size, num_nodes, hidden_dim = backbone_output.node_embeddings.shape
+    device = backbone_output.node_embeddings.device
+    center_indices_tensor = torch.as_tensor(center_indices, dtype=torch.int64, device=device)
+    if center_indices_tensor.ndim != 1 or center_indices_tensor.numel() == 0:
+        raise ValueError("center_indices must be a non-empty 1D tensor or sequence.")
+    if int(center_indices_tensor.min().item()) < 0 or int(center_indices_tensor.max().item()) >= num_nodes:
+        raise IndexError("center_indices contain an out-of-range value.")
+
+    num_centers = int(center_indices_tensor.numel())
+    member_mask = backbone_output.ego_mask[:, center_indices_tensor, :]
+    member_mask_flat = member_mask.reshape(batch_size * num_centers, num_nodes)
+    if not torch.all(member_mask_flat.any(dim=1)):
+        raise RuntimeError("Each batched ego-subgraph must contain at least the center node.")
+
+    base_indices = torch.arange(num_nodes, device=device).unsqueeze(0).expand(batch_size * num_centers, -1)
+    masked_order = torch.where(member_mask_flat, base_indices, base_indices + num_nodes)
+    sorted_member_indices = masked_order.argsort(dim=1)
+    member_counts = member_mask_flat.sum(dim=1)
+    max_members = int(member_counts.max().item())
+    member_indices = sorted_member_indices[:, :max_members]
+    local_node_mask = torch.gather(member_mask_flat, 1, member_indices)
+
+    expanded_node_embeddings = backbone_output.node_embeddings.unsqueeze(1).expand(batch_size, num_centers, num_nodes, hidden_dim)
+    expanded_node_embeddings = expanded_node_embeddings.reshape(batch_size * num_centers, num_nodes, hidden_dim)
+    gather_nodes = member_indices.unsqueeze(-1).expand(batch_size * num_centers, max_members, hidden_dim)
+    local_node_embeddings = torch.gather(expanded_node_embeddings, 1, gather_nodes)
+
+    batch_indices = torch.arange(batch_size, device=device, dtype=torch.int64).unsqueeze(1).expand(batch_size, num_centers).reshape(-1)
+    flat_center_indices = center_indices_tensor.unsqueeze(0).expand(batch_size, num_centers).reshape(-1)
+    row_indices = member_indices.unsqueeze(2).expand(batch_size * num_centers, max_members, max_members)
+    col_indices = member_indices.unsqueeze(1).expand(batch_size * num_centers, max_members, max_members)
+    local_edge_features = backbone_output.edge_embeddings[batch_indices[:, None, None], row_indices, col_indices]
+    local_edge_mask = backbone_output.edge_mask[batch_indices[:, None, None], row_indices, col_indices]
+    local_edge_mask = local_edge_mask & local_node_mask.unsqueeze(1) & local_node_mask.unsqueeze(2)
+
+    center_local_matches = (member_indices == flat_center_indices.unsqueeze(1)) & local_node_mask
+    if not torch.all(center_local_matches.any(dim=1)):
+        raise RuntimeError("Failed to identify the center node inside a batched ego-subgraph.")
+    center_local_indices = center_local_matches.to(dtype=torch.int64).argmax(dim=1)
+
+    center_indicator = torch.zeros(
+        (batch_size * num_centers, max_members, 1),
+        dtype=local_node_embeddings.dtype,
+        device=device,
+    )
+    center_indicator[
+        torch.arange(batch_size * num_centers, device=device),
+        center_local_indices,
+        0,
+    ] = 1.0
+    center_indicator = center_indicator * local_node_mask.unsqueeze(-1).to(dtype=local_node_embeddings.dtype)
+    local_node_features = torch.cat([local_node_embeddings, center_indicator], dim=-1)
+
+    pool_value = backbone_output.pool_values[batch_indices, flat_center_indices]
+    ego_size = local_node_mask.sum(dim=1).to(dtype=local_node_embeddings.dtype).unsqueeze(-1)
+    center_nodes = backbone_output.node_embeddings[batch_indices, flat_center_indices]
+    local_global_features = torch.cat(
+        [
+            backbone_output.global_embedding[batch_indices],
+            center_nodes,
+            pool_value.unsqueeze(-1),
+            ego_size,
+        ],
+        dim=-1,
+    )
+
+    return FlattenedBatchedEgoSubgraphs(
+        batch_indices=batch_indices,
+        center_indices=flat_center_indices,
+        center_local_indices=center_local_indices,
+        member_indices=member_indices,
+        local_node_features=local_node_features,
+        local_node_mask=local_node_mask,
+        local_edge_features=local_edge_features,
+        local_edge_mask=local_edge_mask,
+        local_global_features=local_global_features,
+        pool_value=pool_value,
+    )
+
+
+class EgoLocalGraphNet(nn.Module):
+    """One-layer tiny GraphNet operating on the induced ego-subgraph."""
+
+    def __init__(self, backbone_hidden_dim: int, local_hidden_dim: int):
+        super().__init__()
+        self.block = GraphNetBlock(
+            global_input_dim=(2 * backbone_hidden_dim) + 2,
+            node_input_dim=backbone_hidden_dim + 1,
+            edge_input_dim=backbone_hidden_dim,
+            hidden_dim=local_hidden_dim,
+            global_output_dim=local_hidden_dim,
+            node_output_dim=local_hidden_dim,
+            edge_output_dim=local_hidden_dim,
+        )
+
+    def forward(
+        self,
+        ego_subgraph: FlattenedBatchedEgoSubgraphs,
+    ) -> LocalGraphOutput:
+        state = GraphTensorState(
+            global_features=ego_subgraph.local_global_features,
+            node_features=ego_subgraph.local_node_features,
+            edge_features=ego_subgraph.local_edge_features,
+            edge_mask=ego_subgraph.local_edge_mask,
+            node_mask=ego_subgraph.local_node_mask,
+        )
+        state = self.block(state)
+        return LocalGraphOutput(
+            global_embedding=state.global_features,
+            node_embeddings=state.node_features,
+            edge_embeddings=state.edge_features,
+            edge_mask=state.edge_mask,
+            node_mask=state.node_mask,
+        )
+
+
+class ScoreReadout(nn.Module):
+    """Maps concat(tilde_v_ij, tilde_v_ii) to a scalar score z_ij."""
+
+    def __init__(self, local_hidden_dim: int, hidden_dim: int):
+        super().__init__()
+        self.mlp = MLP(2 * local_hidden_dim, hidden_dim, 1)
+
+    def forward(self, local_node_embeddings: Tensor, center_embedding: Tensor) -> Tensor:
+        if local_node_embeddings.ndim == 3:
+            center_context = center_embedding.unsqueeze(1).expand(-1, local_node_embeddings.size(1), -1)
+        else:
+            center_context = center_embedding.unsqueeze(0).expand(local_node_embeddings.size(0), -1)
+        score_inputs = torch.cat([local_node_embeddings, center_context], dim=-1)
+        return self.mlp(score_inputs).squeeze(-1)
+
+
+class AllocationHead(nn.Module):
+    """Builds row-wise allocation parameters for either softmax or Dirichlet policies."""
+
+    def __init__(self, temperature: float, dirichlet_alpha_floor: float):
+        super().__init__()
+        self.temperature = float(temperature)
+        self.dirichlet_alpha_floor = float(dirichlet_alpha_floor)
+
+    def logits(self, scores: Tensor) -> Tensor:
+        return scores / self.temperature
+
+    def concentration(self, scores: Tensor, valid_mask: Tensor | None = None) -> Tensor:
+        concentration = F.softplus(self.logits(scores)) + self.dirichlet_alpha_floor
+        if valid_mask is not None:
+            concentration = torch.where(valid_mask, concentration, torch.zeros_like(concentration))
+        return concentration
+
+    def forward(self, scores: Tensor, pool_value: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        logits = self.logits(scores)
+        allocation = torch.softmax(logits, dim=-1)
+        if pool_value.ndim > 0:
+            transferred = allocation * pool_value.unsqueeze(-1)
+        else:
+            transferred = allocation * pool_value
+        return logits, allocation, transferred
+
+
+class GNNAllocationPolicy(nn.Module):
+    """Map one observation to an N x N row-normalized allocation matrix."""
+
+    def __init__(self, config: GNNPolicyConfig):
+        super().__init__()
+        self.config = config
+        self.graph_builder = ObservationGraphBuilder()
+        self.backbone = TwoLayerGraphNetBackbone(
+            self.graph_builder.global_input_dim,
+            self.graph_builder.node_input_dim,
+            self.graph_builder.edge_input_dim,
+            config.hidden_dim,
+        )
+        self.local_graph_net = EgoLocalGraphNet(config.hidden_dim, config.local_hidden_dim)
+        self.score_readout = ScoreReadout(config.local_hidden_dim, config.score_hidden_dim)
+        self.allocation_head = AllocationHead(config.temperature, config.dirichlet_alpha_floor)
+
+    def _compute_local_policy_inputs(
+        self,
+        backbone_output: BackboneOutput,
+    ) -> tuple[BackboneOutput, FlattenedBatchedEgoSubgraphs, Tensor, Tensor, Tensor]:
+        backbone_output = ensure_batched_backbone_output(backbone_output)
+        batch_size, num_nodes = backbone_output.node_embeddings.shape[:2]
+        device = backbone_output.node_embeddings.device
+        masked_score_value = torch.finfo(backbone_output.node_embeddings.dtype).min
+        ego_subgraph = extract_batched_center_chunk_ego_subgraphs(
+            backbone_output,
+            torch.arange(num_nodes, device=device, dtype=torch.int64),
+        )
+        local_output = self.local_graph_net(ego_subgraph)
+        flat_indices = torch.arange(ego_subgraph.member_indices.size(0), device=device)
+        center_embedding = local_output.node_embeddings[flat_indices, ego_subgraph.center_local_indices]
+        local_scores = self.score_readout(local_output.node_embeddings, center_embedding)
+        valid_local_nodes = ego_subgraph.local_node_mask & local_output.node_mask
+        local_scores = torch.where(
+            valid_local_nodes,
+            local_scores,
+            torch.full_like(local_scores, masked_score_value),
+        )
+        local_logits = self.allocation_head.logits(local_scores)
+        local_concentration = self.allocation_head.concentration(local_scores, valid_local_nodes)
+        return backbone_output, ego_subgraph, valid_local_nodes, local_logits, local_concentration
+
+    @torch.inference_mode()
+    def forward(self, observation: Observation) -> Tensor:
+        device = next(self.parameters()).device
+        backbone = self.backbone(self.graph_builder.build(observation, device))
+        backbone, ego, valid, logits, concentration = self._compute_local_policy_inputs(backbone)
+        if self.config.action_distribution == "dirichlet":
+            allocation = concentration / concentration.sum(dim=-1, keepdim=True).clamp_min(
+                self.config.dirichlet_alpha_floor
+            )
+        else:
+            allocation = torch.softmax(logits, dim=-1)
+        batch_size, num_nodes = backbone.node_embeddings.shape[:2]
+        matrix = allocation.new_zeros((batch_size, num_nodes, num_nodes))
+        batches = ego.batch_indices.unsqueeze(1).expand_as(ego.member_indices)
+        senders = ego.center_indices.unsqueeze(1).expand_as(ego.member_indices)
+        matrix[batches[valid], senders[valid], ego.member_indices[valid]] = allocation[valid]
+        return matrix[0]
+
+    def allocate(self, observation: Observation) -> np.ndarray:
+        return self(observation).cpu().numpy()
+
+
+def load_gnn(weights_path: str | Path | None = None, device: str = "cpu") -> GNNAllocationPolicy:
+    """Load the bundled actor weights; no training checkpoint is required."""
+    path = Path(weights_path) if weights_path is not None else Path(__file__).parent / "models" / "gnn.pt"
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    policy = GNNAllocationPolicy(GNNPolicyConfig(**payload["policy_config"]))
+    policy.load_state_dict(payload["actor_state_dict"], strict=True)
+    return policy.to(device).eval().requires_grad_(False)

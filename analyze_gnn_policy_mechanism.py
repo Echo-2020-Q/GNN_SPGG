@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -19,7 +20,7 @@ except ImportError:
     plt = None
 
 from Project1.env import SPGGEnv, gini_coefficient
-from Project1.policies.rule_based import ProportionalContributionPolicy, UniformAllocationPolicy
+from Project1.policies.rule_based import PoolPowerMixAllocationPolicy, ProportionalContributionPolicy, UniformAllocationPolicy
 
 from analyze_gnn_policy_decisions import (
     TOPOLOGY_LABELS,
@@ -33,6 +34,7 @@ from analyze_gnn_policy_decisions import (
     build_graph_from_spec,
     build_spec_for_topology,
     collect_graph_stats,
+    collect_decision_records_rows,
     compute_policy_behavior_stats,
     load_actor_from_run_dir,
     parse_topology_list,
@@ -78,14 +80,14 @@ SCRIPT_DEFAULTS = {
     # 建议你把这个名字改成能反映配置的形式，比如：
     # 0416_pool_intervention_original_10ep
    # "output_subdir_name": "0418_regu_ba_resourcepool_intervention_policy_mechanism",
-    "output_subdir_name": "0418_total_regu_ba_policy_mechanism",
+    "output_subdir_name": "0420_total_regu_ba_BA_policy_mechanism",
 
     # 要分析的图拓扑，多个值用英文逗号分隔。
     # 支持：original, regular, er, ws, ba。
     # - original：完全按这次训练原本 results.json 里的拓扑来建图；
     # - regular / er / ws / ba：把同一个训练好的策略迁移到其他图上测。
     # 这个脚本默认给 original，避免一上来就做跨拓扑批量跑。
-    "topologies": "regular,ba",
+    "topologies": "ba",
 
     # 每种拓扑下跑多少个 deterministic episode。
     # 越大越稳，但 CSV/JSON 会更大、运行也更慢。
@@ -152,7 +154,7 @@ SCRIPT_DEFAULTS = {
     # True 时会把 allocation_gini_vs_position.png 改成 intervention 图，
     # 横轴是被操纵后的 pool 相对 reference pool 的倍数。
     # 这是现在最接近你贴的 Fig S3 的那部分分析。
-    "enable_pool_intervention_analysis": True,
+    "enable_pool_intervention_analysis": False,
 
     # intervention 图里使用哪个 reference pool：
     # - original：以该 sender 在当前状态下原本观察到的 pool_grown 为基准；
@@ -206,7 +208,7 @@ SCRIPT_DEFAULTS = {
     # 是否执行“手动操纵 sender 看到的当前 resource 大小，然后重新前向推理”的干预实验。
     # 这和 pool intervention 不同：这里看的不是 pool 通道，而是资源通道。
     # 当前实现的语义是“篡改 agent 对 sender 资源量的感知”，不会把改过的 observation 继续 rollout 到后续步。
-    "enable_resource_intervention_analysis": True,
+    "enable_resource_intervention_analysis": False,
 
     # resource intervention 使用哪个参考量：
     # - original：以该 sender 当前 observation 里的原始 resources[sender] 为基准；
@@ -249,6 +251,32 @@ SCRIPT_DEFAULTS = {
     # 第 0 个 episode 用 seed，第 1 个用 seed+1，以此类推。
     # 如果你想复现实验结果，固定这个值即可。
     "seed": 42,
+
+    # degree 分箱模式。
+    # - quantile：按样本分位数切箱，默认更稳，适合 scale-free；
+    # - log：按 degree 的对数尺度切箱，更强调 hub 尾部。
+    "degree_bin_mode": "quantile",
+
+    # sender / receiver degree 默认分成多少箱。
+    # scale-free 上一般 4 或 5 比较稳。
+    "degree_bin_count": 4,
+
+    # 每个 degree bin 期望至少保留多少样本。
+    # 如果初始切箱后某些箱太稀，会自动和相邻箱合并。
+    "degree_bin_min_count": 100,
+
+    # state-conditioned univariate split 默认把连续变量切成多少个分位数箱。
+    "state_split_bin_count": 4,
+
+    # 是否启用较慢的 tree-like state split。
+    # 这部分在样本多时会比较耗时；如果你只想快速出主结果，可以先关掉。
+    "enable_state_split_tree_like": True,
+
+    # PoolPowerMix baseline 的默认 k。
+    "pool_power_mix_k": 19.0,
+
+    # sender-degree × ego-resource 联合机制图里，ego_mean_resource 分成多少个箱。
+    "ego_resource_bin_count": 4,
 
     # Torch 推理设备。
     # 常见写法：
@@ -372,6 +400,224 @@ def _quantile_edges(values: np.ndarray, num_bins: int) -> np.ndarray:
     return edges
 
 
+def _safe_cv(values: np.ndarray) -> float:
+    array = np.asarray(values, dtype=np.float64).reshape(-1)
+    finite = array[np.isfinite(array)]
+    if finite.size == 0:
+        return float("nan")
+    mean_value = float(np.mean(finite))
+    if abs(mean_value) <= 1e-12:
+        return 0.0
+    return float(np.std(finite) / abs(mean_value))
+
+
+def _resolve_analysis_total_steps(effective_episode_length: int, max_steps: int | None) -> int:
+    total_steps = int(effective_episode_length)
+    if max_steps is not None:
+        total_steps = min(total_steps, int(max_steps))
+    return max(total_steps, 1)
+
+
+def _time_phase_from_step(step: int, total_steps: int) -> str:
+    safe_total_steps = max(int(total_steps), 1)
+    progress = (float(step) + 0.5) / float(safe_total_steps)
+    if progress <= 0.20:
+        return "early"
+    if progress >= 0.80:
+        return "late"
+    return "mid"
+
+
+def _annotate_rows_with_time_phase(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    total_steps: int,
+    topology_name: str | None = None,
+) -> list[dict[str, Any]]:
+    annotated: list[dict[str, Any]] = []
+    for row in rows:
+        enriched = dict(row)
+        enriched["time_phase"] = _time_phase_from_step(_to_int(row.get("step", 0)), total_steps)
+        if topology_name is not None:
+            enriched["topology"] = str(topology_name)
+        annotated.append(enriched)
+    return annotated
+
+
+def _normalize_degree_bin_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower()
+    if normalized not in {"quantile", "log"}:
+        raise ValueError(f"Unsupported degree_bin_mode: {mode}")
+    return normalized
+
+
+def _merge_small_degree_groups(groups: list[dict[str, Any]], min_count: int) -> tuple[list[dict[str, Any]], bool]:
+    merged = [dict(group) for group in groups]
+    merged_any = False
+    threshold = max(1, int(min_count))
+    while len(merged) > 1:
+        sparse_indices = [index for index, group in enumerate(merged) if int(group["count"]) < threshold]
+        if not sparse_indices:
+            break
+        merge_index = min(sparse_indices, key=lambda index: int(merged[index]["count"]))
+        if merge_index == 0:
+            neighbor_index = 1
+        elif merge_index == len(merged) - 1:
+            neighbor_index = merge_index - 1
+        else:
+            left_count = int(merged[merge_index - 1]["count"])
+            right_count = int(merged[merge_index + 1]["count"])
+            neighbor_index = merge_index - 1 if left_count <= right_count else merge_index + 1
+        left = min(merge_index, neighbor_index)
+        right = max(merge_index, neighbor_index)
+        new_degrees = list(merged[left]["degrees"]) + list(merged[right]["degrees"])
+        merged[left] = {
+            "degrees": tuple(sorted(new_degrees)),
+            "count": int(merged[left]["count"]) + int(merged[right]["count"]),
+        }
+        del merged[right]
+        merged_any = True
+    return merged, merged_any
+
+
+def _build_degree_bin_spec(
+    values: Sequence[Any],
+    *,
+    mode: str,
+    bin_count: int,
+    min_count: int,
+) -> dict[str, Any]:
+    degree_values = np.asarray([_to_int(value) for value in values], dtype=np.int64)
+    if degree_values.size == 0:
+        return {"bins": [], "value_to_bin": {}, "unique_degree_count": 0, "collapsed_bins": False, "sparse_final": True}
+
+    unique_degrees, counts = np.unique(degree_values, return_counts=True)
+    mode = _normalize_degree_bin_mode(mode)
+    requested_bins = max(1, int(bin_count))
+    groups: list[dict[str, Any]] = []
+
+    if unique_degrees.size <= requested_bins:
+        for degree, count in zip(unique_degrees, counts):
+            groups.append({"degrees": (int(degree),), "count": int(count)})
+    elif mode == "quantile":
+        total_count = int(np.sum(counts))
+        remaining_bins = requested_bins
+        start = 0
+        accumulated = 0
+        target = float(total_count) / float(max(remaining_bins, 1))
+        for index, count in enumerate(counts):
+            accumulated += int(count)
+            degrees_left = int(unique_degrees.size - index - 1)
+            bins_left_after = max(remaining_bins - 1, 0)
+            should_close = accumulated >= target and degrees_left >= bins_left_after
+            if should_close or index == unique_degrees.size - 1:
+                slice_degrees = tuple(int(value) for value in unique_degrees[start : index + 1])
+                slice_count = int(np.sum(counts[start : index + 1]))
+                groups.append({"degrees": slice_degrees, "count": slice_count})
+                start = index + 1
+                remaining_bins = max(requested_bins - len(groups), 1)
+                remaining_count = int(np.sum(counts[start:]))
+                accumulated = 0
+                target = float(remaining_count) / float(max(remaining_bins, 1)) if remaining_count > 0 else 0.0
+    else:
+        transformed = np.log1p(unique_degrees.astype(np.float64))
+        edges = np.linspace(float(np.min(transformed)), float(np.max(transformed)), num=requested_bins + 1)
+        bin_ids = np.clip(np.digitize(transformed, edges[1:-1], right=False), 0, requested_bins - 1)
+        current_bin = int(bin_ids[0])
+        start = 0
+        for index in range(1, unique_degrees.size + 1):
+            reached_end = index == unique_degrees.size
+            next_bin = -1 if reached_end else int(bin_ids[index])
+            if reached_end or next_bin != current_bin:
+                slice_degrees = tuple(int(value) for value in unique_degrees[start:index])
+                slice_count = int(np.sum(counts[start:index]))
+                groups.append({"degrees": slice_degrees, "count": slice_count})
+                start = index
+                current_bin = next_bin
+
+    groups, merged_any = _merge_small_degree_groups(groups, int(min_count))
+    sparse_final = any(int(group["count"]) < max(1, int(min_count)) for group in groups)
+
+    bins: list[dict[str, Any]] = []
+    value_to_bin: dict[int, dict[str, Any]] = {}
+    label_prefix = "Q" if mode == "quantile" else "L"
+    for index, group in enumerate(groups):
+        degrees = tuple(sorted(int(value) for value in group["degrees"]))
+        left = int(degrees[0])
+        right = int(degrees[-1])
+        label = f"{label_prefix}{index + 1}:{left}" if left == right else f"{label_prefix}{index + 1}:{left}-{right}"
+        bin_info = {
+            "bin_index": int(index),
+            "bin_label": label,
+            "degree_left": left,
+            "degree_right": right,
+            "count_rows": int(group["count"]),
+        }
+        bins.append(bin_info)
+        for degree in degrees:
+            value_to_bin[int(degree)] = bin_info
+
+    return {
+        "bins": bins,
+        "value_to_bin": value_to_bin,
+        "unique_degree_count": int(unique_degrees.size),
+        "collapsed_bins": bool(merged_any or len(groups) < requested_bins),
+        "sparse_final": bool(sparse_final),
+        "mode": mode,
+        "requested_bin_count": int(requested_bins),
+        "effective_bin_count": int(len(groups)),
+        "min_count": int(min_count),
+    }
+
+
+def _assign_degree_bin_fields(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    degree_key: str,
+    spec: Mapping[str, Any],
+    prefix: str,
+) -> list[dict[str, Any]]:
+    enriched_rows: list[dict[str, Any]] = []
+    value_to_bin = dict(spec.get("value_to_bin", {}))
+    fallback = None
+    bins = list(spec.get("bins", []))
+    if bins:
+        fallback = bins[-1]
+    for row in rows:
+        enriched = dict(row)
+        degree_value = _to_int(row.get(degree_key, 0))
+        bin_info = value_to_bin.get(int(degree_value), fallback)
+        enriched[f"{prefix}_degree"] = int(degree_value)
+        if bin_info is None:
+            enriched[f"{prefix}_degree_bin"] = "NA"
+            enriched[f"{prefix}_degree_bin_index"] = -1
+            enriched[f"{prefix}_degree_bin_left"] = float("nan")
+            enriched[f"{prefix}_degree_bin_right"] = float("nan")
+        else:
+            enriched[f"{prefix}_degree_bin"] = str(bin_info["bin_label"])
+            enriched[f"{prefix}_degree_bin_index"] = int(bin_info["bin_index"])
+            enriched[f"{prefix}_degree_bin_left"] = int(bin_info["degree_left"])
+            enriched[f"{prefix}_degree_bin_right"] = int(bin_info["degree_right"])
+        enriched_rows.append(enriched)
+    return enriched_rows
+
+
+def _write_csv_with_optional_headers(
+    path: Path,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    fieldnames: Sequence[str] | None = None,
+) -> None:
+    if rows:
+        write_csv(path, rows)
+        return
+    if fieldnames is None:
+        return
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(fieldnames))
+        writer.writeheader()
+
+
 def _entropy(probabilities: np.ndarray) -> float:
     safe = np.clip(np.asarray(probabilities, dtype=np.float64), 1e-12, 1.0)
     return float(-(safe * np.log(safe)).sum())
@@ -461,8 +707,8 @@ def _build_row_baselines(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     receiver_count = int(valid_receivers.size)
     equal_row = np.full(receiver_count, 1.0 / float(max(receiver_count, 1)), dtype=np.float64)
-    receiver_investment = np.asarray(observation["investment"][valid_receivers], dtype=np.float64)
-    labor_row = _safe_normalize(receiver_investment)
+    receiver_unit_investment = np.asarray(observation["unit_investment"][valid_receivers], dtype=np.float64)
+    labor_row = _safe_normalize(receiver_unit_investment)
 
     self_row = np.zeros(receiver_count, dtype=np.float64)
     self_matches = np.nonzero(valid_receivers == sender)[0]
@@ -713,6 +959,7 @@ def compute_row_mechanism_records(
         policy = snapshot.policy
         local_mask = observation["local_mask"].astype(bool, copy=False)
         num_nodes = local_mask.shape[0]
+        degrees = local_mask.sum(axis=1, dtype=np.int64) - 1
 
         for sender in range(num_nodes):
             valid_receivers = np.flatnonzero(local_mask[sender])
@@ -736,8 +983,10 @@ def compute_row_mechanism_records(
             pool_position_ratio = pool_value / pool_upperbound if pool_upperbound > 1e-12 else float("nan")
             ego_resources = np.asarray(observation["resources"][valid_receivers], dtype=np.float64)
             ego_investment = np.asarray(observation["investment"][valid_receivers], dtype=np.float64)
+            ego_cooperation = np.asarray(observation["x_actual"][valid_receivers], dtype=np.float64)
             self_index = int(np.nonzero(valid_receivers == sender)[0][0])
             top_receiver = int(valid_receivers[np.argmax(allocation_row)])
+            top_receiver_degree = int(degrees[top_receiver])
             agent_allocated_resources = pool_value * allocation_row
 
             rows.append(
@@ -751,12 +1000,21 @@ def compute_row_mechanism_records(
                     "sender_pool_grown": pool_value,
                     "sender_pool_upperbound": pool_upperbound,
                     "pool_grown_over_upperbound": pool_position_ratio,
+                    "ego_mean_resource": float(np.mean(ego_resources)),
                     "ego_total_resources": float(ego_resources.sum()),
                     "ego_total_investment": float(ego_investment.sum()),
                     "sender_resource": float(observation["resources"][sender]),
                     "sender_investment": float(observation["investment"][sender]),
+                    "sender_pool_raw_norm": float(observation["pool_raw_norm"][sender]),
                     "sender_strategy_norm": float(observation["strategy_norm"][sender]),
                     "sender_x_actual": float(observation["x_actual"][sender]),
+                    "local_cooperation_count": float(np.sum(ego_cooperation)),
+                    "local_investment_cv": _safe_cv(ego_investment),
+                    "receiver_degree": top_receiver_degree,
+                    "receiver_degree_minus_sender_degree": float(top_receiver_degree - sender_degree),
+                    "receiver_degree_over_sender_degree": (
+                        float(top_receiver_degree / float(sender_degree)) if sender_degree > 0 else float("nan")
+                    ),
                     "self_allocation": float(allocation_row[self_index]),
                     "top1_receiver": top_receiver,
                     "top1_is_self": int(top_receiver == sender),
@@ -792,6 +1050,8 @@ def compute_node_income_decomposition(snapshots: Sequence[Snapshot]) -> list[dic
         equal_incoming = np.zeros(num_nodes, dtype=np.float64)
         labor_incoming = np.zeros(num_nodes, dtype=np.float64)
         self_incoming = np.zeros(num_nodes, dtype=np.float64)
+        equal_self_incoming = np.zeros(num_nodes, dtype=np.float64)
+        labor_self_incoming = np.zeros(num_nodes, dtype=np.float64)
         sender_counts = np.zeros(num_nodes, dtype=np.int64)
 
         for sender in range(num_nodes):
@@ -801,28 +1061,64 @@ def compute_node_income_decomposition(snapshots: Sequence[Snapshot]) -> list[dic
             equal_incoming[valid_receivers] += pool_value * equal_row
             labor_incoming[valid_receivers] += pool_value * labor_row
             self_incoming[valid_receivers] += pool_value * self_row
+            self_index = int(np.nonzero(valid_receivers == sender)[0][0])
+            equal_self_incoming[sender] += pool_value * float(equal_row[self_index])
+            labor_self_incoming[sender] += pool_value * float(labor_row[self_index])
             sender_counts[valid_receivers] += 1
 
         actual_incoming = np.asarray(policy.incoming_resources, dtype=np.float64)
+        actual_self_incoming = np.asarray(np.diag(policy.transferred_resources), dtype=np.float64)
+        actual_incoming_excluding_self = actual_incoming - actual_self_incoming
+        expected_equal_excluding_self = equal_incoming - equal_self_incoming
+        expected_labor_excluding_self = labor_incoming - labor_self_incoming
         for receiver in range(num_nodes):
             equal_denom = float(equal_incoming[receiver])
             labor_denom = float(labor_incoming[receiver])
+            equal_denom_excluding_self = float(expected_equal_excluding_self[receiver])
+            labor_denom_excluding_self = float(expected_labor_excluding_self[receiver])
             rows.append(
                 {
                     "episode": snapshot.episode,
                     "step": snapshot.step,
                     "receiver": receiver,
                     "actual_incoming": float(actual_incoming[receiver]),
+                    "actual_self_incoming": float(actual_self_incoming[receiver]),
+                    "actual_incoming_excluding_self": float(actual_incoming_excluding_self[receiver]),
                     "expected_incoming_equal": float(equal_incoming[receiver]),
+                    "expected_incoming_equal_self": float(equal_self_incoming[receiver]),
+                    "expected_incoming_equal_excluding_self": float(expected_equal_excluding_self[receiver]),
                     "expected_incoming_labor": float(labor_incoming[receiver]),
+                    "expected_incoming_labor_self": float(labor_self_incoming[receiver]),
+                    "expected_incoming_labor_excluding_self": float(expected_labor_excluding_self[receiver]),
                     "expected_incoming_self": float(self_incoming[receiver]),
                     "actual_minus_equal": float(actual_incoming[receiver] - equal_incoming[receiver]),
                     "actual_minus_labor": float(actual_incoming[receiver] - labor_incoming[receiver]),
+                    "actual_minus_equal_excluding_self": float(
+                        actual_incoming_excluding_self[receiver] - expected_equal_excluding_self[receiver]
+                    ),
+                    "actual_minus_labor_excluding_self": float(
+                        actual_incoming_excluding_self[receiver] - expected_labor_excluding_self[receiver]
+                    ),
                     "actual_over_equal": (
                         float(actual_incoming[receiver] / equal_denom) if equal_denom > 1e-12 else float("nan")
                     ),
                     "actual_over_labor": (
                         float(actual_incoming[receiver] / labor_denom) if labor_denom > 1e-12 else float("nan")
+                    ),
+                    "actual_over_equal_excluding_self": (
+                        float(actual_incoming_excluding_self[receiver] / equal_denom_excluding_self)
+                        if equal_denom_excluding_self > 1e-12
+                        else float("nan")
+                    ),
+                    "actual_over_labor_excluding_self": (
+                        float(actual_incoming_excluding_self[receiver] / labor_denom_excluding_self)
+                        if labor_denom_excluding_self > 1e-12
+                        else float("nan")
+                    ),
+                    "actual_self_share": (
+                        float(actual_self_incoming[receiver] / actual_incoming[receiver])
+                        if actual_incoming[receiver] > 1e-12
+                        else float("nan")
                     ),
                     "receiver_resource": float(observation["resources"][receiver]),
                     "receiver_investment": float(observation["investment"][receiver]),
@@ -1646,7 +1942,7 @@ def summarize_pool_intervention_records(
         key = (str(row["policy"]), float(row["multiplier"]))
         grouped.setdefault(key, []).append(row)
 
-    policy_order = {"equal": 0, "proportional": 1, "agent": 2}
+    policy_order = {"equal": 0, "proportional": 1, "pool_power_mix": 2, "agent": 3}
     summary_rows: list[dict[str, Any]] = []
     for (policy_name, multiplier), group in sorted(
         grouped.items(),
@@ -1964,6 +2260,600 @@ def summarize_receiver_state_income(node_records: Sequence[Mapping[str, Any]]) -
                 ),
             }
         )
+    return rows
+
+
+def summarize_sender_degree_bin_mechanism(
+    row_records: Sequence[Mapping[str, Any]],
+    *,
+    topology_name: str,
+    degree_bin_mode: str,
+    degree_bin_count: int,
+    degree_bin_min_count: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    if not row_records:
+        empty_spec = {
+            "bins": [],
+            "value_to_bin": {},
+            "unique_degree_count": 0,
+            "collapsed_bins": False,
+            "sparse_final": True,
+            "mode": _normalize_degree_bin_mode(degree_bin_mode),
+            "requested_bin_count": int(degree_bin_count),
+            "effective_bin_count": 0,
+            "min_count": int(degree_bin_min_count),
+        }
+        return [], [], empty_spec, []
+
+    spec = _build_degree_bin_spec(
+        [row["sender_degree"] for row in row_records],
+        mode=degree_bin_mode,
+        bin_count=degree_bin_count,
+        min_count=degree_bin_min_count,
+    )
+    annotated = _assign_degree_bin_fields(
+        row_records,
+        degree_key="sender_degree",
+        spec=spec,
+        prefix="sender",
+    )
+
+    def _summarize(group_rows: Sequence[Mapping[str, Any]], *, episode: int, step: int, time_phase: str) -> dict[str, Any]:
+        sender_degree_values = np.asarray([float(row["sender_degree"]) for row in group_rows], dtype=np.float64)
+        return {
+            "topology": str(topology_name),
+            "episode": int(episode),
+            "step": int(step),
+            "time_phase": str(time_phase),
+            "sender_degree": _nanmean_or_nan(sender_degree_values),
+            "sender_degree_min": _to_int(np.min(sender_degree_values)) if sender_degree_values.size > 0 else 0,
+            "sender_degree_max": _to_int(np.max(sender_degree_values)) if sender_degree_values.size > 0 else 0,
+            "sender_degree_bin": str(group_rows[0]["sender_degree_bin"]),
+            "sender_degree_bin_index": _to_int(group_rows[0]["sender_degree_bin_index"]),
+            "count_rows": int(len(group_rows)),
+            "mean_self_allocation": _nanmean_or_nan([float(row["self_allocation"]) for row in group_rows]),
+            "mean_row_entropy": _nanmean_or_nan([float(row["row_entropy"]) for row in group_rows]),
+            "mean_top1_mass": _nanmean_or_nan([float(row["top1_mass"]) for row in group_rows]),
+            "mean_top1_self_rate": _nanmean_or_nan([float(row["top1_is_self"]) for row in group_rows]),
+            "mean_weight_labor": _nanmean_or_nan([float(row["weight_labor"]) for row in group_rows]),
+            "mean_weight_equal": _nanmean_or_nan([float(row["weight_equal"]) for row in group_rows]),
+            "mean_weight_self": _nanmean_or_nan([float(row["weight_self"]) for row in group_rows]),
+            "mean_lambda_labor_equal": _nanmean_or_nan([float(row["lambda_labor_equal"]) for row in group_rows]),
+            "mean_js_to_labor": _nanmean_or_nan([float(row["js_to_labor"]) for row in group_rows]),
+            "mean_js_to_equal": _nanmean_or_nan([float(row["js_to_equal"]) for row in group_rows]),
+            "mean_three_way_fit_l1": _nanmean_or_nan([float(row["three_way_fit_l1"]) for row in group_rows]),
+            "mean_pool_grown_over_upperbound": _nanmean_or_nan(
+                [float(row["pool_grown_over_upperbound"]) for row in group_rows]
+            ),
+            "mean_sender_resource": _nanmean_or_nan([float(row["sender_resource"]) for row in group_rows]),
+            "mean_sender_strategy_norm": _nanmean_or_nan(
+                [float(row["sender_strategy_norm"]) for row in group_rows]
+            ),
+            "mean_sender_x_actual": _nanmean_or_nan([float(row["sender_x_actual"]) for row in group_rows]),
+        }
+
+    aggregate_rows: list[dict[str, Any]] = []
+    step_rows: list[dict[str, Any]] = []
+    for phase_name in ("all", "early", "mid", "late"):
+        phase_rows = list(annotated) if phase_name == "all" else [row for row in annotated if str(row["time_phase"]) == phase_name]
+        if not phase_rows:
+            continue
+        grouped_phase: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        grouped_step: dict[tuple[int, int, str, int], list[dict[str, Any]]] = {}
+        for row in phase_rows:
+            grouped_phase.setdefault(
+                (str(row["sender_degree_bin"]), _to_int(row["sender_degree_bin_index"])),
+                [],
+            ).append(row)
+            grouped_step.setdefault(
+                (
+                    _to_int(row["episode"]),
+                    _to_int(row["step"]),
+                    str(row["sender_degree_bin"]),
+                    _to_int(row["sender_degree_bin_index"]),
+                ),
+                [],
+            ).append(row)
+        for _, group_rows in sorted(grouped_phase.items(), key=lambda item: item[0][1]):
+            aggregate_rows.append(_summarize(group_rows, episode=-1, step=-1, time_phase=phase_name))
+        for (episode, step, _, _), group_rows in sorted(grouped_step.items(), key=lambda item: (item[0][0], item[0][1], item[0][3])):
+            step_rows.append(_summarize(group_rows, episode=episode, step=step, time_phase=phase_name))
+
+    return aggregate_rows, step_rows, spec, annotated
+
+
+def summarize_receiver_degree_bin_income(
+    node_records: Sequence[Mapping[str, Any]],
+    *,
+    topology_name: str,
+    degree_bin_mode: str,
+    degree_bin_count: int,
+    degree_bin_min_count: int,
+    exclude_self_flow: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    if not node_records:
+        empty_spec = {
+            "bins": [],
+            "value_to_bin": {},
+            "unique_degree_count": 0,
+            "collapsed_bins": False,
+            "sparse_final": True,
+            "mode": _normalize_degree_bin_mode(degree_bin_mode),
+            "requested_bin_count": int(degree_bin_count),
+            "effective_bin_count": 0,
+            "min_count": int(degree_bin_min_count),
+        }
+        return [], [], empty_spec, []
+
+    spec = _build_degree_bin_spec(
+        [row["receiver_degree"] for row in node_records],
+        mode=degree_bin_mode,
+        bin_count=degree_bin_count,
+        min_count=degree_bin_min_count,
+    )
+    annotated = _assign_degree_bin_fields(
+        node_records,
+        degree_key="receiver_degree",
+        spec=spec,
+        prefix="receiver",
+    )
+
+    actual_key = "actual_incoming_excluding_self" if exclude_self_flow else "actual_incoming"
+    expected_equal_key = (
+        "expected_incoming_equal_excluding_self" if exclude_self_flow else "expected_incoming_equal"
+    )
+    expected_labor_key = (
+        "expected_incoming_labor_excluding_self" if exclude_self_flow else "expected_incoming_labor"
+    )
+    actual_over_equal_key = "actual_over_equal_excluding_self" if exclude_self_flow else "actual_over_equal"
+    actual_over_labor_key = "actual_over_labor_excluding_self" if exclude_self_flow else "actual_over_labor"
+
+    def _summarize(group_rows: Sequence[Mapping[str, Any]], *, episode: int, step: int, time_phase: str) -> dict[str, Any]:
+        receiver_degree_values = np.asarray([float(row["receiver_degree"]) for row in group_rows], dtype=np.float64)
+        return {
+            "topology": str(topology_name),
+            "episode": int(episode),
+            "step": int(step),
+            "time_phase": str(time_phase),
+            "flow_scope": "excluding_self" if exclude_self_flow else "all",
+            "receiver_degree": _nanmean_or_nan(receiver_degree_values),
+            "receiver_degree_min": _to_int(np.min(receiver_degree_values)) if receiver_degree_values.size > 0 else 0,
+            "receiver_degree_max": _to_int(np.max(receiver_degree_values)) if receiver_degree_values.size > 0 else 0,
+            "receiver_degree_bin": str(group_rows[0]["receiver_degree_bin"]),
+            "receiver_degree_bin_index": _to_int(group_rows[0]["receiver_degree_bin_index"]),
+            "count_rows": int(len(group_rows)),
+            "actual_incoming_mean": _nanmean_or_nan([float(row[actual_key]) for row in group_rows]),
+            "expected_incoming_equal_mean": _nanmean_or_nan(
+                [float(row[expected_equal_key]) for row in group_rows]
+            ),
+            "expected_incoming_labor_mean": _nanmean_or_nan(
+                [float(row[expected_labor_key]) for row in group_rows]
+            ),
+            "actual_over_equal_mean": _nanmean_or_nan([float(row[actual_over_equal_key]) for row in group_rows]),
+            "actual_over_labor_mean": _nanmean_or_nan([float(row[actual_over_labor_key]) for row in group_rows]),
+            "actual_self_incoming_mean": _nanmean_or_nan([float(row["actual_self_incoming"]) for row in group_rows]),
+            "expected_incoming_equal_self_mean": _nanmean_or_nan(
+                [float(row["expected_incoming_equal_self"]) for row in group_rows]
+            ),
+            "expected_incoming_labor_self_mean": _nanmean_or_nan(
+                [float(row["expected_incoming_labor_self"]) for row in group_rows]
+            ),
+            "actual_self_share_mean": _nanmean_or_nan([float(row["actual_self_share"]) for row in group_rows]),
+            "receiver_resource_mean": _nanmean_or_nan([float(row["receiver_resource"]) for row in group_rows]),
+            "receiver_investment_mean": _nanmean_or_nan([float(row["receiver_investment"]) for row in group_rows]),
+            "receiver_strategy_norm_mean": _nanmean_or_nan(
+                [float(row["receiver_strategy_norm"]) for row in group_rows]
+            ),
+            "receiver_x_actual_mean": _nanmean_or_nan([float(row["receiver_x_actual"]) for row in group_rows]),
+        }
+
+    aggregate_rows: list[dict[str, Any]] = []
+    step_rows: list[dict[str, Any]] = []
+    for phase_name in ("all", "early", "mid", "late"):
+        phase_rows = list(annotated) if phase_name == "all" else [row for row in annotated if str(row["time_phase"]) == phase_name]
+        if not phase_rows:
+            continue
+        grouped_phase: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        grouped_step: dict[tuple[int, int, str, int], list[dict[str, Any]]] = {}
+        for row in phase_rows:
+            grouped_phase.setdefault(
+                (str(row["receiver_degree_bin"]), _to_int(row["receiver_degree_bin_index"])),
+                [],
+            ).append(row)
+            grouped_step.setdefault(
+                (
+                    _to_int(row["episode"]),
+                    _to_int(row["step"]),
+                    str(row["receiver_degree_bin"]),
+                    _to_int(row["receiver_degree_bin_index"]),
+                ),
+                [],
+            ).append(row)
+        for _, group_rows in sorted(grouped_phase.items(), key=lambda item: item[0][1]):
+            aggregate_rows.append(_summarize(group_rows, episode=-1, step=-1, time_phase=phase_name))
+        for (episode, step, _, _), group_rows in sorted(grouped_step.items(), key=lambda item: (item[0][0], item[0][1], item[0][3])):
+            step_rows.append(_summarize(group_rows, episode=episode, step=step, time_phase=phase_name))
+
+    return aggregate_rows, step_rows, spec, annotated
+
+
+def summarize_sender_degree_ego_resource_mechanism(
+    row_records: Sequence[Mapping[str, Any]],
+    *,
+    topology_name: str,
+    sender_spec: Mapping[str, Any],
+    ego_resource_bin_count: int,
+    tail_trim_frac: float = 0.0,
+) -> list[dict[str, Any]]:
+    if not row_records:
+        return []
+
+    annotated = _assign_degree_bin_fields(
+        row_records,
+        degree_key="sender_degree",
+        spec=sender_spec,
+        prefix="sender",
+    )
+
+    rows_out: list[dict[str, Any]] = []
+    phase_order = ("all", "early", "mid", "late")
+    for phase_name in phase_order:
+        phase_rows = list(annotated) if phase_name == "all" else [row for row in annotated if str(row.get("time_phase", "")) == phase_name]
+        if not phase_rows:
+            continue
+        degree_bins = sorted(
+            {(_to_int(row.get("sender_degree_bin_index", 0)), str(row.get("sender_degree_bin", "NA"))) for row in phase_rows},
+            key=lambda item: item[0],
+        )
+        for degree_bin_index, degree_bin_label in degree_bins:
+            degree_rows = [
+                row
+                for row in phase_rows
+                if _to_int(row.get("sender_degree_bin_index", -1)) == degree_bin_index
+            ]
+            if not degree_rows:
+                continue
+            ego_values = np.asarray([float(row.get("ego_mean_resource", float("nan"))) for row in degree_rows], dtype=np.float64)
+            finite_mask = np.isfinite(ego_values)
+            if not np.any(finite_mask):
+                continue
+            finite_values = ego_values[finite_mask]
+            trim_frac = min(max(float(tail_trim_frac), 0.0), 0.49)
+            trim_low = float(np.min(finite_values))
+            trim_high = float(np.max(finite_values))
+            trimmed_mask = finite_mask.copy()
+            if trim_frac > 0.0 and finite_values.size >= 10:
+                trim_low = float(np.quantile(finite_values, trim_frac))
+                trim_high = float(np.quantile(finite_values, 1.0 - trim_frac))
+                trimmed_mask = finite_mask & (ego_values >= trim_low) & (ego_values <= trim_high)
+                if not np.any(trimmed_mask):
+                    trimmed_mask = finite_mask.copy()
+                    trim_low = float(np.min(finite_values))
+                    trim_high = float(np.max(finite_values))
+            finite_values = ego_values[trimmed_mask]
+            if finite_values.size == 0:
+                continue
+            edges = _quantile_edges(finite_values, max(1, int(ego_resource_bin_count)))
+            if edges.size <= 1:
+                bin_specs = [(0, float(finite_values[0]), float(finite_values[0]), trimmed_mask.copy())]
+            else:
+                bin_specs = []
+                for bin_index in range(edges.size - 1):
+                    left = float(edges[bin_index])
+                    right = float(edges[bin_index + 1])
+                    if bin_index == edges.size - 2:
+                        mask = trimmed_mask & (ego_values >= left) & (ego_values <= right)
+                    else:
+                        mask = trimmed_mask & (ego_values >= left) & (ego_values < right)
+                    bin_specs.append((bin_index, left, right, mask))
+            for bin_index, left, right, mask in bin_specs:
+                if not np.any(mask):
+                    continue
+                group_rows = [degree_rows[idx] for idx, keep in enumerate(mask.tolist()) if keep]
+                label = f"R{bin_index + 1}:{left:.2f}" if abs(right - left) <= 1e-12 else f"R{bin_index + 1}:{left:.2f}-{right:.2f}"
+                rows_out.append(
+                    {
+                        "topology": str(topology_name),
+                        "time_phase": str(phase_name),
+                        "sender_degree_bin": str(degree_bin_label),
+                        "sender_degree_bin_index": int(degree_bin_index),
+                        "ego_resource_bin": label,
+                        "ego_resource_bin_display": f"B{bin_index + 1}",
+                        "ego_resource_bin_index": int(bin_index),
+                        "ego_resource_left": left,
+                        "ego_resource_right": right,
+                        "tail_trim_frac": trim_frac,
+                        "tail_trim_lower": trim_low,
+                        "tail_trim_upper": trim_high,
+                        "count_rows_before_trim": int(np.sum(finite_mask)),
+                        "count_rows": int(len(group_rows)),
+                        "mean_ego_mean_resource": _nanmean_or_nan([float(row["ego_mean_resource"]) for row in group_rows]),
+                        "mean_weight_labor": _nanmean_or_nan([float(row["weight_labor"]) for row in group_rows]),
+                        "mean_weight_equal": _nanmean_or_nan([float(row["weight_equal"]) for row in group_rows]),
+                        "mean_weight_self": _nanmean_or_nan([float(row["weight_self"]) for row in group_rows]),
+                        "mean_self_allocation": _nanmean_or_nan([float(row["self_allocation"]) for row in group_rows]),
+                    }
+                )
+    return rows_out
+
+
+def summarize_sender_receiver_degree_matrix(
+    decision_rows: Sequence[Mapping[str, Any]],
+    *,
+    topology_name: str,
+    sender_spec: Mapping[str, Any],
+    receiver_spec: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not decision_rows:
+        return [], []
+
+    annotated = _assign_degree_bin_fields(
+        decision_rows,
+        degree_key="sender_degree",
+        spec=sender_spec,
+        prefix="sender",
+    )
+    annotated = _assign_degree_bin_fields(
+        annotated,
+        degree_key="receiver_degree",
+        spec=receiver_spec,
+        prefix="receiver",
+    )
+
+    def _summarize(group_rows: Sequence[Mapping[str, Any]], *, step: int, time_phase: str, aggregation_level: str) -> dict[str, Any]:
+        top_allocations = [float(row["allocation"]) for row in group_rows if _to_int(row.get("is_top_receiver", 0)) == 1]
+        return {
+            "topology": str(topology_name),
+            "step": int(step),
+            "time_phase": str(time_phase),
+            "aggregation_level": str(aggregation_level),
+            "sender_degree_bin": str(group_rows[0]["sender_degree_bin"]),
+            "sender_degree_bin_index": _to_int(group_rows[0]["sender_degree_bin_index"]),
+            "receiver_degree_bin": str(group_rows[0]["receiver_degree_bin"]),
+            "receiver_degree_bin_index": _to_int(group_rows[0]["receiver_degree_bin_index"]),
+            "count_edges_or_pairs": int(len(group_rows)),
+            "allocation_mean": _nanmean_or_nan([float(row["allocation"]) for row in group_rows]),
+            "transferred_mean": _nanmean_or_nan([float(row["transferred"]) for row in group_rows]),
+            "logit_mean": _nanmean_or_nan([float(row["logit"]) for row in group_rows]),
+            "is_top_receiver_rate": _nanmean_or_nan([float(row["is_top_receiver"]) for row in group_rows]),
+            "top1_share_mean": _nanmean_or_nan(top_allocations),
+        }
+
+    aggregate_rows: list[dict[str, Any]] = []
+    step_rows: list[dict[str, Any]] = []
+    for phase_name in ("all", "early", "mid", "late"):
+        phase_rows = list(annotated) if phase_name == "all" else [row for row in annotated if str(row["time_phase"]) == phase_name]
+        if not phase_rows:
+            continue
+        grouped_phase: dict[tuple[str, int, str, int], list[dict[str, Any]]] = {}
+        grouped_step: dict[tuple[int, str, int, str, int], list[dict[str, Any]]] = {}
+        for row in phase_rows:
+            grouped_phase.setdefault(
+                (
+                    str(row["sender_degree_bin"]),
+                    _to_int(row["sender_degree_bin_index"]),
+                    str(row["receiver_degree_bin"]),
+                    _to_int(row["receiver_degree_bin_index"]),
+                ),
+                [],
+            ).append(row)
+            grouped_step.setdefault(
+                (
+                    _to_int(row["step"]),
+                    str(row["sender_degree_bin"]),
+                    _to_int(row["sender_degree_bin_index"]),
+                    str(row["receiver_degree_bin"]),
+                    _to_int(row["receiver_degree_bin_index"]),
+                ),
+                [],
+            ).append(row)
+        for _, group_rows in sorted(grouped_phase.items(), key=lambda item: (item[0][1], item[0][3])):
+            aggregate_rows.append(_summarize(group_rows, step=-1, time_phase=phase_name, aggregation_level="phase"))
+        for (step, _, _, _, _), group_rows in sorted(grouped_step.items(), key=lambda item: (item[0][0], item[0][2], item[0][4])):
+            step_rows.append(_summarize(group_rows, step=step, time_phase=phase_name, aggregation_level="step"))
+    return aggregate_rows, step_rows
+
+
+def summarize_state_split_univariate(
+    row_records: Sequence[Mapping[str, Any]],
+    *,
+    topology_name: str,
+    bin_count: int,
+) -> list[dict[str, Any]]:
+    if not row_records:
+        return []
+
+    candidate_specs = [
+        ("sender_degree", "sender_degree"),
+        ("receiver_degree", "receiver_degree"),
+        ("sender_pool_raw_norm", "sender_pool_raw_norm"),
+        ("pool_grown_over_upperbound", "pool_grown_over_upperbound"),
+        ("sender_resource", "sender_resource"),
+        ("sender_strategy_norm", "sender_strategy_norm"),
+        ("sender_x_actual", "sender_x_actual"),
+        ("local_cooperation_count", "local_cooperation_count"),
+        ("local_investment_cv", "local_investment_cv"),
+        ("receiver_degree_minus_sender_degree", "receiver_degree_minus_sender_degree"),
+        ("receiver_degree_over_sender_degree", "receiver_degree_over_sender_degree"),
+    ]
+    target_specs = [
+        ("self_allocation", "self_allocation"),
+        ("weight_labor", "weight_labor"),
+        ("weight_equal", "weight_equal"),
+        ("row_entropy", "row_entropy"),
+        ("top1_is_self", "top1_is_self"),
+    ]
+
+    rows: list[dict[str, Any]] = []
+    for time_phase in ("all", "early", "mid", "late"):
+        phase_rows = list(row_records) if time_phase == "all" else [row for row in row_records if str(row["time_phase"]) == time_phase]
+        if not phase_rows:
+            continue
+        for target_name, target_key in target_specs:
+            for candidate_name, candidate_key in candidate_specs:
+                valid_rows = [
+                    row
+                    for row in phase_rows
+                    if np.isfinite(float(row.get(candidate_key, float("nan"))))
+                    and np.isfinite(float(row.get(target_key, float("nan"))))
+                ]
+                if len(valid_rows) < 2:
+                    continue
+                x_values = np.asarray([float(row[candidate_key]) for row in valid_rows], dtype=np.float64)
+                edges = _quantile_edges(x_values, max(2, int(bin_count)))
+                if edges.size < 2:
+                    continue
+                target_means: list[float] = []
+                candidate_rows: list[dict[str, Any]] = []
+                for bin_index in range(edges.size - 1):
+                    left = float(edges[bin_index])
+                    right = float(edges[bin_index + 1])
+                    if bin_index == edges.size - 2:
+                        grouped = [row for row in valid_rows if left <= float(row[candidate_key]) <= right]
+                    else:
+                        grouped = [row for row in valid_rows if left <= float(row[candidate_key]) < right]
+                    if not grouped:
+                        continue
+                    target_values = np.asarray([float(row[target_key]) for row in grouped], dtype=np.float64)
+                    candidate_values = np.asarray([float(row[candidate_key]) for row in grouped], dtype=np.float64)
+                    target_mean = _nanmean_or_nan(target_values)
+                    target_means.append(target_mean)
+                    target_std = float(np.nanstd(target_values)) if target_values.size > 0 else float("nan")
+                    target_sem = (
+                        float(target_std / np.sqrt(target_values.size)) if target_values.size > 0 else float("nan")
+                    )
+                    candidate_rows.append(
+                        {
+                            "topology": str(topology_name),
+                            "time_phase": str(time_phase),
+                            "target_name": str(target_name),
+                            "split_variable": str(candidate_name),
+                            "bin_index": int(bin_index),
+                            "bin_left": left,
+                            "bin_right": right,
+                            "bin_center": _nanmean_or_nan(candidate_values),
+                            "count_rows": int(len(grouped)),
+                            "target_mean": target_mean,
+                            "target_std": target_std,
+                            "target_sem": target_sem,
+                        }
+                    )
+                if not candidate_rows:
+                    continue
+                effect_range = float(np.nanmax(target_means) - np.nanmin(target_means)) if target_means else float("nan")
+                for row in candidate_rows:
+                    row["target_mean_range"] = effect_range
+                rows.extend(candidate_rows)
+    return rows
+
+
+def summarize_state_split_tree_like(
+    row_records: Sequence[Mapping[str, Any]],
+    *,
+    topology_name: str,
+    min_count: int,
+) -> list[dict[str, Any]]:
+    if not row_records:
+        return []
+
+    candidate_specs = [
+        ("sender_degree", "sender_degree"),
+        ("receiver_degree", "receiver_degree"),
+        ("sender_pool_raw_norm", "sender_pool_raw_norm"),
+        ("pool_grown_over_upperbound", "pool_grown_over_upperbound"),
+        ("sender_resource", "sender_resource"),
+        ("sender_strategy_norm", "sender_strategy_norm"),
+        ("sender_x_actual", "sender_x_actual"),
+        ("local_cooperation_count", "local_cooperation_count"),
+        ("local_investment_cv", "local_investment_cv"),
+        ("receiver_degree_minus_sender_degree", "receiver_degree_minus_sender_degree"),
+        ("receiver_degree_over_sender_degree", "receiver_degree_over_sender_degree"),
+    ]
+    target_specs = [
+        ("self_allocation", "self_allocation"),
+        ("weight_labor", "weight_labor"),
+        ("weight_equal", "weight_equal"),
+        ("row_entropy", "row_entropy"),
+        ("top1_is_self", "top1_is_self"),
+    ]
+
+    def _best_split(rows: Sequence[Mapping[str, Any]], target_key: str) -> dict[str, Any] | None:
+        if len(rows) < max(4, int(min_count) * 2):
+            return None
+        target_values = np.asarray([float(row[target_key]) for row in rows], dtype=np.float64)
+        base_mean = _nanmean_or_nan(target_values)
+        best: dict[str, Any] | None = None
+        for candidate_name, candidate_key in candidate_specs:
+            values = np.asarray([float(row.get(candidate_key, float("nan"))) for row in rows], dtype=np.float64)
+            finite_values = values[np.isfinite(values)]
+            if finite_values.size < max(4, int(min_count) * 2):
+                continue
+            thresholds = np.unique(np.quantile(finite_values, [0.25, 0.5, 0.75]))
+            for threshold in thresholds:
+                left_rows = [
+                    row
+                    for row in rows
+                    if np.isfinite(float(row.get(candidate_key, float("nan"))))
+                    and float(row[candidate_key]) <= float(threshold)
+                ]
+                right_rows = [
+                    row
+                    for row in rows
+                    if np.isfinite(float(row.get(candidate_key, float("nan"))))
+                    and float(row[candidate_key]) > float(threshold)
+                ]
+                if len(left_rows) < max(2, int(min_count)) or len(right_rows) < max(2, int(min_count)):
+                    continue
+                left_mean = _nanmean_or_nan([float(row[target_key]) for row in left_rows])
+                right_mean = _nanmean_or_nan([float(row[target_key]) for row in right_rows])
+                score = (
+                    (len(left_rows) / float(len(rows))) * (left_mean - base_mean) ** 2
+                    + (len(right_rows) / float(len(rows))) * (right_mean - base_mean) ** 2
+                )
+                if best is None or score > float(best["score"]):
+                    best = {
+                        "candidate_name": str(candidate_name),
+                        "threshold": float(threshold),
+                        "left_rows": left_rows,
+                        "right_rows": right_rows,
+                        "score": float(score),
+                    }
+        return best
+
+    rows: list[dict[str, Any]] = []
+    for time_phase in ("all", "early", "mid", "late"):
+        phase_rows = list(row_records) if time_phase == "all" else [row for row in row_records if str(row["time_phase"]) == time_phase]
+        if len(phase_rows) < max(4, int(min_count) * 2):
+            continue
+        for target_name, target_key in target_specs:
+            root_split = _best_split(phase_rows, target_key)
+            if root_split is None:
+                continue
+            queue: list[tuple[str, int, list[Mapping[str, Any]], dict[str, Any]]] = [("root", 0, list(phase_rows), root_split)]
+            while queue:
+                node_path, depth, node_rows, split = queue.pop(0)
+                rows.append(
+                    {
+                        "topology": str(topology_name),
+                        "time_phase": str(time_phase),
+                        "target_name": str(target_name),
+                        "node_path": str(node_path),
+                        "depth": int(depth),
+                        "split_variable": str(split["candidate_name"]),
+                        "threshold": float(split["threshold"]),
+                        "count_rows": int(len(node_rows)),
+                        "target_mean": _nanmean_or_nan([float(row[target_key]) for row in node_rows]),
+                        "split_score": float(split["score"]),
+                    }
+                )
+                if depth >= 1:
+                    continue
+                left_split = _best_split(split["left_rows"], target_key)
+                right_split = _best_split(split["right_rows"], target_key)
+                if left_split is not None:
+                    queue.append((f"{node_path}.L", depth + 1, list(split["left_rows"]), left_split))
+                if right_split is not None:
+                    queue.append((f"{node_path}.R", depth + 1, list(split["right_rows"]), right_split))
     return rows
 
 
@@ -2295,6 +3185,7 @@ def plot_allocation_gini_vs_observed_position(summary_rows: Sequence[Mapping[str
         "agent": {"linestyle": "-", "marker": "o", "linewidth": 2.0},
         "proportional": {"linestyle": "--", "marker": None, "linewidth": 2.0},
         "equal": {"linestyle": "--", "marker": None, "linewidth": 2.0},
+        "pool_power_mix": {"linestyle": ":", "marker": None, "linewidth": 2.0},
     }
     policy_names = sorted({str(row["policy"]) for row in summary_rows})
     for policy_name in policy_names:
@@ -2559,6 +3450,7 @@ def _plot_policy_rollout_metric_grid(
         "agent": {"color": "#2ca02c", "label": "RL Agent"},
         "proportional": {"color": "#d62728", "label": "Proportional"},
         "equal": {"color": "#1f77ff", "label": "Equal"},
+        "pool_power_mix": {"color": "#9467bd", "label": "PoolPowerMix"},
     }
     rows, cols = int(layout[0]), int(layout[1])
     figure_width = 6.2 * float(cols)
@@ -2567,7 +3459,7 @@ def _plot_policy_rollout_metric_grid(
     axes_flat = list(np.asarray(axes).reshape(-1))
 
     for axis, (metric_key, title, ylabel) in zip(axes_flat, metric_specs):
-        for policy_name in ("agent", "proportional", "equal"):
+        for policy_name in ("agent", "proportional", "equal", "pool_power_mix"):
             rows = [row for row in step_rows if str(row["policy"]) == policy_name]
             if not rows:
                 continue
@@ -2685,6 +3577,236 @@ def plot_receiver_state_income(rows: Sequence[Mapping[str, Any]], output_path: P
     ax.set_ylabel("Mean Incoming Resource")
     ax.legend()
 
+    _save_figure(figure, output_path)
+
+
+def plot_sender_degree_bin_mechanism(rows: Sequence[Mapping[str, Any]], output_path: Path) -> None:
+    if plt is None or not rows:
+        return
+
+    phase_order = ["early", "mid", "late"]
+    figure, axes = plt.subplots(1, 3, figsize=(16, 5), constrained_layout=True, sharey=True)
+    for ax, phase_name in zip(axes, phase_order):
+        phase_rows = [row for row in rows if str(row.get("time_phase", "")) == phase_name]
+        phase_rows.sort(key=lambda row: _to_int(row.get("sender_degree_bin_index", 0)))
+        if not phase_rows:
+            ax.set_axis_off()
+            continue
+        x_labels = [str(row["sender_degree_bin"]) for row in phase_rows]
+        x = np.arange(len(x_labels))
+        labor = [float(row["mean_weight_labor"]) for row in phase_rows]
+        equal = [float(row["mean_weight_equal"]) for row in phase_rows]
+        self_weight = [float(row["mean_weight_self"]) for row in phase_rows]
+        self_alloc = [float(row["mean_self_allocation"]) for row in phase_rows]
+        ax.plot(x, labor, marker="o", color="#1f77b4", label="unit-investment proportional")
+        ax.plot(x, equal, marker="o", color="#ff7f0e", label="equal")
+        ax.plot(x, self_weight, marker="o", color="#9467bd", linestyle="--", label="self mechanism weight")
+        ax.plot(x, self_alloc, marker="o", color="#d62728", label="self allocation")
+        ax.set_title(f"{phase_name.title()} Phase")
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_labels, rotation=20)
+        ax.grid(alpha=0.25)
+    axes[0].set_ylabel("Mean Value")
+    handles, labels = axes[0].get_legend_handles_labels()
+    if handles:
+        figure.legend(handles, labels, loc="upper center", ncol=4, frameon=False)
+    _save_figure(figure, output_path)
+
+
+def plot_sender_degree_ego_resource_mechanism(rows: Sequence[Mapping[str, Any]], output_path: Path) -> None:
+    if plt is None or not rows:
+        return
+
+    all_rows = [row for row in rows if str(row.get("time_phase", "")) == "all"]
+    if not all_rows:
+        return
+
+    degree_bins = sorted(
+        {
+            (_to_int(row.get("sender_degree_bin_index", 0)), str(row.get("sender_degree_bin", "NA")))
+            for row in all_rows
+        },
+        key=lambda item: item[0],
+    )
+    if not degree_bins:
+        return
+
+    panel_count = len(degree_bins)
+    ncols = min(3, max(1, panel_count))
+    nrows = int(math.ceil(float(panel_count) / float(ncols)))
+    figure, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(5.6 * ncols, 4.3 * nrows),
+        constrained_layout=True,
+        sharey=True,
+    )
+    axes_array = np.atleast_1d(axes).reshape(-1)
+
+    for ax, (degree_bin_index, degree_bin_label) in zip(axes_array, degree_bins):
+        panel_rows = [
+            row
+            for row in all_rows
+            if _to_int(row.get("sender_degree_bin_index", -1)) == degree_bin_index
+        ]
+        panel_rows.sort(key=lambda row: _to_int(row.get("ego_resource_bin_index", 0)))
+        if not panel_rows:
+            ax.set_axis_off()
+            continue
+        x_labels = [
+            str(row.get("ego_resource_bin_display", f"B{_to_int(row.get('ego_resource_bin_index', 0)) + 1}"))
+            for row in panel_rows
+        ]
+        x = np.arange(len(x_labels))
+        labor = [float(row["mean_weight_labor"]) for row in panel_rows]
+        equal = [float(row["mean_weight_equal"]) for row in panel_rows]
+        self_weight = [float(row["mean_weight_self"]) for row in panel_rows]
+        ax.plot(x, labor, marker="o", color="#1f77b4", label="unit-investment proportional")
+        ax.plot(x, equal, marker="o", color="#ff7f0e", label="equal")
+        ax.plot(x, self_weight, marker="o", color="#9467bd", linestyle="--", label="self")
+        ax.set_title(f"Sender Degree {degree_bin_label}")
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_labels, rotation=0)
+        ax.set_xlabel("Ego Resource Bin (low -> high)")
+        ax.grid(alpha=0.25)
+
+    for ax in axes_array[len(degree_bins):]:
+        ax.set_axis_off()
+    axes_array[0].set_ylabel("Mean Mechanism Weight")
+    handles, labels = axes_array[0].get_legend_handles_labels()
+    if handles:
+        figure.legend(handles, labels, loc="upper center", ncol=3, frameon=False)
+    trim_values = [float(row.get("tail_trim_frac", 0.0)) for row in all_rows if str(row.get("tail_trim_frac", "")) != ""]
+    trim_frac = trim_values[0] if trim_values else 0.0
+    if trim_frac > 0.0:
+        figure.suptitle(
+            f"Mechanism Weights by Sender Degree Bin and Ego Mean Resource (trim {trim_frac:.0%} tails)"
+        )
+    else:
+        figure.suptitle("Mechanism Weights by Sender Degree Bin and Ego Mean Resource")
+    _save_figure(figure, output_path)
+
+
+def plot_receiver_degree_bin_income(
+    rows: Sequence[Mapping[str, Any]],
+    output_path: Path,
+    *,
+    excluding_self_flow: bool = False,
+) -> None:
+    if plt is None or not rows:
+        return
+
+    phase_order = ["early", "mid", "late"]
+    figure, axes = plt.subplots(1, 3, figsize=(16, 5), constrained_layout=True, sharey=True)
+    for ax, phase_name in zip(axes, phase_order):
+        phase_rows = [row for row in rows if str(row.get("time_phase", "")) == phase_name]
+        phase_rows.sort(key=lambda row: _to_int(row.get("receiver_degree_bin_index", 0)))
+        if not phase_rows:
+            ax.set_axis_off()
+            continue
+        x_labels = [str(row["receiver_degree_bin"]) for row in phase_rows]
+        x = np.arange(len(x_labels))
+        over_equal = [float(row["actual_over_equal_mean"]) for row in phase_rows]
+        over_labor = [float(row["actual_over_labor_mean"]) for row in phase_rows]
+        ax.plot(x, over_equal, marker="o", color="#1f77ff", label="actual / equal")
+        ax.plot(x, over_labor, marker="o", color="#2ca02c", label="actual / unit-investment")
+        ax.axhline(1.0, color="black", linewidth=1.0, linestyle="--")
+        ax.set_title(f"{phase_name.title()} Phase")
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_labels, rotation=20)
+        ax.grid(alpha=0.25)
+    axes[0].set_ylabel("Mean Ratio")
+    figure.suptitle(
+        "Receiver Degree Income Ratios Excluding Self-Flow"
+        if excluding_self_flow
+        else "Receiver Degree Income Ratios"
+    )
+    handles, labels = axes[0].get_legend_handles_labels()
+    if handles:
+        figure.legend(handles, labels, loc="upper center", ncol=2, frameon=False)
+    _save_figure(figure, output_path)
+
+
+def plot_sender_receiver_degree_heatmap(rows: Sequence[Mapping[str, Any]], output_path: Path) -> None:
+    if plt is None or not rows:
+        return
+
+    phase_order = ["early", "mid", "late"]
+    figure, axes = plt.subplots(1, 3, figsize=(16, 5), constrained_layout=True)
+    for ax, phase_name in zip(axes, phase_order):
+        phase_rows = [
+            row for row in rows
+            if str(row.get("time_phase", "")) == phase_name and str(row.get("aggregation_level", "")) == "phase"
+        ]
+        if not phase_rows:
+            ax.set_axis_off()
+            continue
+        sender_labels = sorted(
+            {str(row["sender_degree_bin"]) for row in phase_rows},
+            key=lambda label: min(
+                _to_int(row.get("sender_degree_bin_index", 0))
+                for row in phase_rows
+                if str(row["sender_degree_bin"]) == label
+            ),
+        )
+        receiver_labels = sorted(
+            {str(row["receiver_degree_bin"]) for row in phase_rows},
+            key=lambda label: min(
+                _to_int(row.get("receiver_degree_bin_index", 0))
+                for row in phase_rows
+                if str(row["receiver_degree_bin"]) == label
+            ),
+        )
+        matrix = np.full((len(sender_labels), len(receiver_labels)), np.nan, dtype=np.float64)
+        for row in phase_rows:
+            sender_index = sender_labels.index(str(row["sender_degree_bin"]))
+            receiver_index = receiver_labels.index(str(row["receiver_degree_bin"]))
+            matrix[sender_index, receiver_index] = float(row["allocation_mean"])
+        image = ax.imshow(matrix, aspect="auto", cmap="viridis")
+        ax.set_title(f"{phase_name.title()} Phase")
+        ax.set_xticks(np.arange(len(receiver_labels)))
+        ax.set_xticklabels(receiver_labels, rotation=20)
+        ax.set_yticks(np.arange(len(sender_labels)))
+        ax.set_yticklabels(sender_labels)
+        ax.set_xlabel("Receiver Degree Bin")
+        ax.set_ylabel("Sender Degree Bin")
+        figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    _save_figure(figure, output_path)
+
+
+def plot_degree_state_split_summary(rows: Sequence[Mapping[str, Any]], output_path: Path) -> None:
+    if plt is None or not rows:
+        return
+
+    filtered = [row for row in rows if str(row.get("time_phase", "")) == "all"]
+    if not filtered:
+        filtered = list(rows)
+    if not filtered:
+        return
+
+    target_names = sorted({str(row["target_name"]) for row in filtered})
+    split_variables = sorted({str(row["split_variable"]) for row in filtered})
+    heatmap = np.full((len(split_variables), len(target_names)), np.nan, dtype=np.float64)
+    for split_index, split_name in enumerate(split_variables):
+        for target_index, target_name in enumerate(target_names):
+            matches = [
+                float(row["target_mean_range"])
+                for row in filtered
+                if str(row["split_variable"]) == split_name and str(row["target_name"]) == target_name
+            ]
+            if matches:
+                heatmap[split_index, target_index] = float(np.nanmax(matches))
+
+    figure, ax = plt.subplots(figsize=(11, 7), constrained_layout=True)
+    image = ax.imshow(heatmap, aspect="auto", cmap="magma")
+    ax.set_xticks(np.arange(len(target_names)))
+    ax.set_xticklabels(target_names, rotation=20)
+    ax.set_yticks(np.arange(len(split_variables)))
+    ax.set_yticklabels(split_variables)
+    ax.set_title("State-Split Effect Range Summary")
+    ax.set_xlabel("Target Variable")
+    ax.set_ylabel("Split Variable")
+    figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label="Max Mean Difference Across Bins")
     _save_figure(figure, output_path)
 
 
@@ -2846,6 +3968,13 @@ def analyze_single_topology(
     counterfactual_contribution_delta: float,
     counterfactual_batch_size: int,
     baseline_gini_episodes: int,
+    degree_bin_mode: str,
+    degree_bin_count: int,
+    degree_bin_min_count: int,
+    state_split_bin_count: int,
+    enable_state_split_tree_like: bool,
+    pool_power_mix_k: float,
+    ego_resource_bin_count: int,
     rollout_seed: int,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2870,12 +3999,26 @@ def analyze_single_topology(
 
     graph_stats = collect_graph_stats(graph)
     policy_behavior = compute_policy_behavior_stats(snapshots)
-    row_mechanism_records = compute_row_mechanism_records(
-        snapshots,
-        p_c=float(env_config.p_c),
-        labor_equal_gap_threshold=float(labor_equal_gap_threshold),
+    analysis_total_steps = _resolve_analysis_total_steps(int(effective_spec["dynamics"]["episode_length"]), max_steps)
+    row_mechanism_records = _annotate_rows_with_time_phase(
+        compute_row_mechanism_records(
+            snapshots,
+            p_c=float(env_config.p_c),
+            labor_equal_gap_threshold=float(labor_equal_gap_threshold),
+        ),
+        total_steps=analysis_total_steps,
+        topology_name=topology_name,
     )
-    node_income_records = compute_node_income_decomposition(snapshots)
+    node_income_records = _annotate_rows_with_time_phase(
+        compute_node_income_decomposition(snapshots),
+        total_steps=analysis_total_steps,
+        topology_name=topology_name,
+    )
+    decision_record_rows = _annotate_rows_with_time_phase(
+        collect_decision_records_rows(snapshots),
+        total_steps=analysis_total_steps,
+        topology_name=topology_name,
+    )
     mechanism_summary, position_bin_rows = summarize_row_mechanism_records(
         row_mechanism_records,
         bin_count=mechanism_bin_count,
@@ -2907,6 +4050,7 @@ def analyze_single_topology(
         baseline_specs = [
             ("proportional", ProportionalContributionPolicy(), int(rollout_seed) + 100_000),
             ("equal", UniformAllocationPolicy(), int(rollout_seed) + 200_000),
+            ("pool_power_mix", PoolPowerMixAllocationPolicy(float(pool_power_mix_k)), int(rollout_seed) + 300_000),
         ]
         for policy_name, policy, policy_seed in baseline_specs:
             policy_snapshots, policy_episode_summaries = run_rule_policy_rollouts(
@@ -2940,6 +4084,9 @@ def analyze_single_topology(
                 row for row in baseline_allocation_gini_records if str(row["policy"]) == "proportional"
             ],
             "equal": [row for row in baseline_allocation_gini_records if str(row["policy"]) == "equal"],
+            "pool_power_mix": [
+                row for row in baseline_allocation_gini_records if str(row["policy"]) == "pool_power_mix"
+            ],
         },
         bin_count=mechanism_bin_count,
     )
@@ -2948,12 +4095,98 @@ def analyze_single_topology(
             "agent": snapshots,
             "proportional": baseline_snapshots_by_policy.get("proportional", []),
             "equal": baseline_snapshots_by_policy.get("equal", []),
+            "pool_power_mix": baseline_snapshots_by_policy.get("pool_power_mix", []),
         }
     )
     step_mechanism_rows = summarize_step_mechanism_records(row_mechanism_records)
     sender_state_rows = summarize_sender_state_mechanism(row_mechanism_records)
     node_income_summary = summarize_node_income_records(node_income_records)
     receiver_state_rows = summarize_receiver_state_income(node_income_records)
+    sender_degree_rows, sender_degree_step_rows, sender_degree_spec, row_mechanism_degree_rows = (
+        summarize_sender_degree_bin_mechanism(
+            row_mechanism_records,
+            topology_name=topology_name,
+            degree_bin_mode=str(degree_bin_mode),
+            degree_bin_count=int(degree_bin_count),
+            degree_bin_min_count=int(degree_bin_min_count),
+        )
+    )
+    sender_degree_ego_resource_rows = summarize_sender_degree_ego_resource_mechanism(
+        row_mechanism_degree_rows,
+        topology_name=topology_name,
+        sender_spec=sender_degree_spec,
+        ego_resource_bin_count=max(1, int(ego_resource_bin_count)),
+    )
+    receiver_degree_rows, receiver_degree_step_rows, receiver_degree_spec, node_income_degree_rows = (
+        summarize_receiver_degree_bin_income(
+            node_income_records,
+            topology_name=topology_name,
+            degree_bin_mode=str(degree_bin_mode),
+            degree_bin_count=int(degree_bin_count),
+            degree_bin_min_count=int(degree_bin_min_count),
+        )
+    )
+    receiver_degree_excluding_self_rows, receiver_degree_excluding_self_step_rows, _, _ = (
+        summarize_receiver_degree_bin_income(
+            node_income_records,
+            topology_name=topology_name,
+            degree_bin_mode=str(degree_bin_mode),
+            degree_bin_count=int(degree_bin_count),
+            degree_bin_min_count=int(degree_bin_min_count),
+            exclude_self_flow=True,
+        )
+    )
+    sender_receiver_matrix_rows, sender_receiver_matrix_step_rows = summarize_sender_receiver_degree_matrix(
+        decision_record_rows,
+        topology_name=topology_name,
+        sender_spec=sender_degree_spec,
+        receiver_spec=receiver_degree_spec,
+    )
+    state_split_univariate_rows = summarize_state_split_univariate(
+        row_mechanism_degree_rows,
+        topology_name=topology_name,
+        bin_count=max(2, int(state_split_bin_count)),
+    )
+    state_split_tree_rows = (
+        summarize_state_split_tree_like(
+            row_mechanism_degree_rows,
+            topology_name=topology_name,
+            min_count=max(2, int(degree_bin_min_count)),
+        )
+        if bool(enable_state_split_tree_like)
+        else []
+    )
+    degree_analysis_summary = {
+        "degree_bin_mode": str(degree_bin_mode),
+        "degree_bin_count": int(degree_bin_count),
+        "degree_bin_min_count": int(degree_bin_min_count),
+        "state_split_bin_count": int(state_split_bin_count),
+        "enable_state_split_tree_like": bool(enable_state_split_tree_like),
+        "pool_power_mix_k": float(pool_power_mix_k),
+        "ego_resource_bin_count": int(ego_resource_bin_count),
+        "sender_degree_binning": {
+            "unique_degree_count": int(sender_degree_spec.get("unique_degree_count", 0)),
+            "requested_bin_count": int(sender_degree_spec.get("requested_bin_count", 0)),
+            "effective_bin_count": int(sender_degree_spec.get("effective_bin_count", 0)),
+            "collapsed_bins": bool(sender_degree_spec.get("collapsed_bins", False)),
+            "sparse_final": bool(sender_degree_spec.get("sparse_final", False)),
+            "bins": [dict(row) for row in sender_degree_spec.get("bins", [])],
+        },
+        "receiver_degree_binning": {
+            "unique_degree_count": int(receiver_degree_spec.get("unique_degree_count", 0)),
+            "requested_bin_count": int(receiver_degree_spec.get("requested_bin_count", 0)),
+            "effective_bin_count": int(receiver_degree_spec.get("effective_bin_count", 0)),
+            "collapsed_bins": bool(receiver_degree_spec.get("collapsed_bins", False)),
+            "sparse_final": bool(receiver_degree_spec.get("sparse_final", False)),
+            "bins": [dict(row) for row in receiver_degree_spec.get("bins", [])],
+        },
+        "row_count": int(len(row_mechanism_records)),
+        "node_income_count": int(len(node_income_records)),
+        "decision_pair_count": int(len(decision_record_rows)),
+        "state_split_univariate_row_count": int(len(state_split_univariate_rows)),
+        "state_split_tree_like_row_count": int(len(state_split_tree_rows)),
+        "sender_degree_ego_resource_row_count": int(len(sender_degree_ego_resource_rows)),
+    }
     proportional_intervention_policy = ProportionalContributionPolicy()
     proportional_intervention_snapshots = baseline_snapshots_by_policy.get("proportional", [])
     proportional_intervention_row_records: list[dict[str, Any]] | None = None
@@ -3134,6 +4367,19 @@ def analyze_single_topology(
     plot_mechanism_over_time(step_mechanism_rows, output_dir / "mechanism_over_time.png")
     plot_sender_state_mechanism(sender_state_rows, output_dir / "sender_state_mechanism.png")
     plot_receiver_state_income(receiver_state_rows, output_dir / "receiver_state_income.png")
+    plot_sender_degree_bin_mechanism(sender_degree_rows, output_dir / "sender_degree_bin_mechanism.png")
+    plot_sender_degree_ego_resource_mechanism(
+        sender_degree_ego_resource_rows,
+        output_dir / "sender_degree_ego_mean_resource_mechanism.png",
+    )
+    plot_receiver_degree_bin_income(receiver_degree_rows, output_dir / "receiver_degree_bin_income.png")
+    plot_receiver_degree_bin_income(
+        receiver_degree_excluding_self_rows,
+        output_dir / "receiver_degree_bin_income_excluding_self.png",
+        excluding_self_flow=True,
+    )
+    plot_sender_receiver_degree_heatmap(sender_receiver_matrix_rows, output_dir / "sender_receiver_degree_heatmap.png")
+    plot_degree_state_split_summary(state_split_univariate_rows, output_dir / "degree_state_split_summary.png")
     plot_counterfactual_summary(counterfactual_summary_rows, output_dir / "counterfactual_contribution_summary.png")
     write_episode_summary_csv(output_dir / "episode_summary.csv", episode_summaries)
     write_csv(output_dir / "row_mechanism.csv", row_mechanism_records)
@@ -3145,8 +4391,74 @@ def analyze_single_topology(
     write_csv(output_dir / "policy_rollout_step_metrics.csv", policy_rollout_step_rows)
     write_csv(output_dir / "step_mechanism.csv", step_mechanism_rows)
     write_csv(output_dir / "sender_state_mechanism.csv", sender_state_rows)
+    write_csv(output_dir / "decision_records.csv", decision_record_rows)
     write_csv(output_dir / "node_income_decomposition.csv", node_income_records)
     write_csv(output_dir / "receiver_state_income.csv", receiver_state_rows)
+    write_csv(output_dir / "sender_degree_bin_mechanism.csv", sender_degree_rows)
+    write_csv(output_dir / "sender_degree_bin_step_mechanism.csv", sender_degree_step_rows)
+    _write_csv_with_optional_headers(
+        output_dir / "sender_degree_ego_mean_resource_mechanism.csv",
+        sender_degree_ego_resource_rows,
+        fieldnames=[
+            "topology",
+            "time_phase",
+            "sender_degree_bin",
+            "sender_degree_bin_index",
+            "ego_resource_bin",
+            "ego_resource_bin_index",
+            "ego_resource_left",
+            "ego_resource_right",
+            "count_rows",
+            "mean_ego_mean_resource",
+            "mean_weight_labor",
+            "mean_weight_equal",
+            "mean_weight_self",
+            "mean_self_allocation",
+        ],
+    )
+    write_csv(output_dir / "receiver_degree_bin_income.csv", receiver_degree_rows)
+    write_csv(output_dir / "receiver_degree_bin_step_income.csv", receiver_degree_step_rows)
+    write_csv(output_dir / "receiver_degree_bin_income_excluding_self.csv", receiver_degree_excluding_self_rows)
+    write_csv(
+        output_dir / "receiver_degree_bin_step_income_excluding_self.csv",
+        receiver_degree_excluding_self_step_rows,
+    )
+    write_csv(output_dir / "sender_receiver_degree_matrix.csv", list(sender_receiver_matrix_rows) + list(sender_receiver_matrix_step_rows))
+    _write_csv_with_optional_headers(
+        output_dir / "state_split_univariate.csv",
+        state_split_univariate_rows,
+        fieldnames=[
+            "topology",
+            "time_phase",
+            "target_name",
+            "split_variable",
+            "bin_index",
+            "bin_label",
+            "bin_left",
+            "bin_right",
+            "count_rows",
+            "target_mean",
+            "target_std",
+            "target_sem",
+            "target_mean_range",
+        ],
+    )
+    _write_csv_with_optional_headers(
+        output_dir / "state_split_tree_like.csv",
+        state_split_tree_rows,
+        fieldnames=[
+            "topology",
+            "time_phase",
+            "target_name",
+            "node_path",
+            "depth",
+            "split_variable",
+            "threshold",
+            "count_rows",
+            "target_mean",
+            "split_score",
+        ],
+    )
     write_csv(output_dir / "pool_intervention_raw_rows.csv", pool_intervention_rows)
     write_csv(output_dir / "pool_intervention_summary.csv", pool_intervention_summary_rows)
     write_csv(output_dir / "resource_intervention_raw_rows.csv", resource_intervention_rows)
@@ -3235,6 +4547,7 @@ def analyze_single_topology(
         },
         episode_summaries=episode_summaries,
     )
+    summary["degree_analysis"] = degree_analysis_summary
     with (output_dir / "mechanism_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)
 
@@ -3497,6 +4810,57 @@ def parse_args() -> argparse.Namespace:
         help="Base environment reset seed for analysis rollouts.",
     )
     parser.add_argument(
+        "--degree-bin-mode",
+        type=str,
+        choices=("quantile", "log"),
+        default=str(SCRIPT_DEFAULTS["degree_bin_mode"]),
+        help="How sender/receiver degrees are binned for degree-stratified analysis.",
+    )
+    parser.add_argument(
+        "--degree-bin-count",
+        type=int,
+        default=int(SCRIPT_DEFAULTS["degree_bin_count"]),
+        help="Requested number of sender/receiver degree bins.",
+    )
+    parser.add_argument(
+        "--degree-bin-min-count",
+        type=int,
+        default=int(SCRIPT_DEFAULTS["degree_bin_min_count"]),
+        help="Minimum preferred sample count per degree bin; sparse adjacent bins are merged.",
+    )
+    parser.add_argument(
+        "--state-split-bin-count",
+        type=int,
+        default=int(SCRIPT_DEFAULTS["state_split_bin_count"]),
+        help="Number of quantile bins used by the lightweight univariate state split analysis.",
+    )
+    state_split_tree_group = parser.add_mutually_exclusive_group()
+    state_split_tree_group.add_argument(
+        "--enable-state-split-tree-like",
+        dest="enable_state_split_tree_like",
+        action="store_true",
+        help="Run the slower depth<=2 greedy tree-like state split analysis.",
+    )
+    state_split_tree_group.add_argument(
+        "--disable-state-split-tree-like",
+        dest="enable_state_split_tree_like",
+        action="store_false",
+        help="Skip the slower depth<=2 greedy tree-like state split analysis.",
+    )
+    parser.set_defaults(enable_state_split_tree_like=bool(SCRIPT_DEFAULTS["enable_state_split_tree_like"]))
+    parser.add_argument(
+        "--pool-power-mix-k",
+        type=float,
+        default=float(SCRIPT_DEFAULTS["pool_power_mix_k"]),
+        help="k used by PoolPowerMixAllocationPolicy baseline rollouts.",
+    )
+    parser.add_argument(
+        "--ego-resource-bin-count",
+        type=int,
+        default=int(SCRIPT_DEFAULTS["ego_resource_bin_count"]),
+        help="Number of quantile bins used for the sender-degree × ego-mean-resource mechanism plot.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=str(SCRIPT_DEFAULTS["device"]),
@@ -3615,6 +4979,12 @@ def _write_multi_topology_aggregate(
     labor_equal_gap_threshold: float,
     pool_intervention_reference_mode: str,
     resource_intervention_reference_mode: str,
+    degree_bin_mode: str,
+    degree_bin_count: int,
+    degree_bin_min_count: int,
+    state_split_bin_count: int,
+    enable_state_split_tree_like: bool,
+    ego_resource_bin_count: int,
 ) -> None:
     if len(topology_names) < 2:
         return
@@ -3644,6 +5014,7 @@ def _write_multi_topology_aggregate(
     pool_intervention_rows: list[dict[str, Any]] = []
     resource_intervention_rows: list[dict[str, Any]] = []
     counterfactual_response_rows: list[dict[str, Any]] = []
+    decision_record_rows: list[dict[str, Any]] = []
 
     per_topology_graph_stats: dict[str, Any] = {}
     per_topology_policy_behavior: dict[str, Any] = {}
@@ -3670,6 +5041,9 @@ def _write_multi_topology_aggregate(
             _apply_episode_offset(_read_csv_rows(topo_dir / "baseline_episode_summary.csv"), offset)
         )
         policy_rollout_step_rows_raw.extend(_read_csv_rows(topo_dir / "policy_rollout_step_metrics.csv"))
+        decision_record_rows.extend(
+            _apply_episode_offset(_read_csv_rows(topo_dir / "decision_records.csv"), offset)
+        )
 
         pool_intervention_rows.extend(
             _apply_episode_offset(_read_csv_rows(topo_dir / "pool_intervention_raw_rows.csv"), offset)
@@ -3740,6 +5114,60 @@ def _write_multi_topology_aggregate(
     sender_state_rows = summarize_sender_state_mechanism(row_mechanism_records)
     node_income_summary = summarize_node_income_records(node_income_records)
     receiver_state_rows = summarize_receiver_state_income(node_income_records)
+    combined_total_steps = max([_to_int(row.get("step", 0)) for row in row_mechanism_records] + [0]) + 1
+    row_mechanism_records = _annotate_rows_with_time_phase(row_mechanism_records, total_steps=combined_total_steps)
+    node_income_records = _annotate_rows_with_time_phase(node_income_records, total_steps=combined_total_steps)
+    decision_record_rows = _annotate_rows_with_time_phase(decision_record_rows, total_steps=combined_total_steps)
+    sender_degree_rows, sender_degree_step_rows, sender_degree_spec, row_mechanism_degree_rows = (
+        summarize_sender_degree_bin_mechanism(
+            row_mechanism_records,
+            topology_name="_all_topologies",
+            degree_bin_mode=str(degree_bin_mode),
+            degree_bin_count=int(degree_bin_count),
+            degree_bin_min_count=int(degree_bin_min_count),
+        )
+    )
+    sender_degree_ego_resource_rows = summarize_sender_degree_ego_resource_mechanism(
+        row_mechanism_degree_rows,
+        topology_name="_all_topologies",
+        sender_spec=sender_degree_spec,
+        ego_resource_bin_count=max(1, int(ego_resource_bin_count)),
+    )
+    receiver_degree_rows, receiver_degree_step_rows, receiver_degree_spec, _ = summarize_receiver_degree_bin_income(
+        node_income_records,
+        topology_name="_all_topologies",
+        degree_bin_mode=str(degree_bin_mode),
+        degree_bin_count=int(degree_bin_count),
+        degree_bin_min_count=int(degree_bin_min_count),
+    )
+    receiver_degree_excluding_self_rows, receiver_degree_excluding_self_step_rows, _, _ = summarize_receiver_degree_bin_income(
+        node_income_records,
+        topology_name="_all_topologies",
+        degree_bin_mode=str(degree_bin_mode),
+        degree_bin_count=int(degree_bin_count),
+        degree_bin_min_count=int(degree_bin_min_count),
+        exclude_self_flow=True,
+    )
+    sender_receiver_matrix_rows, sender_receiver_matrix_step_rows = summarize_sender_receiver_degree_matrix(
+        decision_record_rows,
+        topology_name="_all_topologies",
+        sender_spec=sender_degree_spec,
+        receiver_spec=receiver_degree_spec,
+    )
+    state_split_univariate_rows = summarize_state_split_univariate(
+        row_mechanism_degree_rows,
+        topology_name="_all_topologies",
+        bin_count=max(2, int(state_split_bin_count)),
+    )
+    state_split_tree_rows = (
+        summarize_state_split_tree_like(
+            row_mechanism_degree_rows,
+            topology_name="_all_topologies",
+            min_count=max(2, int(degree_bin_min_count)),
+        )
+        if bool(enable_state_split_tree_like)
+        else []
+    )
 
     pool_intervention_summary_rows, pool_intervention_flat_summary = summarize_pool_intervention_records(
         pool_intervention_rows
@@ -3780,6 +5208,19 @@ def _write_multi_topology_aggregate(
     plot_mechanism_over_time(step_mechanism_rows, combined_output_dir / "mechanism_over_time.png")
     plot_sender_state_mechanism(sender_state_rows, combined_output_dir / "sender_state_mechanism.png")
     plot_receiver_state_income(receiver_state_rows, combined_output_dir / "receiver_state_income.png")
+    plot_sender_degree_bin_mechanism(sender_degree_rows, combined_output_dir / "sender_degree_bin_mechanism.png")
+    plot_sender_degree_ego_resource_mechanism(
+        sender_degree_ego_resource_rows,
+        combined_output_dir / "sender_degree_ego_mean_resource_mechanism.png",
+    )
+    plot_receiver_degree_bin_income(receiver_degree_rows, combined_output_dir / "receiver_degree_bin_income.png")
+    plot_receiver_degree_bin_income(
+        receiver_degree_excluding_self_rows,
+        combined_output_dir / "receiver_degree_bin_income_excluding_self.png",
+        excluding_self_flow=True,
+    )
+    plot_sender_receiver_degree_heatmap(sender_receiver_matrix_rows, combined_output_dir / "sender_receiver_degree_heatmap.png")
+    plot_degree_state_split_summary(state_split_univariate_rows, combined_output_dir / "degree_state_split_summary.png")
     plot_counterfactual_summary(
         counterfactual_summary_rows,
         combined_output_dir / "counterfactual_contribution_summary.png",
@@ -3795,8 +5236,77 @@ def _write_multi_topology_aggregate(
     write_csv(combined_output_dir / "policy_rollout_step_metrics.csv", policy_rollout_step_rows)
     write_csv(combined_output_dir / "step_mechanism.csv", step_mechanism_rows)
     write_csv(combined_output_dir / "sender_state_mechanism.csv", sender_state_rows)
+    write_csv(combined_output_dir / "decision_records.csv", decision_record_rows)
     write_csv(combined_output_dir / "node_income_decomposition.csv", node_income_records)
     write_csv(combined_output_dir / "receiver_state_income.csv", receiver_state_rows)
+    write_csv(combined_output_dir / "sender_degree_bin_mechanism.csv", sender_degree_rows)
+    write_csv(combined_output_dir / "sender_degree_bin_step_mechanism.csv", sender_degree_step_rows)
+    _write_csv_with_optional_headers(
+        combined_output_dir / "sender_degree_ego_mean_resource_mechanism.csv",
+        sender_degree_ego_resource_rows,
+        fieldnames=[
+            "topology",
+            "time_phase",
+            "sender_degree_bin",
+            "sender_degree_bin_index",
+            "ego_resource_bin",
+            "ego_resource_bin_index",
+            "ego_resource_left",
+            "ego_resource_right",
+            "count_rows",
+            "mean_ego_mean_resource",
+            "mean_weight_labor",
+            "mean_weight_equal",
+            "mean_weight_self",
+            "mean_self_allocation",
+        ],
+    )
+    write_csv(combined_output_dir / "receiver_degree_bin_income.csv", receiver_degree_rows)
+    write_csv(combined_output_dir / "receiver_degree_bin_step_income.csv", receiver_degree_step_rows)
+    write_csv(combined_output_dir / "receiver_degree_bin_income_excluding_self.csv", receiver_degree_excluding_self_rows)
+    write_csv(
+        combined_output_dir / "receiver_degree_bin_step_income_excluding_self.csv",
+        receiver_degree_excluding_self_step_rows,
+    )
+    write_csv(
+        combined_output_dir / "sender_receiver_degree_matrix.csv",
+        list(sender_receiver_matrix_rows) + list(sender_receiver_matrix_step_rows),
+    )
+    _write_csv_with_optional_headers(
+        combined_output_dir / "state_split_univariate.csv",
+        state_split_univariate_rows,
+        fieldnames=[
+            "topology",
+            "time_phase",
+            "target_name",
+            "split_variable",
+            "bin_index",
+            "bin_label",
+            "bin_left",
+            "bin_right",
+            "count_rows",
+            "target_mean",
+            "target_std",
+            "target_sem",
+            "target_mean_range",
+        ],
+    )
+    _write_csv_with_optional_headers(
+        combined_output_dir / "state_split_tree_like.csv",
+        state_split_tree_rows,
+        fieldnames=[
+            "topology",
+            "time_phase",
+            "target_name",
+            "node_path",
+            "depth",
+            "split_variable",
+            "threshold",
+            "count_rows",
+            "target_mean",
+            "split_score",
+        ],
+    )
     write_csv(combined_output_dir / "pool_intervention_raw_rows.csv", pool_intervention_rows)
     write_csv(combined_output_dir / "pool_intervention_summary.csv", pool_intervention_summary_rows)
     write_csv(combined_output_dir / "resource_intervention_raw_rows.csv", resource_intervention_rows)
@@ -3876,6 +5386,36 @@ def _write_multi_topology_aggregate(
         "episode_offsets": dict(episode_offsets),
         "episode_counts": dict(episode_counts),
         "source_output_dir": str(root_output_dir),
+    }
+    summary_payload["degree_analysis"] = {
+        "degree_bin_mode": str(degree_bin_mode),
+        "degree_bin_count": int(degree_bin_count),
+        "degree_bin_min_count": int(degree_bin_min_count),
+        "state_split_bin_count": int(state_split_bin_count),
+        "enable_state_split_tree_like": bool(enable_state_split_tree_like),
+        "ego_resource_bin_count": int(ego_resource_bin_count),
+        "sender_degree_binning": {
+            "unique_degree_count": int(sender_degree_spec.get("unique_degree_count", 0)),
+            "requested_bin_count": int(sender_degree_spec.get("requested_bin_count", 0)),
+            "effective_bin_count": int(sender_degree_spec.get("effective_bin_count", 0)),
+            "collapsed_bins": bool(sender_degree_spec.get("collapsed_bins", False)),
+            "sparse_final": bool(sender_degree_spec.get("sparse_final", False)),
+            "bins": [dict(row) for row in sender_degree_spec.get("bins", [])],
+        },
+        "receiver_degree_binning": {
+            "unique_degree_count": int(receiver_degree_spec.get("unique_degree_count", 0)),
+            "requested_bin_count": int(receiver_degree_spec.get("requested_bin_count", 0)),
+            "effective_bin_count": int(receiver_degree_spec.get("effective_bin_count", 0)),
+            "collapsed_bins": bool(receiver_degree_spec.get("collapsed_bins", False)),
+            "sparse_final": bool(receiver_degree_spec.get("sparse_final", False)),
+            "bins": [dict(row) for row in receiver_degree_spec.get("bins", [])],
+        },
+        "row_count": int(len(row_mechanism_records)),
+        "node_income_count": int(len(node_income_records)),
+        "decision_pair_count": int(len(decision_record_rows)),
+        "state_split_univariate_row_count": int(len(state_split_univariate_rows)),
+        "state_split_tree_like_row_count": int(len(state_split_tree_rows)),
+        "sender_degree_ego_resource_row_count": int(len(sender_degree_ego_resource_rows)),
     }
     with (combined_output_dir / "mechanism_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary_payload, handle, ensure_ascii=False, indent=2)
@@ -3989,6 +5529,13 @@ def main() -> None:
             counterfactual_contribution_delta=max(0.0, float(args.counterfactual_contribution_delta)),
             counterfactual_batch_size=max(1, int(args.counterfactual_batch_size)),
             baseline_gini_episodes=max(0, int(args.baseline_gini_episodes)),
+            degree_bin_mode=str(args.degree_bin_mode),
+            degree_bin_count=max(1, int(args.degree_bin_count)),
+            degree_bin_min_count=max(1, int(args.degree_bin_min_count)),
+            state_split_bin_count=max(2, int(args.state_split_bin_count)),
+            enable_state_split_tree_like=bool(args.enable_state_split_tree_like),
+            pool_power_mix_k=float(args.pool_power_mix_k),
+            ego_resource_bin_count=max(1, int(args.ego_resource_bin_count)),
             rollout_seed=int(args.seed) + topology_index,
         )
         topology_rows.append(result["topology_row"])
@@ -4005,6 +5552,12 @@ def main() -> None:
             labor_equal_gap_threshold=max(0.0, float(args.labor_equal_gap_threshold)),
             pool_intervention_reference_mode=str(args.pool_intervention_reference_mode),
             resource_intervention_reference_mode=str(args.resource_intervention_reference_mode),
+            degree_bin_mode=str(args.degree_bin_mode),
+            degree_bin_count=max(1, int(args.degree_bin_count)),
+            degree_bin_min_count=max(1, int(args.degree_bin_min_count)),
+            state_split_bin_count=max(2, int(args.state_split_bin_count)),
+            enable_state_split_tree_like=bool(args.enable_state_split_tree_like),
+            ego_resource_bin_count=max(1, int(args.ego_resource_bin_count)),
         )
 
     write_csv(output_dir / "topology_summary.csv", topology_rows)
